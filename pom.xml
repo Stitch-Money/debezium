@@ -238,11 +238,6 @@
         <name>GitHub Packages</name>
         <url>https://maven.pkg.github.com/Stitch-Money/debezium</url>
       </repository>
-      <snapshotRepository>
-        <id>central-snapshots</id>
-        <name>Maven Central Snapshots</name>
-        <url>${publish.snapshot.url}</url>
-      </snapshotRepository>
     </distributionManagement>
 
     <repositories>
@@ -285,11 +280,13 @@
                     <artifactId>maven-release-plugin</artifactId>
                     <version>${version.release.plugin}</version>
                 </plugin>
+                <!-- remove plugin that publishes to maven
                 <plugin>
                     <groupId>org.sonatype.central</groupId>
                     <artifactId>central-publishing-maven-plugin</artifactId>
                     <version>${version.central.publishing.plugin}</version>
                 </plugin>
+                -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
@@ -336,6 +333,7 @@
                     <releaseProfiles>docs,assembly,release-sign-artifacts,release</releaseProfiles>
                 </configuration>
             </plugin>
+            <!-- disable config for maven publishing
             <plugin>
                   <groupId>org.sonatype.central</groupId>
                   <artifactId>central-publishing-maven-plugin</artifactId>
@@ -350,6 +348,7 @@
                         <waitPollingInterval>${publish.poll.interval}</waitPollingInterval>
                   </configuration>
             </plugin>
+            -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
