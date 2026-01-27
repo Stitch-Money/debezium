@@ -23,6 +23,6 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
       - name: Publish package
-        run: ./mvnw clean deploy -pl debezium-connector-jdbc -am
+        run: ./mvnw clean deploy -Dquick -pl debezium-connector-jdbc -am
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
