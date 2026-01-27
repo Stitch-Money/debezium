@@ -1,0 +1,28 @@
+name: Publish debezium-connector-jdbc package to GitHub Packages
+on:
+  workflow_dispatch:
+    inputs:
+      ref: 
+        description: 'The branch, tag or SHA to checkout.'
+        required: true
+        type: string
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - name: Publish package
+        run: ./mvnw clean deploy -pl debezium-connector-jdbc -am
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
