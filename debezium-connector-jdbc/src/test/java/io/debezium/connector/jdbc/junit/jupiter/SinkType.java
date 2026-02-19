@@ -16,7 +16,11 @@ public enum SinkType {
     POSTGRES("postgres"),
     SQLSERVER("sqlserver"),
     ORACLE("oracle"),
-    DB2("db2");
+    DB2("db2"),
+    /**
+     * <Snowflake JDBC Sink Addition>
+     */
+    SNOWFLAKE("snowflake");
 
     private final String value;
 

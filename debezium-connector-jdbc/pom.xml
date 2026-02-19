@@ -15,6 +15,8 @@
     <packaging>jar</packaging>
 
     <properties>
+        <!-- Snowflake -->
+        <version.snowflake>3.28.0</version.snowflake>
         <!-- Other artifact versions -->
         <version.hibernate>7.1.0.Final</version.hibernate>
         <version.c3p0>0.9.5.5</version.c3p0>
@@ -69,6 +71,13 @@
             </exclusions>
         </dependency>
 
+        <!-- Kafka bespoke needed connect-json-->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-json</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- Logging -->
         <dependency>
             <groupId>org.slf4j</groupId>
@@ -93,6 +102,14 @@
             <groupId>com.mchange</groupId>
             <artifactId>c3p0</artifactId>
             <version>${version.c3p0}</version>
+        </dependency>
+
+        <!-- Snowflake -->
+        <dependency>
+            <groupId>net.snowflake</groupId>
+            <artifactId>snowflake-jdbc</artifactId>
+            <version>${version.snowflake}</version>
+            <scope>compile</scope>
         </dependency>
 
         <!-- Testing -->

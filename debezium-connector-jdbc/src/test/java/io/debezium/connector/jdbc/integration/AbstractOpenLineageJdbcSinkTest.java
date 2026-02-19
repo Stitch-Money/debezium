@@ -201,6 +201,8 @@ public abstract class AbstractOpenLineageJdbcSinkTest extends AbstractJdbcSinkTe
             case SQLSERVER -> List.of("id;smallint", "name;varchar", "nick_name$;varchar");
             case ORACLE -> List.of("ID;NUMBER", "NAME;CLOB", "nick_name$;VARCHAR2");
             case DB2 -> List.of("ID;SMALLINT", "NAME;CLOB", "nick_name$;VARCHAR");
+            case SNOWFLAKE -> List.of("ID;INT8", "NAME;STRING", "nick_name$;STRING");
+            default -> throw new IllegalArgumentException("Unsupported sink type: " + getSink().getType());
         };
     }
 
