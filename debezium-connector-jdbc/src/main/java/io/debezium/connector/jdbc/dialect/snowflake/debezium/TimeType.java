@@ -38,4 +38,13 @@ public class TimeType extends AbstractDebeziumTimeType {
         return DateTimeUtils.toLocalTimeFromDurationMilliseconds(value.longValue());
     }
 
+    @Override
+    public String getDefaultValueBinding(Schema schema, Object value) {
+        String formattedTime = super.getDefaultValueBinding(schema, value);
+        String typeName = getTypeName(schema, false);
+        // NOTE: isKey is not referenced in the getTypeName method, so we can safely pass false here.
+        // NOTE: Snowflake requires the string formatted time to be cast to the type name.
+        return formattedTime + "::" + typeName;
+    }
+
 }
