@@ -146,3 +146,33 @@ In order to change this, the `-Dsource.connectors` argument can be supplied with
 In order to run all tests for all source connectors with all sink connector combinations there is a short-cut tag "all":
 
     $ ./mvnw clean install -Dtest.tags=all -Dsource.connectors=all
+
+### Stitch Snowflake Dialect JDBC Sink Contributions
+
+This section documents the additions made to support Snowflake as a JDBC sink target.
+
+#### Dependencies (`pom.xml`)
+
+- Added `net.snowflake:snowflake-jdbc:3.28.0` as a compile-scoped dependency.
+- Added `org.apache.kafka:connect-json` as a provided-scoped dependency.
+
+#### Hibernate Dialect (`hibernate/dialect/snowflake/`)
+
+- **`SnowflakeDialect`** — Custom Hibernate `Dialect` for Snowflake. Handles SQL type mappings (e.g. `TIMESTAMP_TZ`, `VARCHAR(16777216)` for CLOB, `BINARY` for BLOB), keyword registration, default timestamp precision (9), timezone support, and table type awareness (STANDARD vs HYBRID).
+- **`SnowflakeSequenceSupport`** — Implements `SequenceSupport` for Snowflake sequence next-val / drop syntax.
+- **`TableType`** — Enum defining `STANDARD` and `HYBRID` Snowflake table types with their respective `CREATE TABLE` modifiers.
+- **`Version` / `VersionParsingException` / `JdbcDriverVersionException`** — JDBC driver version parsing and minimum-version validation utilities.
+
+#### Database Dialect (`dialect/snowflake/`)
+
+- **`SnowflakeDatabaseDialect`** — Main `DatabaseDialect` implementation for the JDBC sink connector targeting Snowflake. Registered via `META-INF/services` SPI as `SnowflakeDatabaseDialectProvider`.
+
+##### Snowflake-specific type mappings
+
+- **Core types:** `ArrayType`, `BinaryType`, `BitType`, `EnumType`, `JsonType`, `MapToJsonType`, `OidType`, `SerialType`, `UuidType`, `XmlType`.
+- **Kafka Connect schema types (`connect/`):** `ConnectBooleanType`, `ConnectDateType`, `ConnectDecimalType`, `ConnectFloat32Type`, `ConnectFloat64Type`, `ConnectInt8Type`, `ConnectInt16Type`, `ConnectInt32Type`, `ConnectInt64Type`, `ConnectTimeType`, `ConnectTimestampType`.
+- **Debezium named-schema types (`debezium/`):** `AbstractDebeziumTimeType`, `AbstractDebeziumTimestampType`, `DateType`, `DebeziumZonedTimestampType`, `MicroTimeType`, `MicroTimestampType`, `NanoTimeType`, `NanoTimestampType`, `TimeType`, `TimestampType`, `ZonedTimeType`.
+
+#### Service Registration
+
+- `SnowflakeDatabaseDialect$SnowflakeDatabaseDialectProvider` added to `META-INF/services/io.debezium.connector.jdbc.dialect.DatabaseDialectProvider`.
