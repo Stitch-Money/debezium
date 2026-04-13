@@ -3087,6 +3087,49 @@ public abstract class AbstractJdbcSinkPipelineIT extends AbstractJdbcSinkIT {
                 });
     }
 
+    /**
+     * Verifies that when a source table gains a new column while the connector is running,
+     * the Snowflake sink issues a syntactically correct {@code ALTER TABLE ... ADD COLUMN}
+     * statement (no wrapping parentheses) and the column is readable afterwards.
+     * <p>
+     * Oracle and SQL Server are skipped because their DDL syntax for adding a column differs
+     * from the standard {@code ADD COLUMN col TYPE} form used here.
+     */
+    @TestTemplate
+    @SkipWhenSource(value = { SourceType.ORACLE, SourceType.SQLSERVER }, reason = "Different ALTER TABLE ADD COLUMN syntax")
+    public void testSchemaEvolutionAddsColumn(Source source, Sink sink) throws Exception {
+        final String tableName = source.randomTableName();
+
+        // Register the source connector before DDL so the CDC stream captures the CREATE TABLE.
+        registerSourceConnector(source, tableName);
+
+        // Phase 1: create the source table and insert an initial row.
+        source.execute(String.format("CREATE TABLE %s (id INTEGER NOT NULL, value VARCHAR(100), PRIMARY KEY(id))", tableName));
+        source.streamTable(tableName);
+        source.execute(String.format("INSERT INTO %s VALUES (1, 'initial')", tableName));
+
+        Properties sinkProperties = getDefaultSinkConfig(sink);
+        sinkProperties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.BASIC.getValue());
+        sinkProperties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, PrimaryKeyMode.RECORD_KEY.getValue());
+        sinkProperties.put(JdbcSinkConnectorConfig.INSERT_MODE, InsertMode.UPSERT.getValue());
+        startSink(source, sinkProperties, tableName);
+
+        // The first record triggers CREATE TABLE on the sink side.
+        consumeSinkRecord();
+
+        // Phase 2: add a nullable column to the source, then insert a second row.
+        source.execute(String.format("ALTER TABLE %s ADD COLUMN extra_col VARCHAR(100) NULL", tableName));
+        source.execute(String.format("INSERT INTO %s VALUES (2, 'evolved', 'extra')", tableName));
+
+        // The second record carries the extended schema; the sink must issue
+        // ALTER TABLE <table> ADD COLUMN EXTRA_COL <type> NULL (Snowflake syntax, no parentheses).
+        // If the pre-fix syntax ADD (EXTRA_COL ...) were still in place, Snowflake would throw a
+        // SQL compilation error here.
+        final SinkRecord record = consumeSinkRecord();
+
+        assertColumn(sink, record, "extra_col", getStringType(source, false, false, false));
+    }
+
     private static List<ZonedDateTime> getExpectedZonedDateTimes(Sink sink) {
 
         List<ZonedDateTime> expectedValues = List.of();
