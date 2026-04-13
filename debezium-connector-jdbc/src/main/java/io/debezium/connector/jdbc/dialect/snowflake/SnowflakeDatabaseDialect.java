@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.jdbc.dialect.snowflake;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Optional;
@@ -43,6 +45,8 @@ import io.debezium.connector.jdbc.relational.TableDescriptor;
 import io.debezium.connector.jdbc.type.connect.ConnectInt64Type;
 import io.debezium.data.Json;
 import io.debezium.data.Xml;
+import io.debezium.metadata.CollectionId;
+import io.debezium.util.Strings;
 
 public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
 
@@ -73,6 +77,69 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
 
     private SnowflakeDatabaseDialect(JdbcSinkConnectorConfig config, SessionFactory sessionFactory) {
         super(config, sessionFactory);
+    }
+
+    @Override
+    public boolean tableExists(Connection connection, CollectionId collectionId) throws SQLException {
+        // Snowflake's JDBC DatabaseMetaData.getTables() with a null schema searches ALL accessible
+        // schemas, which produces false positives when a table with the same name exists elsewhere.
+        // Querying INFORMATION_SCHEMA.TABLES directly avoids this. INFORMATION_SCHEMA is
+        // database-scoped: without qualification it resolves to the session's current database
+        // (set via ?db=... in the connection URL). When realm is set (3-part topic name, e.g.
+        // "mydb.myschema.orders") qualify the reference so we search the correct database even
+        // if it differs from the session database.
+        if (!getConfig().isQuoteIdentifiers()) {
+            collectionId = collectionId.toUpperCase();
+        }
+        final boolean hasRealm = !Strings.isNullOrBlank(collectionId.realm());
+        final boolean hasSchema = !Strings.isNullOrBlank(collectionId.namespace());
+
+        final String infoSchema = hasRealm
+                ? collectionId.realm() + ".INFORMATION_SCHEMA.TABLES"
+                : "INFORMATION_SCHEMA.TABLES";
+
+        final String sql = hasSchema
+                ? "SELECT COUNT(*) FROM " + infoSchema + " WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+                : "SELECT COUNT(*) FROM " + infoSchema + " WHERE TABLE_NAME = ?";
+
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            if (hasSchema) {
+                stmt.setString(1, collectionId.namespace());
+                stmt.setString(2, collectionId.name());
+            }
+            else {
+                stmt.setString(1, collectionId.name());
+            }
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next() && rs.getInt(1) > 0;
+            }
+        }
+    }
+
+    @Override
+    public TableDescriptor readTable(Connection connection, CollectionId collectionId) throws SQLException {
+        // Apply Snowflake's uppercase-when-unquoted rule before delegating to the parent's
+        // JDBC metadata calls (getTables / getPrimaryKeys / getColumns).
+        if (!getConfig().isQuoteIdentifiers()) {
+            collectionId = collectionId.toUpperCase();
+        }
+        return super.readTable(connection, collectionId);
+    }
+
+    @Override
+    public String getAlterTablePrefix() {
+        // Snowflake ALTER TABLE syntax: ADD COLUMN col TYPE (no wrapping parentheses)
+        return "";
+    }
+
+    @Override
+    public String getAlterTableSuffix() {
+        return "";
+    }
+
+    @Override
+    public String getAlterTableColumnPrefix() {
+        return "ADD COLUMN ";
     }
 
     @Override
