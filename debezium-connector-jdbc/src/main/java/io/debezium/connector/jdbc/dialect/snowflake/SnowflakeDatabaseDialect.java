@@ -127,6 +127,18 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
     }
 
     @Override
+    public CollectionId getCollectionId(String tableName) {
+        // Centralise Snowflake's uppercase-when-unquoted rule at the point where the
+        // CollectionId is created, so every downstream use (DDL, buffer map key, log
+        // messages) consistently reflects the casing that Snowflake actually stores.
+        CollectionId id = super.getCollectionId(tableName);
+        if (!getConfig().isQuoteIdentifiers()) {
+            return id.toUpperCase();
+        }
+        return id;
+    }
+
+    @Override
     public String getAlterTablePrefix() {
         // Snowflake ALTER TABLE syntax: ADD COLUMN col TYPE (no wrapping parentheses)
         return "";
@@ -234,6 +246,13 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
     public String getFormattedBoolean(boolean value) {
         // PostgreSQL maps logical TRUE/FALSE for boolean data types
         return value ? "TRUE" : "FALSE";
+    }
+
+    @Override
+    public String getFormattedTimestampWithTimeZone(String value) {
+        // Snowflake rejects bare string literals as defaults for TIMESTAMP_TZ columns.
+        // Wrapping with TO_TIMESTAMP_TZ() ensures the DDL is accepted.
+        return String.format("TO_TIMESTAMP_TZ('%s')", value);
     }
 
     @Override
