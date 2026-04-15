@@ -14,7 +14,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.connector.jdbc.type.AbstractType;
 import io.debezium.connector.jdbc.type.JdbcType;
 import io.debezium.data.Enum;
-import io.debezium.data.Uuid;
+import io.debezium.data.EnumSet;
 import io.debezium.sink.valuebinding.ValueBindDescriptor;
 
 /**
@@ -30,7 +30,7 @@ class EnumType extends AbstractType {
 
     @Override
     public String[] getRegistrationKeys() {
-        return new String[]{ Enum.LOGICAL_NAME };
+        return new String[]{ Enum.LOGICAL_NAME, EnumSet.LOGICAL_NAME };
     }
 
     @Override
@@ -40,10 +40,10 @@ class EnumType extends AbstractType {
 
     @Override
     public List<ValueBindDescriptor> bind(int index, Schema schema, Object value) {
-        if (value instanceof Uuid) {
-            super.bind(index, schema, ((Uuid) value).toString());
+        if (value == null) {
+            return super.bind(index, schema, null);
         }
-        return super.bind(index, schema, value.toString());
+        return super.bind(index, schema, value);
     }
 
 }
