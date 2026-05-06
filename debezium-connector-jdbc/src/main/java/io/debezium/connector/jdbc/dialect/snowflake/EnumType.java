@@ -8,13 +8,10 @@ package io.debezium.connector.jdbc.dialect.snowflake;
 import java.util.List;
 
 import org.apache.kafka.connect.data.Schema;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.jdbc.type.AbstractType;
 import io.debezium.connector.jdbc.type.JdbcType;
 import io.debezium.data.Enum;
-import io.debezium.data.Uuid;
 import io.debezium.sink.valuebinding.ValueBindDescriptor;
 
 /**
@@ -23,8 +20,6 @@ import io.debezium.sink.valuebinding.ValueBindDescriptor;
  * @author Marinus Krommenhoek
  */
 class EnumType extends AbstractType {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger(EnumType.class);
 
     public static final EnumType INSTANCE = new EnumType();
 
@@ -40,8 +35,8 @@ class EnumType extends AbstractType {
 
     @Override
     public List<ValueBindDescriptor> bind(int index, Schema schema, Object value) {
-        if (value instanceof Uuid) {
-            super.bind(index, schema, ((Uuid) value).toString());
+        if (value == null) {
+            return super.bind(index, schema, null);
         }
         return super.bind(index, schema, value.toString());
     }
