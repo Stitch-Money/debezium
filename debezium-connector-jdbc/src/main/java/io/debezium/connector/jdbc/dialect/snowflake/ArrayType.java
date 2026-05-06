@@ -44,6 +44,14 @@ public class ArrayType extends AbstractType {
         if (value == null) {
             return List.of(new ValueBindDescriptor(index, null));
         }
-        return List.of(new ValueBindDescriptor(index, value, java.sql.Types.ARRAY, getElementTypeName(this.getDialect(), schema, false)));
+        // Connection.createArrayOf() expects a bare SQL type name (e.g. "VARCHAR"), not a DDL
+        // expression with size (e.g. "VARCHAR(16777216)"). The Snowflake JDBC driver validates the
+        // type name against java.sql.JDBCType enum constants, which have no size qualifier.
+        String elementTypeName = getElementTypeName(this.getDialect(), schema, false);
+        int parenIdx = elementTypeName.indexOf('(');
+        if (parenIdx >= 0) {
+            elementTypeName = elementTypeName.substring(0, parenIdx);
+        }
+        return List.of(new ValueBindDescriptor(index, value, java.sql.Types.ARRAY, elementTypeName));
     }
 }
