@@ -35,8 +35,8 @@ class UuidType extends AbstractType {
 
     @Override
     public List<ValueBindDescriptor> bind(int index, Schema schema, Object value) {
-        if (value instanceof Uuid) {
-            super.bind(index, schema, ((Uuid) value).toString());
+        if (value == null) {
+            return super.bind(index, schema, null);
         }
         return super.bind(index, schema, value.toString());
     }
