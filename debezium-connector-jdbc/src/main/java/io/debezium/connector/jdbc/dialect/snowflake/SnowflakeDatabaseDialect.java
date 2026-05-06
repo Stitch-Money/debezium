@@ -202,6 +202,9 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
         if (Schema.Type.MAP.equals(schema.type())) {
             return String.format("PARSE_JSON(%s) AS %s", name, name);
         }
+        if (Schema.Type.ARRAY.equals(schema.type())) {
+            return String.format("PARSE_JSON(%s) AS %s", name, name);
+        }
         // return name;
         return columnQueryBinding;
     }

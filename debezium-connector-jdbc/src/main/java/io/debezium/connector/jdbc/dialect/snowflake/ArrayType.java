@@ -8,8 +8,11 @@ package io.debezium.connector.jdbc.dialect.snowflake;
 import java.util.List;
 
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.errors.ConnectException;
 
-import io.debezium.connector.jdbc.dialect.DatabaseDialect;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import io.debezium.connector.jdbc.type.AbstractType;
 import io.debezium.connector.jdbc.type.JdbcType;
 import io.debezium.sink.valuebinding.ValueBindDescriptor;
@@ -22,6 +25,8 @@ import io.debezium.sink.valuebinding.ValueBindDescriptor;
 
 public class ArrayType extends AbstractType {
 
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
     public static final ArrayType INSTANCE = new ArrayType();
 
     @Override
@@ -31,12 +36,8 @@ public class ArrayType extends AbstractType {
 
     @Override
     public String getTypeName(Schema schema, boolean isKey) {
-        return "ARRAY(" + getElementTypeName(getDialect(), schema, isKey) + ")";
-    }
-
-    private String getElementTypeName(DatabaseDialect dialect, Schema schema, boolean isKey) {
-        JdbcType elementJdbcType = dialect.getSchemaType(schema.valueSchema());
-        return elementJdbcType.getTypeName(schema.valueSchema(), isKey);
+        // Snowflake's ARRAY is a semi-structured type with no element-type qualifier in DDL
+        return "ARRAY";
     }
 
     @Override
@@ -44,14 +45,15 @@ public class ArrayType extends AbstractType {
         if (value == null) {
             return List.of(new ValueBindDescriptor(index, null));
         }
-        // Connection.createArrayOf() expects a bare SQL type name (e.g. "VARCHAR"), not a DDL
-        // expression with size (e.g. "VARCHAR(16777216)"). The Snowflake JDBC driver validates the
-        // type name against java.sql.JDBCType enum constants, which have no size qualifier.
-        String elementTypeName = getElementTypeName(this.getDialect(), schema, false);
-        int parenIdx = elementTypeName.indexOf('(');
-        if (parenIdx >= 0) {
-            elementTypeName = elementTypeName.substring(0, parenIdx);
+        // Snowflake ARRAY is semi-structured (like VARIANT). Values must be passed as a JSON
+        // string and converted in SQL via PARSE_JSON() — the same pattern used for MAP types.
+        // Using Types.ARRAY / Connection.createArrayOf() causes Snowflake to interpret the value
+        // as VARCHAR, producing a type-mismatch error.
+        try {
+            return List.of(new ValueBindDescriptor(index, OBJECT_MAPPER.writeValueAsString(value)));
         }
-        return List.of(new ValueBindDescriptor(index, value, java.sql.Types.ARRAY, elementTypeName));
+        catch (JsonProcessingException e) {
+            throw new ConnectException("Failed to serialize ARRAY to JSON", e);
+        }
     }
 }
