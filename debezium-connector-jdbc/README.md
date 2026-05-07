@@ -176,3 +176,43 @@ This section documents the additions made to support Snowflake as a JDBC sink ta
 #### Service Registration
 
 - `SnowflakeDatabaseDialect$SnowflakeDatabaseDialectProvider` added to `META-INF/services/io.debezium.connector.jdbc.dialect.DatabaseDialectProvider`.
+
+#### Transforms (`transforms/`)
+
+- **`ToastColumnFilter`** — A Kafka Connect SMT that strips fields carrying the PostgreSQL TOAST
+  unavailable-value sentinel (`__debezium_unavailable_value`) from the `SinkRecord` schema and
+  struct before the record reaches the JDBC sink connector. When a TOASTed column is not
+  included in the WAL record and no SMT is configured, the connector throws a `DataException`
+  with actionable remediation guidance. Configuring this SMT is one of the three supported
+  remediation paths.
+
+##### Why it is needed
+
+PostgreSQL only includes changed column values in WAL `UPDATE` records. Columns that were not
+changed and whose values are stored out-of-line (TOAST) are omitted. Debezium fills the gap with
+the sentinel string `__debezium_unavailable_value`. Without intervention, the JDBC sink connector
+attempts to write this string to a semi-structured column (e.g. a Snowflake `VARIANT` or `ARRAY`)
+via `PARSE_JSON()`, causing a SQL parse error.
+
+##### How it works
+
+On each record the SMT inspects every field in the value `Struct`. Any field whose value equals
+the placeholder is removed from both the schema and the struct. The modified record is passed
+downstream with a reduced schema. Because the JDBC sink connector's internal record buffer detects
+schema changes and flushes the current batch before accepting a record with a new schema, TOAST
+records and normal records are automatically separated into independent batches. The
+`MERGE`/`UPDATE` SQL generated for a TOAST batch does not reference the stripped column, so the
+existing database value is left intact.
+
+##### Configuration
+
+```properties
+transforms=stripToast
+transforms.stripToast.type=io.debezium.connector.jdbc.transforms.ToastColumnFilter
+# Optional — only needed if the Debezium source connector uses a non-default placeholder:
+# transforms.stripToast.unavailable.value.placeholder=__debezium_unavailable_value
+```
+
+| Property | Default | Description |
+|---|---|---|
+| `unavailable.value.placeholder` | `__debezium_unavailable_value` | The sentinel string that identifies an unavailable TOAST column value. Must match the `unavailable.value.placeholder` configured on the Debezium source connector. |
