@@ -53,22 +53,34 @@ import io.debezium.connector.jdbc.Module;
  *
  * <h2>How it works</h2>
  * <p>
- * On each record the SMT inspects every field in the value {@link Struct}. Any field whose
- * string value equals the configured placeholder is collected for removal. If no such fields
- * are found the original record is returned unchanged (zero allocation fast path).
+ * On each record the SMT first determines whether the value {@link Struct} is a full Debezium
+ * change event envelope or an already-unwrapped (flat) record.
  * </p>
  * <p>
- * When one or more TOAST fields are found, the SMT rebuilds both the {@link Schema} and the
- * {@link Struct} without those fields and returns a new record via
- * {@link ConnectRecord#newRecord}.
+ * <b>Envelope detection:</b> if the top-level struct contains a field named {@code after}
+ * whose schema type is {@link Schema.Type#STRUCT}, the record is treated as a Debezium change
+ * event envelope. The SMT inspects the fields of the {@code after} sub-struct for the TOAST
+ * sentinel. If TOAST fields are found, only the {@code after} sub-struct is rebuilt without
+ * those fields; the outer envelope is reconstructed with the reduced {@code after} schema. All
+ * other envelope fields ({@code before}, {@code op}, {@code source}, {@code ts_ms}, etc.) pass
+ * through unmodified. This is the typical case when no {@code ExtractNewRecordState} SMT is
+ * applied upstream.
  * </p>
  * <p>
- * The JDBC sink connector's internal record buffer detects schema changes between consecutive
- * records. Removing a field changes the {@code valueSchema}, causing the buffer to flush the
- * current batch and start a new one before accepting the TOAST record. As a result, TOAST
- * records and normal records are automatically segregated into independent batches. The
- * {@code MERGE}/{@code UPDATE} SQL generated for a TOAST batch does not reference the stripped
- * column, so the existing database value is preserved.
+ * <b>Flat record:</b> if no {@code after}-typed-as-STRUCT field is present, the SMT inspects
+ * the top-level fields directly. This is the case when {@code ExtractNewRecordState} has
+ * already been applied before this SMT in the transforms chain, and it must be ordered
+ * <em>before</em> this SMT so that the record value is already the unwrapped struct.
+ * </p>
+ * <p>
+ * In both cases: if no TOAST fields are found the original record is returned unchanged (zero
+ * allocation fast path).
+ * </p>
+ * <p>
+ * When TOAST fields are removed, the modified schema causes the JDBC sink connector's internal
+ * record buffer to flush the current batch and start a new one. The {@code MERGE}/{@code UPDATE}
+ * SQL generated for a TOAST batch does not reference the stripped column, so the existing
+ * database value is preserved.
  * </p>
  *
  * <h2>Configuration</h2>
@@ -140,15 +152,20 @@ public class ToastColumnFilter<R extends ConnectRecord<R>> implements Transforma
      * <ul>
      *   <li><b>Tombstone</b> ({@code record.value() == null}): returned unchanged.</li>
      *   <li><b>Non-Struct value</b>: returned unchanged.</li>
-     *   <li><b>No TOAST fields</b>: returned unchanged (zero allocation fast path).</li>
-     *   <li><b>One or more TOAST fields</b>: a new record is returned whose value schema
-     *       and struct no longer contain the sentinel-valued fields.</li>
+     *   <li><b>Debezium envelope, {@code after} is non-null with TOAST fields</b>: a new record
+     *       is returned whose {@code after} sub-schema and sub-struct no longer contain the
+     *       sentinel-valued fields; the outer envelope schema is also rebuilt to reference the
+     *       reduced {@code after} schema.</li>
+     *   <li><b>Debezium envelope, {@code after} is null</b> (DELETE event): returned unchanged.</li>
+     *   <li><b>Flat record, no TOAST fields</b>: returned unchanged (zero allocation fast path).</li>
+     *   <li><b>Flat record, one or more TOAST fields</b>: a new record is returned whose value
+     *       schema and struct no longer contain the sentinel-valued fields.</li>
      * </ul>
      * </p>
      *
      * @param record the record to transform
      * @return the original record if no TOAST fields are present, otherwise a new record
-     *         with the TOAST fields removed from both the schema and the struct
+     *         with the TOAST fields removed
      */
     @Override
     public R apply(R record) {
@@ -162,6 +179,84 @@ public class ToastColumnFilter<R extends ConnectRecord<R>> implements Transforma
             return record;
         }
 
+        final Field afterField = originalStruct.schema().field("after");
+        if (afterField != null && afterField.schema().type() == Schema.Type.STRUCT) {
+            return applyToEnvelope(record, originalStruct);
+        }
+
+        return applyToFlatRecord(record, originalStruct);
+    }
+
+    /**
+     * Applies TOAST filtering to a full Debezium change event envelope. Only the {@code after}
+     * sub-struct is inspected; all other envelope fields are preserved as-is.
+     *
+     * @param record   the original record
+     * @param envelope the top-level envelope struct
+     * @return the original record if {@code after} is null or contains no TOAST fields,
+     *         otherwise a new record with a reduced {@code after} sub-struct
+     */
+    private R applyToEnvelope(R record, Struct envelope) {
+        final Struct after = (Struct) envelope.get("after");
+        if (after == null) {
+            return record;
+        }
+
+        final List<String> toastFieldNames = collectToastFieldNames(after);
+        if (toastFieldNames.isEmpty()) {
+            return record;
+        }
+
+        LOGGER.debug("Stripping {} TOAST field(s) from envelope 'after' on topic '{}': {}",
+                toastFieldNames.size(), record.topic(), toastFieldNames);
+
+        final Schema reducedAfterSchema = buildReducedSchema(after.schema(), toastFieldNames);
+        final Struct reducedAfterStruct = buildReducedStruct(after, reducedAfterSchema);
+
+        final Schema originalEnvelopeSchema = envelope.schema();
+        final SchemaBuilder envelopeBuilder = SchemaBuilder.struct();
+        if (originalEnvelopeSchema.name() != null) {
+            envelopeBuilder.name(originalEnvelopeSchema.name());
+        }
+        if (originalEnvelopeSchema.version() != null) {
+            envelopeBuilder.version(originalEnvelopeSchema.version());
+        }
+        if (originalEnvelopeSchema.doc() != null) {
+            envelopeBuilder.doc(originalEnvelopeSchema.doc());
+        }
+        for (Field field : originalEnvelopeSchema.fields()) {
+            envelopeBuilder.field(field.name(),
+                    "after".equals(field.name()) ? reducedAfterSchema : field.schema());
+        }
+        final Schema reducedEnvelopeSchema = envelopeBuilder.build();
+
+        final Struct reducedEnvelope = new Struct(reducedEnvelopeSchema);
+        for (Field field : reducedEnvelopeSchema.fields()) {
+            reducedEnvelope.put(field.name(),
+                    "after".equals(field.name()) ? reducedAfterStruct : envelope.get(field.name()));
+        }
+
+        return record.newRecord(
+                record.topic(),
+                record.kafkaPartition(),
+                record.keySchema(),
+                record.key(),
+                reducedEnvelopeSchema,
+                reducedEnvelope,
+                record.timestamp(),
+                record.headers());
+    }
+
+    /**
+     * Applies TOAST filtering to a flat (already-unwrapped) record whose top-level fields
+     * are the column values directly.
+     *
+     * @param record         the original record
+     * @param originalStruct the flat value struct
+     * @return the original record if no TOAST fields are present, otherwise a new record
+     *         with the TOAST fields removed from both the schema and the struct
+     */
+    private R applyToFlatRecord(R record, Struct originalStruct) {
         final List<String> toastFieldNames = collectToastFieldNames(originalStruct);
 
         if (toastFieldNames.isEmpty()) {
