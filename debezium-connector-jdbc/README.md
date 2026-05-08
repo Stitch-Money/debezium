@@ -196,21 +196,37 @@ via `PARSE_JSON()`, causing a SQL parse error.
 
 ##### How it works
 
-On each record the SMT inspects every field in the value `Struct`. Any field whose value equals
-the placeholder is removed from both the schema and the struct. The modified record is passed
-downstream with a reduced schema. Because the JDBC sink connector's internal record buffer detects
-schema changes and flushes the current batch before accepting a record with a new schema, TOAST
-records and normal records are automatically separated into independent batches. The
-`MERGE`/`UPDATE` SQL generated for a TOAST batch does not reference the stripped column, so the
-existing database value is left intact.
+On each record the SMT detects whether the value `Struct` is a full Debezium change event
+envelope or an already-unwrapped (flat) record.
+
+- **Full envelope** (top-level struct has an `after` field of type `STRUCT`): the SMT inspects
+  the fields of the `after` sub-struct. Any field whose value equals the placeholder is removed
+  from both the `after` schema and the `after` struct. The outer envelope is rebuilt with the
+  reduced `after` field; all other envelope fields (`before`, `op`, `source`, `ts_ms`, etc.) are
+  preserved. This is the typical case when no `ExtractNewRecordState` SMT is applied upstream.
+
+- **Flat record** (no `after`-typed-as-STRUCT at top level): the SMT inspects the top-level
+  fields directly. This applies when `ExtractNewRecordState` has already been applied before
+  this SMT in the transforms chain. In that case `ExtractNewRecordState` **must** be listed
+  before `ToastColumnFilter` (e.g. `transforms=unwrap,stripToast`) so that this SMT receives
+  the unwrapped struct rather than the full envelope.
+
+In both cases, if no TOAST fields are found the original record is returned unchanged. When TOAST
+fields are removed, the modified schema causes the JDBC sink connector's internal record buffer to
+flush the current batch and start a new one. The `MERGE`/`UPDATE` SQL generated for that batch
+does not reference the stripped column, so the existing database value is left intact.
 
 ##### Configuration
 
 ```properties
 transforms=stripToast
 transforms.stripToast.type=io.debezium.connector.jdbc.transforms.ToastColumnFilter
-# Optional — only needed if the Debezium source connector uses a non-default placeholder:
+# Optional — only needed if the source connector uses a non-default placeholder:
 # transforms.stripToast.unavailable.value.placeholder=__debezium_unavailable_value
+
+# If ExtractNewRecordState is also configured it must be listed BEFORE stripToast:
+# transforms=unwrap,stripToast
+# transforms.unwrap.type=io.debezium.transforms.ExtractNewRecordState
 ```
 
 | Property | Default | Description |
