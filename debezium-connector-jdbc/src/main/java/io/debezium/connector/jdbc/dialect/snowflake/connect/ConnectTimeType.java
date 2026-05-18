@@ -34,10 +34,7 @@ public class ConnectTimeType extends AbstractTimeType {
     @Override
     public String getDefaultValueBinding(Schema schema, Object value) {
         String formattedTime = getDialect().getFormattedTime(DateTimeUtils.toZonedDateTimeFromDate((Date) value, getDatabaseTimeZone()));
-        // NOTE: isKey is not referenced in the getTypeName method, so we can safely pass false here.
-        // NOTE: Snowflake requires the string formatted time to be cast to the type name.
-        String typeName = getTypeName(schema, false);
-        return formattedTime + "::" + typeName;
+        return "TO_TIME(" + formattedTime + ")";
     }
 
     @Override
