@@ -7,6 +7,9 @@ package io.debezium.connector.jdbc.dialect.snowflake;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.TemporalAccessor;
 import java.util.Optional;
 import java.util.Set;
 
@@ -43,10 +46,13 @@ import io.debezium.connector.jdbc.relational.TableDescriptor;
 import io.debezium.connector.jdbc.type.connect.ConnectInt64Type;
 import io.debezium.data.Json;
 import io.debezium.data.Xml;
+import io.debezium.time.ZonedTimestamp;
 
 public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SnowflakeDatabaseDialect.class);
+
+    private static final DateTimeFormatter SNOWFLAKE_DATETIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSSSS xxx");
 
     private static final int MAX_VARCHAR_LENGTH = 134217728;
     private static final int MAX_VARBINARY_LENGTH = 67108864;
@@ -167,6 +173,17 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
     public String getFormattedBoolean(boolean value) {
         // PostgreSQL maps logical TRUE/FALSE for boolean data types
         return value ? "TRUE" : "FALSE";
+    }
+
+    @Override
+    public String getFormattedDateTime(TemporalAccessor value) {
+        return String.format("'%s'", SNOWFLAKE_DATETIME_FORMATTER.format(value));
+    }
+
+    @Override
+    public String getFormattedTimestampWithTimeZone(String value) {
+        ZonedDateTime zdt = ZonedDateTime.parse(value, ZonedTimestamp.FORMATTER);
+        return String.format("'%s'", SNOWFLAKE_DATETIME_FORMATTER.format(zdt));
     }
 
     @Override
