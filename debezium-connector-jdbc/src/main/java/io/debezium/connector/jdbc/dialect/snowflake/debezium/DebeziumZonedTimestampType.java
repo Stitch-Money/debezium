@@ -36,10 +36,7 @@ public class DebeziumZonedTimestampType extends AbstractTimestampType {
     @Override
     public String getDefaultValueBinding(Schema schema, Object value) {
         String formattedTimestamp = getDialect().getFormattedTimestampWithTimeZone((String) value);
-        String typeName = getTypeName(schema, false);
-        // NOTE: isKey is not referenced in the getTypeName method, so we can safely pass false here.
-        // NOTE: Snowflake requires the string formatted timestamp to be cast to the type name.
-        return formattedTimestamp + "::" + typeName;
+        return "TO_TIMESTAMP_TZ(" + formattedTimestamp + ")";
     }
 
     @Override

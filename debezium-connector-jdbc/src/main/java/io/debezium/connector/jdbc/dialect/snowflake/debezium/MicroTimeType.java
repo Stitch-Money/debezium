@@ -55,9 +55,6 @@ public class MicroTimeType extends AbstractDebeziumTimeType {
     @Override
     public String getDefaultValueBinding(Schema schema, Object value) {
         String formattedTime = super.getDefaultValueBinding(schema, value);
-        // NOTE: isKey is not referenced in the getTypeName method, so we can safely pass false here.
-        // NOTE: Snowflake requires the string formatted time to be cast to the type name.
-        String typeName = getTypeName(schema, false);
-        return formattedTime + "::" + typeName;
+        return "TO_TIME(" + formattedTime + ")";
     }
 }

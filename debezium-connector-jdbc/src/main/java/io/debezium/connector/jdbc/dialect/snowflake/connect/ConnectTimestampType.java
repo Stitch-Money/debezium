@@ -36,10 +36,7 @@ public class ConnectTimestampType extends AbstractTimestampType {
     @Override
     public String getDefaultValueBinding(Schema schema, Object value) {
         String formattedTimestamp = getDialect().getFormattedTimestamp(DateTimeUtils.toZonedDateTimeFromDate((java.util.Date) value, ZoneOffset.UTC));
-        // NOTE: isKey is not referenced in the getTypeName method, so we can safely pass false here.
-        String typeName = getTypeName(schema, false);
-        // NOTE: Snowflake requires the string formatted timestamp to be cast to the type name.
-        return formattedTimestamp + "::" + typeName;
+        return "TO_TIMESTAMP_TZ(" + formattedTimestamp + ")";
     }
 
     @Override
