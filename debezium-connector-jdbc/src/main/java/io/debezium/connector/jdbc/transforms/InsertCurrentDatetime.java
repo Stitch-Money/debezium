@@ -120,7 +120,11 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
         }
 
         final Field afterField = originalStruct.schema().field("after");
-        if (afterField != null && afterField.schema().type() == Schema.Type.STRUCT) {
+        final Field beforeField = originalStruct.schema().field("before");
+        final Field opField = originalStruct.schema().field("op");
+        if (afterField != null && afterField.schema().type() == Schema.Type.STRUCT
+                && beforeField != null && beforeField.schema().type() == Schema.Type.STRUCT
+                && opField != null && opField.schema().type() == Schema.Type.STRING) {
             return applyToEnvelope(record, originalStruct);
         }
 
@@ -142,7 +146,13 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
             return record;
         }
 
-        LOGGER.debug("Inserting datetime field '{}' into envelope 'after' on topic '{}'", columnName, record.topic());
+        if (after.schema().field(columnName) == null) {
+            LOGGER.debug("Inserting datetime field '{}' into envelope 'after' on topic '{}'", columnName, record.topic());
+        }
+        else {
+            LOGGER.debug("Field '{}' already exists in envelope 'after' on topic '{}'; preserving source value or stamping null",
+                    columnName, record.topic());
+        }
 
         final Schema expandedAfterSchema = buildExpandedSchema(after.schema());
         final Struct expandedAfterStruct = buildExpandedStruct(after, expandedAfterSchema);
@@ -157,6 +167,12 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
         }
         if (originalEnvelopeSchema.doc() != null) {
             envelopeBuilder.doc(originalEnvelopeSchema.doc());
+        }
+        if (originalEnvelopeSchema.isOptional()) {
+            envelopeBuilder.optional();
+        }
+        if (originalEnvelopeSchema.parameters() != null && !originalEnvelopeSchema.parameters().isEmpty()) {
+            envelopeBuilder.parameters(originalEnvelopeSchema.parameters());
         }
         for (Field field : originalEnvelopeSchema.fields()) {
             envelopeBuilder.field(field.name(),
@@ -189,7 +205,13 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
      * @return a new record with the datetime field appended
      */
     private R applyToFlatRecord(R record, Struct originalStruct) {
-        LOGGER.debug("Inserting datetime field '{}' into flat record on topic '{}'", columnName, record.topic());
+        if (originalStruct.schema().field(columnName) == null) {
+            LOGGER.debug("Inserting datetime field '{}' into flat record on topic '{}'", columnName, record.topic());
+        }
+        else {
+            LOGGER.debug("Field '{}' already exists in flat record on topic '{}'; preserving source value or stamping null",
+                    columnName, record.topic());
+        }
 
         final Schema expandedSchema = buildExpandedSchema(originalStruct.schema());
         final Struct expandedStruct = buildExpandedStruct(originalStruct, expandedSchema);
@@ -223,16 +245,38 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
         if (originalSchema.doc() != null) {
             builder.doc(originalSchema.doc());
         }
+        if (originalSchema.isOptional()) {
+            builder.optional();
+        }
+        if (originalSchema.parameters() != null && !originalSchema.parameters().isEmpty()) {
+            builder.parameters(originalSchema.parameters());
+        }
         for (Field field : originalSchema.fields()) {
             builder.field(field.name(), field.schema());
         }
-        builder.field(columnName, Timestamp.builder().optional().build());
+        final Field existingField = originalSchema.field(columnName);
+        if (existingField == null) {
+            builder.field(columnName, Timestamp.builder().optional().build());
+        }
+        else if (!Timestamp.LOGICAL_NAME.equals(existingField.schema().name())) {
+            final String schemaDescription = existingField.schema().name() != null
+                    ? existingField.schema().name()
+                    : existingField.schema().type().getName();
+            LOGGER.warn("Field '{}' already exists with schema type '{}' instead of Timestamp. " +
+                    "Configure column.name to a column that does not exist in the source schema " +
+                    "or is a Timestamp-typed column. Source value will be preserved unchanged.",
+                    columnName, schemaDescription);
+        }
         return builder.build();
     }
 
     /**
      * Builds a new {@link Struct} conforming to {@code expandedSchema} by copying all field
      * values from {@code originalStruct} and setting {@code columnName} to the current UTC time.
+     * When {@code columnName} already exists in the source schema with a non-null
+     * {@link Timestamp} value, the source value is preserved unchanged. When the source value is
+     * {@code null} and the field is a {@link Timestamp} logical type, the current UTC time is
+     * stamped to prevent a {@code null} audit column.
      *
      * @param originalStruct the source struct
      * @param expandedSchema the schema of the new struct (datetime field already included)
@@ -243,7 +287,13 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
         for (Field field : originalStruct.schema().fields()) {
             expandedStruct.put(field.name(), originalStruct.get(field.name()));
         }
-        expandedStruct.put(columnName, new Date());
+        final Field existingField = originalStruct.schema().field(columnName);
+        if (existingField == null) {
+            expandedStruct.put(columnName, new Date());
+        }
+        else if (Timestamp.LOGICAL_NAME.equals(existingField.schema().name()) && originalStruct.get(columnName) == null) {
+            expandedStruct.put(columnName, new Date());
+        }
         return expandedStruct;
     }
 
