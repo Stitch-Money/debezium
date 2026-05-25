@@ -320,6 +320,80 @@ class InsertCurrentDatetimeTest {
     }
 
     /**
+     * When a flat record has a pre-existing Timestamp column with a schema-level
+     * {@code defaultValue} and a {@code null} physical slot, the SMT must stamp the current time
+     * rather than leaving the schema default in place. This guards against a regression where
+     * {@code Struct.get()} is used instead of {@code getWithoutDefault()}: {@code get()} returns
+     * the schema default for a physically-null slot, making the null check false and causing the
+     * column to silently retain the stale default instead of being stamped.
+     */
+    @Test
+    void flatRecordWithSchemaDefaultAndNullTimestampIsStamped() {
+        final Date schemaDefault = new Date(0L);
+        final Schema valueSchema = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field(COLUMN, Timestamp.builder().optional().defaultValue(schemaDefault).build())
+                .build();
+        final Struct value = new Struct(valueSchema).put("id", 9).put(COLUMN, null);
+        final SinkRecord record = sinkRecord(valueSchema, value);
+
+        final long before = System.currentTimeMillis();
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+            final long after = System.currentTimeMillis();
+
+            final Date stampedAt = (Date) ((Struct) result.value()).get(COLUMN);
+            assertThat(stampedAt).isNotNull();
+            assertThat(stampedAt.getTime()).isGreaterThanOrEqualTo(before);
+            assertThat(stampedAt.getTime()).isLessThanOrEqualTo(after);
+        }
+    }
+
+    /**
+     * When the envelope {@code after} struct has a pre-existing Timestamp column with a
+     * schema-level {@code defaultValue} and a {@code null} physical slot, the SMT must stamp the
+     * current time rather than leaving the schema default in place.
+     */
+    @Test
+    void envelopeWithSchemaDefaultAndNullTimestampIsStamped() {
+        final Date schemaDefault = new Date(0L);
+        final Schema rowSchema = SchemaBuilder.struct()
+                .name("test.Value")
+                .field("id", Schema.INT32_SCHEMA)
+                .field(COLUMN, Timestamp.builder().optional().defaultValue(schemaDefault).build())
+                .optional()
+                .build();
+        final Schema envelopeSchema = SchemaBuilder.struct()
+                .name("test.Envelope")
+                .field("before", rowSchema)
+                .field("after", rowSchema)
+                .field("op", Schema.STRING_SCHEMA)
+                .build();
+
+        final Struct after = new Struct(rowSchema).put("id", 10).put(COLUMN, null);
+        final Struct envelope = new Struct(envelopeSchema)
+                .put("before", null)
+                .put("after", after)
+                .put("op", "u");
+        final SinkRecord record = sinkRecord(envelopeSchema, envelope);
+
+        final long before = System.currentTimeMillis();
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+            final long afterTime = System.currentTimeMillis();
+
+            final Struct resultAfter = (Struct) ((Struct) result.value()).get("after");
+            final Date stampedAt = (Date) resultAfter.get(COLUMN);
+            assertThat(stampedAt).isNotNull();
+            assertThat(stampedAt.getTime()).isGreaterThanOrEqualTo(before);
+            assertThat(stampedAt.getTime()).isLessThanOrEqualTo(afterTime);
+            assertThat(resultAfter.get("id")).isEqualTo(10);
+        }
+    }
+
+    /**
      * Configuring without a {@code column.name} must throw a {@link ConfigException}.
      */
     @Test
