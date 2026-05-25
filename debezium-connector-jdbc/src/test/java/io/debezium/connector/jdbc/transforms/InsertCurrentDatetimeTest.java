@@ -114,6 +114,36 @@ class InsertCurrentDatetimeTest {
     }
 
     /**
+     * A flat record that happens to have a domain field named {@code after} of type STRUCT must
+     * NOT be mis-classified as a Debezium envelope. The datetime field must be appended to the
+     * top-level struct, not to the nested {@code after} sub-struct.
+     */
+    @Test
+    void flatRecordWithAfterFieldIsNotMisRoutedToEnvelopePath() {
+        final Schema innerSchema = SchemaBuilder.struct()
+                .field("x", Schema.INT32_SCHEMA)
+                .build();
+        final Schema valueSchema = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field("after", innerSchema)
+                .build();
+        final Struct innerStruct = new Struct(innerSchema).put("x", 42);
+        final Struct value = new Struct(valueSchema).put("id", 9).put("after", innerStruct);
+        final SinkRecord record = sinkRecord(valueSchema, value);
+
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+
+            assertThat(result.valueSchema().field(COLUMN)).isNotNull();
+            assertThat(result.valueSchema().field("id")).isNotNull();
+            assertThat(result.valueSchema().field("after")).isNotNull();
+            assertThat(((Struct) result.value()).get(COLUMN)).isNotNull();
+            assertThat(((Struct) result.value()).get("id")).isEqualTo(9);
+        }
+    }
+
+    /**
      * A tombstone record (null value) must be returned as the same object reference unchanged.
      */
     @Test
@@ -154,6 +184,138 @@ class InsertCurrentDatetimeTest {
         try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
             smt.configure(Map.of("column.name", COLUMN));
             assertThat(smt.apply(record)).isSameAs(record);
+        }
+    }
+
+    /**
+     * When the source flat record already contains a field matching {@code column.name}, the SMT
+     * must not crash (no SchemaBuilderException or DataException) and must preserve the existing
+     * field's value unchanged.
+     */
+    @Test
+    void flatRecordWithPreExistingColumnPreservesSourceValue() {
+        final Schema valueSchema = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field(COLUMN, Timestamp.builder().optional().build())
+                .build();
+        final Date sourceTimestamp = new Date(1_000_000_000_000L);
+        final Struct value = new Struct(valueSchema).put("id", 5).put(COLUMN, sourceTimestamp);
+        final SinkRecord record = sinkRecord(valueSchema, value);
+
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+
+            final Struct resultValue = (Struct) result.value();
+            assertThat(resultValue.schema().fields()).hasSize(2);
+            assertThat(resultValue.get(COLUMN)).isEqualTo(sourceTimestamp);
+            assertThat(resultValue.get("id")).isEqualTo(5);
+        }
+    }
+
+    /**
+     * When the source envelope {@code after} struct already contains a field matching
+     * {@code column.name}, the SMT must not crash and must preserve the existing field's value.
+     */
+    @Test
+    void envelopeWithPreExistingColumnPreservesSourceValue() {
+        final Schema rowSchema = SchemaBuilder.struct()
+                .name("test.Value")
+                .field("id", Schema.INT32_SCHEMA)
+                .field(COLUMN, Timestamp.builder().optional().build())
+                .optional()
+                .build();
+        final Schema envelopeSchema = SchemaBuilder.struct()
+                .name("test.Envelope")
+                .field("before", rowSchema)
+                .field("after", rowSchema)
+                .field("op", Schema.STRING_SCHEMA)
+                .build();
+
+        final Date sourceTimestamp = new Date(2_000_000_000_000L);
+        final Struct after = new Struct(rowSchema).put("id", 6).put(COLUMN, sourceTimestamp);
+        final Struct envelope = new Struct(envelopeSchema)
+                .put("before", null)
+                .put("after", after)
+                .put("op", "u");
+        final SinkRecord record = sinkRecord(envelopeSchema, envelope);
+
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+
+            final Struct resultAfter = (Struct) ((Struct) result.value()).get("after");
+            assertThat(resultAfter.schema().fields()).hasSize(2);
+            assertThat(resultAfter.get(COLUMN)).isEqualTo(sourceTimestamp);
+            assertThat(resultAfter.get("id")).isEqualTo(6);
+        }
+    }
+
+    /**
+     * When the source flat record has a pre-existing Timestamp column matching {@code column.name}
+     * with a {@code null} value, the SMT must stamp the current time rather than propagating null.
+     */
+    @Test
+    void flatRecordWithNullPreExistingColumnIsStamped() {
+        final Schema valueSchema = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field(COLUMN, Timestamp.builder().optional().build())
+                .build();
+        final Struct value = new Struct(valueSchema).put("id", 7).put(COLUMN, null);
+        final SinkRecord record = sinkRecord(valueSchema, value);
+
+        final long before = System.currentTimeMillis();
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+            final long after = System.currentTimeMillis();
+
+            final Date stampedAt = (Date) ((Struct) result.value()).get(COLUMN);
+            assertThat(stampedAt).isNotNull();
+            assertThat(stampedAt.getTime()).isGreaterThanOrEqualTo(before);
+            assertThat(stampedAt.getTime()).isLessThanOrEqualTo(after);
+            assertThat(((Struct) result.value()).get("id")).isEqualTo(7);
+        }
+    }
+
+    /**
+     * When the source envelope {@code after} struct has a pre-existing Timestamp column with a
+     * {@code null} value, the SMT must stamp the current time rather than propagating null.
+     */
+    @Test
+    void envelopeWithNullPreExistingColumnIsStamped() {
+        final Schema rowSchema = SchemaBuilder.struct()
+                .name("test.Value")
+                .field("id", Schema.INT32_SCHEMA)
+                .field(COLUMN, Timestamp.builder().optional().build())
+                .optional()
+                .build();
+        final Schema envelopeSchema = SchemaBuilder.struct()
+                .name("test.Envelope")
+                .field("before", rowSchema)
+                .field("after", rowSchema)
+                .field("op", Schema.STRING_SCHEMA)
+                .build();
+
+        final Struct after = new Struct(rowSchema).put("id", 8).put(COLUMN, null);
+        final Struct envelope = new Struct(envelopeSchema)
+                .put("before", null)
+                .put("after", after)
+                .put("op", "u");
+        final SinkRecord record = sinkRecord(envelopeSchema, envelope);
+
+        final long before = System.currentTimeMillis();
+        try (InsertCurrentDatetime<SinkRecord> smt = new InsertCurrentDatetime<>()) {
+            smt.configure(Map.of("column.name", COLUMN));
+            final SinkRecord result = smt.apply(record);
+            final long after2 = System.currentTimeMillis();
+
+            final Struct resultAfter = (Struct) ((Struct) result.value()).get("after");
+            final Date stampedAt = (Date) resultAfter.get(COLUMN);
+            assertThat(stampedAt).isNotNull();
+            assertThat(stampedAt.getTime()).isGreaterThanOrEqualTo(before);
+            assertThat(stampedAt.getTime()).isLessThanOrEqualTo(after2);
+            assertThat(resultAfter.get("id")).isEqualTo(8);
         }
     }
 
