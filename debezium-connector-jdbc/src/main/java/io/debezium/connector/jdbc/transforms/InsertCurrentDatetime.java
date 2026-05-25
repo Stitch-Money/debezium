@@ -141,7 +141,7 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
      *         with the datetime field appended to the {@code after} sub-struct
      */
     private R applyToEnvelope(R record, Struct envelope) {
-        final Struct after = (Struct) envelope.get("after");
+        final Struct after = (Struct) envelope.getWithoutDefault("after");
         if (after == null) {
             return record;
         }
@@ -291,7 +291,7 @@ public class InsertCurrentDatetime<R extends ConnectRecord<R>> implements Transf
         if (existingField == null) {
             expandedStruct.put(columnName, new Date());
         }
-        else if (Timestamp.LOGICAL_NAME.equals(existingField.schema().name()) && originalStruct.get(columnName) == null) {
+        else if (Timestamp.LOGICAL_NAME.equals(existingField.schema().name()) && originalStruct.getWithoutDefault(columnName) == null) {
             expandedStruct.put(columnName, new Date());
         }
         return expandedStruct;

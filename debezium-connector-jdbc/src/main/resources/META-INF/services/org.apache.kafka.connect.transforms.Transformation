@@ -3,3 +3,4 @@ io.debezium.connector.jdbc.transforms.FieldNameTransformation
 io.debezium.connector.jdbc.transforms.InsertCurrentDatetime
 io.debezium.connector.jdbc.transforms.ToastColumnFilter
 io.debezium.connector.jdbc.transforms.SoftDeleteTransform
+io.debezium.connector.jdbc.transforms.InsertEventTimestamp
