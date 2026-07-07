@@ -124,11 +124,13 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
             String field = columnNameFromField(name, record);
             return "T." + field + "=S." + field;
         });
-        builder.append(" WHEN MATCHED THEN UPDATE SET ");
-        builder.appendList(",", record.nonKeyFieldNames(), (String name) -> {
-            String field = columnNameFromField(name, record);
-            return "T." + field + "=S." + field;
-        });
+        if (!record.nonKeyFieldNames().isEmpty()) {
+            builder.append(" WHEN MATCHED THEN UPDATE SET ");
+            builder.appendList(",", record.nonKeyFieldNames(), (String name) -> {
+                String field = columnNameFromField(name, record);
+                return "T." + field + "=S." + field;
+            });
+        }
         builder.append(" WHEN NOT MATCHED THEN INSERT (");
         builder.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> columnNameFromField(name, record));
         builder.append(") VALUES (");
