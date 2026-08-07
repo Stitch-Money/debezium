@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.jdbc;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -16,6 +17,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.kafka.connect.errors.ConnectException;
 import org.hibernate.cfg.AvailableSettings;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -41,6 +43,49 @@ import io.debezium.sink.naming.CollectionNamingStrategy;
 public class JdbcSinkConnectorConfigTest {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(JdbcSinkConnectorConfigTest.class);
+
+    @Test
+    public void testMultiValueStatementsWithUpsertRequiresReductionBuffer() {
+        final Map<String, String> properties = requiredConnectionProperties();
+        properties.put(JdbcSinkConnectorConfig.USE_MULTI_VALUE_STATEMENTS, "true");
+        properties.put(JdbcSinkConnectorConfig.INSERT_MODE, "upsert");
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_key");
+
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        assertThatThrownBy(config::validate)
+                .isInstanceOf(ConnectException.class)
+                .hasMessageContaining(JdbcSinkConnectorConfig.USE_REDUCTION_BUFFER);
+    }
+
+    @Test
+    public void testMultiValueStatementsWithUpsertAndReductionBufferPasses() {
+        final Map<String, String> properties = requiredConnectionProperties();
+        properties.put(JdbcSinkConnectorConfig.USE_MULTI_VALUE_STATEMENTS, "true");
+        properties.put(JdbcSinkConnectorConfig.INSERT_MODE, "upsert");
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_key");
+        properties.put(JdbcSinkConnectorConfig.USE_REDUCTION_BUFFER, "true");
+
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        config.validate();
+        assertThat(config.isUseMultiValueStatements()).isTrue();
+    }
+
+    @Test
+    public void testMultiValueStatementsWithInsertModeDoesNotRequireReductionBuffer() {
+        final Map<String, String> properties = requiredConnectionProperties();
+        properties.put(JdbcSinkConnectorConfig.USE_MULTI_VALUE_STATEMENTS, "true");
+        properties.put(JdbcSinkConnectorConfig.INSERT_MODE, "insert");
+
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        config.validate();
+        assertThat(config.isUseMultiValueStatements()).isTrue();
+    }
+
+    @Test
+    public void testMultiValueStatementsDefaultsToFalse() {
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(Collections.emptyMap());
+        assertThat(config.isUseMultiValueStatements()).isFalse();
+    }
 
     @Test
     public void testMissingRequiredConfigurationPropertiesFail() {
@@ -230,6 +275,14 @@ public class JdbcSinkConnectorConfigTest {
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_URL)).isEqualTo("jdbc://url");
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_USER)).isEqualTo("user");
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_PASSWORD)).isNull(); // Password should be null
+    }
+
+    private static Map<String, String> requiredConnectionProperties() {
+        final Map<String, String> properties = new HashMap<>();
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_URL, "jdbc:h2:mem:test");
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_USER, "sa");
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_PASSWORD, "sa");
+        return properties;
     }
 
     // @Test

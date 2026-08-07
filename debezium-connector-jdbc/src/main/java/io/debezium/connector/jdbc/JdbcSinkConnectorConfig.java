@@ -63,6 +63,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final String POSTGRES_POSTGIS_SCHEMA = "dialect.postgres.postgis.schema";
     public static final String SQLSERVER_IDENTITY_INSERT = "dialect.sqlserver.identity.insert";
     public static final String USE_REDUCTION_BUFFER = "use.reduction.buffer";
+    public static final String USE_MULTI_VALUE_STATEMENTS = "use.multi.value.statements";
     public static final String FLUSH_MAX_RETRIES = "flush.max.retries";
     public static final String FLUSH_RETRY_DELAY_MS = "flush.retry.delay.ms";
     public static final String CONNECTION_RESTART_ON_ERRORS = "connection.restart.on.errors";
@@ -238,6 +239,19 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
             .withDescription(
                     "A reduction buffer consolidates the execution of SQL statements by primary key to reduce the SQL load on the target database. When set to false (the default), each incoming event is applied as a logical SQL change. When set to true, incoming events that refer to the same row will be reduced to a single logical change based on the most recent row state.");
 
+    public static final Field USE_MULTI_VALUE_STATEMENTS_FIELD = Field.create(USE_MULTI_VALUE_STATEMENTS)
+            .withDisplayName("Use multi-value prepared statements")
+            .withType(Type.BOOLEAN)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 8))
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDefault(false)
+            .withDescription("When true and the target dialect supports it, INSERT/UPSERT/DELETE batches are executed as one or more " +
+                    "multi-row statements, chunked by the dialect's maximum bind-parameter limit, instead of JDBC statement batching. " +
+                    "Batches written with insert.mode update, as well as deletes and upserts of records without key fields, " +
+                    "always fall back to JDBC statement batching. " +
+                    "Requires use.reduction.buffer=true when insert.mode is upsert.");
+
     public static final Field CONNECTION_RESTART_ON_ERRORS_FIELD = Field.create(CONNECTION_RESTART_ON_ERRORS)
             .withDisplayName("Restart connection on errors")
             .withType(Type.BOOLEAN)
@@ -287,6 +301,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
                     FIELD_EXCLUDE_LIST_FIELD,
                     FLUSH_MAX_RETRIES_FIELD,
                     FLUSH_RETRY_DELAY_MS_FIELD,
+                    USE_MULTI_VALUE_STATEMENTS_FIELD,
                     CONNECTION_RESTART_ON_ERRORS_FIELD,
                     CLOUDEVENTS_SCHEMA_NAME_PATTERN_FIELD)
             .create();
@@ -401,6 +416,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     private final FieldNameFilter fieldsFilter;
     private final int batchSize;
     private final boolean useReductionBuffer;
+    private final boolean useMultiValueStatements;
     private final boolean connectionRestartOnErrors;
     private final String cloudEventsSchemaNamePattern;
 
@@ -422,6 +438,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         this.sqlServerIdentityInsert = config.getBoolean(SQLSERVER_IDENTITY_INSERT_FIELD);
         this.batchSize = config.getInteger(BATCH_SIZE_FIELD);
         this.useReductionBuffer = config.getBoolean(USE_REDUCTION_BUFFER_FIELD);
+        this.useMultiValueStatements = config.getBoolean(USE_MULTI_VALUE_STATEMENTS_FIELD);
         this.flushMaxRetries = config.getInteger(FLUSH_MAX_RETRIES_FIELD);
         this.flushRetryDelayMs = config.getLong(FLUSH_RETRY_DELAY_MS_FIELD);
         this.connectionRestartOnErrors = config.getBoolean(CONNECTION_RESTART_ON_ERRORS_FIELD);
@@ -451,6 +468,10 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
             throw new ConnectException("Cannot define both column.exclude.list and column.include.list. Please specify only one.");
         }
 
+        if (useMultiValueStatements && insertMode == InsertMode.UPSERT && !useReductionBuffer) {
+            throw new ConnectException("Configuring " + USE_MULTI_VALUE_STATEMENTS + "=true with " + INSERT_MODE + "=upsert requires "
+                    + USE_REDUCTION_BUFFER + "=true, because a multi-row MERGE fails on duplicate keys in its source (nondeterministic merge).");
+        }
     }
 
     public boolean validateAndRecord(Iterable<Field> fields, Consumer<String> problems) {
@@ -521,6 +542,10 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
 
     public boolean isUseReductionBuffer() {
         return useReductionBuffer;
+    }
+
+    public boolean isUseMultiValueStatements() {
+        return useMultiValueStatements;
     }
 
     @Override

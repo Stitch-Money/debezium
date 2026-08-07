@@ -86,6 +86,64 @@ public class SnowflakeDatabaseDialectTest {
         assertThat(sql).contains(" WHEN NOT MATCHED THEN INSERT (ID,NAME) VALUES (S.ID,S.NAME)");
     }
 
+    @Test
+    public void testSupportsMultiValueStatements() {
+        assertThat(dialect.supportsMultiValueStatements()).isTrue();
+        assertThat(dialect.getMaxBindParameters()).isEqualTo(16_384);
+    }
+
+    @Test
+    public void testMultiValueInsertRepeatsTuplesOnly() {
+        final String sql = dialect.getMultiValueInsertStatement(customersTable(), customerRecord(), 3);
+
+        assertThat(sql).isEqualTo("INSERT INTO Customers ( ID, NAME) SELECT ID AS ID,NAME AS NAME "
+                + "FROM ( VALUES (?,?),(?,?),(?,?)) AS S(ID, NAME)");
+    }
+
+    @Test
+    public void testMultiValueUpsertRepeatsTuplesOnly() {
+        final String sql = dialect.getMultiValueUpsertStatement(customersTable(), customerRecord(), 2);
+
+        assertThat(sql).isEqualTo("MERGE INTO Customers AS T USING "
+                + "(SELECT ID AS ID,NAME AS NAME FROM (VALUES (?,?),(?,?)) AS TBL (ID,NAME)) "
+                + "AS S (ID,NAME) ON T.ID=S.ID "
+                + "WHEN MATCHED THEN UPDATE SET T.NAME=S.NAME "
+                + "WHEN NOT MATCHED THEN INSERT (ID,NAME) VALUES (S.ID,S.NAME)");
+    }
+
+    @Test
+    public void testMultiValueUpsertWithOnlyKeyFieldsOmitsWhenMatchedClause() {
+        final String sql = dialect.getMultiValueUpsertStatement(allKeyTable(), allKeyRecord(), 2);
+
+        assertThat(sql).doesNotContain("WHEN MATCHED");
+        assertThat(sql).contains("FROM (VALUES (?,?),(?,?)) AS TBL (TENANT_ID,CLIENT_ID)");
+    }
+
+    @Test
+    public void testMultiValueDeleteBindsKeyFieldsPerRow() {
+        final String sql = dialect.getMultiValueDeleteStatement(allKeyTable(), allKeyRecord(), 2);
+
+        assertThat(sql).isEqualTo("DELETE FROM TenantClients USING "
+                + "(SELECT TENANT_ID AS TENANT_ID,CLIENT_ID AS CLIENT_ID FROM (VALUES (?,?),(?,?)) AS TBL (TENANT_ID,CLIENT_ID)) "
+                + "AS S (TENANT_ID,CLIENT_ID) "
+                + "WHERE TenantClients.TENANT_ID=S.TENANT_ID AND TenantClients.CLIENT_ID=S.CLIENT_ID");
+    }
+
+    @Test
+    public void testSingleRowStatementsEmitOneTuple() {
+        // Regression guard for the legacy single-row path, which non-multi-value configurations
+        // still use; asserted literally so a change to the multi-value builders cannot hide here
+        assertThat(dialect.getInsertStatement(customersTable(), customerRecord()))
+                .isEqualTo("INSERT INTO Customers ( ID, NAME) SELECT ID AS ID,NAME AS NAME "
+                        + "FROM ( VALUES (?,?)) AS S(ID, NAME)");
+        assertThat(dialect.getUpsertStatement(customersTable(), customerRecord()))
+                .isEqualTo("MERGE INTO Customers AS T USING "
+                        + "(SELECT ID AS ID,NAME AS NAME FROM (VALUES (?,?)) AS TBL (ID,NAME)) "
+                        + "AS S (ID,NAME) ON T.ID=S.ID "
+                        + "WHEN MATCHED THEN UPDATE SET T.NAME=S.NAME "
+                        + "WHEN NOT MATCHED THEN INSERT (ID,NAME) VALUES (S.ID,S.NAME)");
+    }
+
     private static JdbcSinkRecord allKeyRecord() {
         final Schema keySchema = SchemaBuilder.struct()
                 .field("tenant_id", Schema.STRING_SCHEMA)

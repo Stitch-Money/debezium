@@ -168,6 +168,77 @@ public interface DatabaseDialect {
     String getDeleteStatement(TableDescriptor table, JdbcSinkRecord record);
 
     /**
+     * Returns whether this dialect can generate multi-value statements, i.e. single statements
+     * whose bind placeholders cover multiple records at once.
+     * <p>
+     * Dialects that return {@code true} must implement the {@code getMultiValue*Statement} methods
+     * and must also override {@link #getMaxBindParameters()} with the database's real limit;
+     * otherwise chunking is effectively disabled and an entire flush is emitted as one statement
+     * with an unbounded {@code VALUES} list.
+     *
+     * @return true if the multi-value statement methods are supported by this dialect
+     */
+    default boolean supportsMultiValueStatements() {
+        return false;
+    }
+
+    /**
+     * Returns the maximum number of bind parameters a single statement may carry for this dialect,
+     * used to chunk multi-value statements. Dialects overriding {@link #supportsMultiValueStatements()}
+     * to return {@code true} must override this with the database's real limit.
+     *
+     * @return the maximum number of bind parameters per statement
+     */
+    default int getMaxBindParameters() {
+        return Integer.MAX_VALUE;
+    }
+
+    /**
+     * Construct a {@code INSERT INTO} statement that binds {@code rowCount} records at once.
+     * <p>
+     * The generated SQL is reused for every record bound to it, so it must depend only on the
+     * representative record's schema, never on its values.
+     *
+     * @param table the current relational table model, should not be {@code null}
+     * @param record a record representative of the batch's schema, should not be {@code null}
+     * @param rowCount number of records the statement should bind, must be positive
+     * @return the multi-value insert SQL statement to be executed, never {@code null}
+     */
+    default String getMultiValueInsertStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount) {
+        throw new UnsupportedOperationException("Multi-value insert statements are not supported by this dialect");
+    }
+
+    /**
+     * Construct a {@code UPSERT} statement that binds {@code rowCount} records at once.
+     * <p>
+     * The generated SQL is reused for every record bound to it, so it must depend only on the
+     * representative record's schema, never on its values.
+     *
+     * @param table the current relational table model, should not be {@code null}
+     * @param record a record representative of the batch's schema, should not be {@code null}
+     * @param rowCount number of records the statement should bind, must be positive
+     * @return the multi-value upsert SQL statement to be executed, never {@code null}
+     */
+    default String getMultiValueUpsertStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount) {
+        throw new UnsupportedOperationException("Multi-value upsert statements are not supported by this dialect");
+    }
+
+    /**
+     * Construct a {@code DELETE} statement that binds the key fields of {@code rowCount} records at once.
+     * <p>
+     * The generated SQL is reused for every record bound to it, so it must depend only on the
+     * representative record's schema, never on its values.
+     *
+     * @param table the current relational table model, should not be {@code null}
+     * @param record a record representative of the batch's schema, should not be {@code null}
+     * @param rowCount number of records the statement should bind, must be positive
+     * @return the multi-value delete SQL statement to be executed, never {@code null}
+     */
+    default String getMultiValueDeleteStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount) {
+        throw new UnsupportedOperationException("Multi-value delete statements are not supported by this dialect");
+    }
+
+    /**
      * Construct a {@code TRUNCATE} statement specific for this dialect.
      *
      * @param table the current relational table model, should not be {@code null}
