@@ -35,3 +35,6 @@ gen/
 
 jenkins-jobs/docker/rhel_kafka/plugins
 jenkins-jobs/docker/artifact-server/plugins
+
+# Local environment files with Snowflake test credentials
+debezium-connector-jdbc/src/env.sh

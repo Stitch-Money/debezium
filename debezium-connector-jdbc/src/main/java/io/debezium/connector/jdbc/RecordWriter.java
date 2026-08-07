@@ -7,11 +7,13 @@ package io.debezium.connector.jdbc;
 
 import java.sql.BatchUpdateException;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.hibernate.SharedSessionContract;
 import org.hibernate.Transaction;
 import org.hibernate.jdbc.Work;
@@ -20,6 +22,7 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.jdbc.dialect.DatabaseDialect;
 import io.debezium.connector.jdbc.field.JdbcFieldDescriptor;
+import io.debezium.connector.jdbc.relational.TableDescriptor;
 import io.debezium.sink.valuebinding.ValueBindDescriptor;
 import io.debezium.util.Stopwatch;
 
@@ -44,12 +47,23 @@ public class RecordWriter {
     }
 
     public void write(List<JdbcSinkRecord> records, String sqlStatement) {
+        executeInTransaction("write", processBatch(records, sqlStatement));
+    }
+
+    public void writeMultiValue(List<JdbcSinkRecord> records, TableDescriptor table) {
+        if (records.isEmpty()) {
+            return;
+        }
+        executeInTransaction("multi-value write", processMultiValue(records, table));
+    }
+
+    private void executeInTransaction(String description, Work work) {
         Stopwatch writeStopwatch = Stopwatch.reusable();
         writeStopwatch.start();
         final Transaction transaction = session.beginTransaction();
 
         try {
-            session.doWork(processBatch(records, sqlStatement));
+            session.doWork(work);
             transaction.commit();
         }
         catch (Exception e) {
@@ -57,7 +71,87 @@ public class RecordWriter {
             throw e;
         }
         writeStopwatch.stop();
-        LOGGER.trace("[PERF] Total write execution time {}", writeStopwatch.durations());
+        LOGGER.trace("[PERF] Total {} execution time {}", description, writeStopwatch.durations());
+    }
+
+    private Work processMultiValue(List<JdbcSinkRecord> records, TableDescriptor table) {
+        return conn -> {
+            final JdbcSinkRecord first = records.get(0);
+            final boolean isDelete = first.isDelete();
+            // A flushed buffer is schema-homogeneous (RecordBuffer and ReducedRecordBuffer flush on any
+            // key or value schema change), so the first record's field counts hold for every record.
+            final int paramsPerRow = isDelete
+                    ? first.keyFieldNames().size()
+                    : first.keyFieldNames().size() + first.nonKeyFieldNames().size();
+            final int rowsPerStatement = computeRowsPerStatement(paramsPerRow, dialect.getMaxBindParameters(), records.size());
+
+            // Deletes may affect fewer rows than records, and a key-only upsert MERGE carries no
+            // WHEN MATCHED clause, so re-delivered keys legitimately affect zero rows there; only
+            // inserts and updating upserts must apply exactly one row per record.
+            final boolean expectOneRowPerRecord = !isDelete
+                    && !(config.getInsertMode() == JdbcSinkConnectorConfig.InsertMode.UPSERT && first.nonKeyFieldNames().isEmpty());
+
+            // Full chunks share one SQL shape and only the final remainder differs, so a flush prepares
+            // at most two distinct statements; remainder sizes vary across flushes and may churn the
+            // provider's statement cache, which is acceptable.
+            for (int from = 0; from < records.size(); from += rowsPerStatement) {
+                final List<JdbcSinkRecord> chunk = records.subList(from, Math.min(from + rowsPerStatement, records.size()));
+                final String sql = getMultiValueStatement(table, chunk.get(0), chunk.size(), isDelete);
+                try (PreparedStatement prepareStatement = conn.prepareStatement(sql)) {
+                    QueryBinder queryBinder = queryBinderResolver.resolve(prepareStatement);
+                    int index = 1;
+                    for (JdbcSinkRecord record : chunk) {
+                        final int nextIndex = bindValues(record, queryBinder, index);
+                        // The SQL emits one placeholder per field, but a type may bind more or fewer values
+                        // per field, which would silently misalign every subsequent row; fail on the first
+                        // offending record, before the misalignment reaches the driver.
+                        if (nextIndex != index + paramsPerRow) {
+                            throw new ConnectException("Bound " + (nextIndex - index) + " parameters for a record but the multi-value statement expects "
+                                    + paramsPerRow + " per row for table '" + table.getId().toFullIdentiferString() + "'");
+                        }
+                        index = nextIndex;
+                    }
+
+                    final int affectedRows;
+                    try {
+                        affectedRows = prepareStatement.executeUpdate();
+                    }
+                    catch (SQLException e) {
+                        // A multi-value statement fails as a whole, without the per-record detail of a
+                        // BatchUpdateException; log the chunk's coordinates so the failure can be traced.
+                        // Records may span topics and are not necessarily offset-ordered (reduced buffers
+                        // iterate in hash order), so only the first record's coordinates are reported.
+                        final JdbcSinkRecord firstOfChunk = chunk.get(0);
+                        LOGGER.error("Multi-value statement failed for table '{}' for a chunk of {} records, the first from topic '{}' partition {} offset {}",
+                                table.getId().toFullIdentiferString(), chunk.size(), firstOfChunk.topicName(), firstOfChunk.partition(), firstOfChunk.offset());
+                        throw e;
+                    }
+                    if (expectOneRowPerRecord && affectedRows != chunk.size()) {
+                        LOGGER.warn("Multi-value statement affected {} rows but {} records were bound for table '{}'",
+                                affectedRows, chunk.size(), table.getId().toFullIdentiferString());
+                    }
+                    LOGGER.trace("Multi-value statement affected {} rows for {} records", affectedRows, chunk.size());
+                }
+            }
+        };
+    }
+
+    private String getMultiValueStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount, boolean isDelete) {
+        if (isDelete) {
+            return dialect.getMultiValueDeleteStatement(table, record, rowCount);
+        }
+        // UPDATE mode never reaches the multi-value path
+        if (config.getInsertMode() == JdbcSinkConnectorConfig.InsertMode.UPSERT) {
+            return dialect.getMultiValueUpsertStatement(table, record, rowCount);
+        }
+        return dialect.getMultiValueInsertStatement(table, record, rowCount);
+    }
+
+    static int computeRowsPerStatement(int paramsPerRow, int maxBindParameters, int totalRows) {
+        if (paramsPerRow <= 0) {
+            return totalRows;
+        }
+        return Math.max(1, Math.min(totalRows, maxBindParameters / paramsPerRow));
     }
 
     private Work processBatch(List<JdbcSinkRecord> records, String sqlStatement) {
@@ -71,7 +165,7 @@ public class RecordWriter {
 
                     Stopwatch singlebindStopwatch = Stopwatch.reusable();
                     singlebindStopwatch.start();
-                    bindValues(record, queryBinder);
+                    bindValues(record, queryBinder, 1);
                     singlebindStopwatch.stop();
 
                     Stopwatch addBatchStopwatch = Stopwatch.reusable();
@@ -99,24 +193,24 @@ public class RecordWriter {
         };
     }
 
-    private void bindValues(JdbcSinkRecord record, QueryBinder queryBinder) {
-        int index;
+    private int bindValues(JdbcSinkRecord record, QueryBinder queryBinder, int startIndex) {
+        int index = startIndex;
         if (record.isDelete()) {
-            bindKeyValuesToQuery(record, queryBinder, 1);
-            return;
+            return bindKeyValuesToQuery(record, queryBinder, index);
         }
 
         switch (config.getInsertMode()) {
             case INSERT:
             case UPSERT:
-                index = bindKeyValuesToQuery(record, queryBinder, 1);
-                bindNonKeyValuesToQuery(record, queryBinder, index);
+                index = bindKeyValuesToQuery(record, queryBinder, index);
+                index = bindNonKeyValuesToQuery(record, queryBinder, index);
                 break;
             case UPDATE:
-                index = bindNonKeyValuesToQuery(record, queryBinder, 1);
-                bindKeyValuesToQuery(record, queryBinder, index);
+                index = bindNonKeyValuesToQuery(record, queryBinder, index);
+                index = bindKeyValuesToQuery(record, queryBinder, index);
                 break;
         }
+        return index;
     }
 
     private int bindKeyValuesToQuery(JdbcSinkRecord record, QueryBinder query, int index) {

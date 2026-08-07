@@ -59,6 +59,10 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
     private static final int DEFAULT_DECIMAL_PRECISION = 38;
     private static final int DEFAULT_TIMESTAMP_PRECISION = 9;
     private static final int DEFAULT_TIME_PRECISION = 9;
+    // Snowflake's documented limit is 16,384 rows per VALUES list, used here as a bind-parameter
+    // budget instead. That is strictly conservative: rows-per-statement never exceeds the budget,
+    // and only reaches it for single-column tuples, exactly at the (inclusive) row limit.
+    private static final int MAX_BIND_PARAMETERS = 16_384;
 
     public static class SnowflakeDatabaseDialectProvider implements DatabaseDialectProvider {
         @Override
@@ -82,8 +86,27 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
     }
 
     @Override
+    public boolean supportsMultiValueStatements() {
+        return true;
+    }
+
+    @Override
+    public int getMaxBindParameters() {
+        return MAX_BIND_PARAMETERS;
+    }
+
+    @Override
     public String getInsertStatement(TableDescriptor table, JdbcSinkRecord record) {
-        LOGGER.info("Compiling Insert");
+        return getMultiValueInsertStatement(table, record, 1);
+    }
+
+    @Override
+    public String getMultiValueInsertStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount) {
+        final SqlStatementBuilder tuple = new SqlStatementBuilder();
+        tuple.append("(");
+        tuple.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> "?");
+        tuple.append(")");
+
         final SqlStatementBuilder builder = new SqlStatementBuilder();
         builder.append("INSERT INTO ");
         builder.append(getQualifiedTableName(table.getId()));
@@ -92,20 +115,29 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
         builder.append(") SELECT ");
         builder.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(),
                 (name) -> transformedNameFromField(name, record, table));
-        builder.append(" FROM ( VALUES (");
-        builder.appendLists(", ", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> "?"); // replacing columnQueryBindingFromField(name, table, record));
-        builder.append(" )) AS S(");
+        builder.append(" FROM ( VALUES ");
+        builder.appendRepeated(",", rowCount, tuple.build());
+        builder.append(") AS S(");
         builder.appendLists(", ", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> columnNameFromField(name, record));
         builder.append(")");
 
         final String statement = builder.build();
-        LOGGER.info(statement);
+        LOGGER.trace("Insert statement: {}", statement);
         return statement;
     }
 
     @Override
     public String getUpsertStatement(TableDescriptor table, JdbcSinkRecord record) {
-        LOGGER.info("Compiling Upsert");
+        return getMultiValueUpsertStatement(table, record, 1);
+    }
+
+    @Override
+    public String getMultiValueUpsertStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount) {
+        final SqlStatementBuilder tuple = new SqlStatementBuilder();
+        tuple.append("(");
+        tuple.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> "?");
+        tuple.append(")");
+
         final SqlStatementBuilder builder = new SqlStatementBuilder();
         builder.append("MERGE INTO ");
         builder.append(getQualifiedTableName(table.getId()));
@@ -113,9 +145,9 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
         builder.append("USING (SELECT ");
         builder.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(),
                 (name) -> transformedNameFromField(name, record, table));
-        builder.append(" FROM (VALUES (");
-        builder.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> "?"); // replacing columnQueryBindingFromField(name, table, record));
-        builder.append(")) AS TBL (");
+        builder.append(" FROM (VALUES ");
+        builder.appendRepeated(",", rowCount, tuple.build());
+        builder.append(") AS TBL (");
         builder.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> columnNameFromField(name, record));
         builder.append(")) AS S (");
         builder.appendLists(",", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> columnNameFromField(name, record));
@@ -141,7 +173,40 @@ public class SnowflakeDatabaseDialect extends GeneralDatabaseDialect {
         builder.append(")");
 
         final String statement = builder.build();
-        LOGGER.info(String.format("Upsert statement: %s", statement));
+        LOGGER.trace("Upsert statement: {}", statement);
+
+        return statement;
+    }
+
+    @Override
+    public String getMultiValueDeleteStatement(TableDescriptor table, JdbcSinkRecord record, int rowCount) {
+        final String qualifiedTableName = getQualifiedTableName(table.getId());
+
+        final SqlStatementBuilder tuple = new SqlStatementBuilder();
+        tuple.append("(");
+        tuple.appendList(",", record.keyFieldNames(), (name) -> "?");
+        tuple.append(")");
+
+        final SqlStatementBuilder builder = new SqlStatementBuilder();
+        builder.append("DELETE FROM ");
+        builder.append(qualifiedTableName);
+        builder.append(" USING (SELECT ");
+        builder.appendList(",", record.keyFieldNames(), (name) -> transformedNameFromField(name, record, table));
+        builder.append(" FROM (VALUES ");
+        builder.appendRepeated(",", rowCount, tuple.build());
+        builder.append(") AS TBL (");
+        builder.appendList(",", record.keyFieldNames(), (name) -> columnNameFromField(name, record));
+        builder.append(")) AS S (");
+        builder.appendList(",", record.keyFieldNames(), (name) -> columnNameFromField(name, record));
+        builder.append(") WHERE ");
+        // Snowflake DELETE has no target-table alias, so predicate columns are qualified with the full table name
+        builder.appendList(" AND ", record.keyFieldNames(), (String name) -> {
+            String field = columnNameFromField(name, record);
+            return qualifiedTableName + "." + field + "=S." + field;
+        });
+
+        final String statement = builder.build();
+        LOGGER.trace("Delete statement: {}", statement);
 
         return statement;
     }

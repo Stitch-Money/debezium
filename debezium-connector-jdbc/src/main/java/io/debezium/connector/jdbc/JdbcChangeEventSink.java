@@ -32,6 +32,7 @@ import org.hibernate.query.NativeQuery;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.connector.common.DebeziumTaskState;
 import io.debezium.connector.jdbc.dialect.DatabaseDialect;
 import io.debezium.connector.jdbc.relational.TableDescriptor;
@@ -78,6 +79,11 @@ public class JdbcChangeEventSink implements ChangeEventSink {
 
         final DatabaseVersion version = this.dialect.getVersion();
         LOGGER.info("Database version {}.{}.{}", version.getMajor(), version.getMinor(), version.getMicro());
+
+        if (config.isUseMultiValueStatements() && !dialect.supportsMultiValueStatements()) {
+            LOGGER.warn("Configuration '{}' is enabled but the dialect does not support multi-value statements; falling back to JDBC batching.",
+                    JdbcSinkConnectorConfig.USE_MULTI_VALUE_STATEMENTS);
+        }
     }
 
     public void execute(Collection<SinkRecord> records) {
@@ -252,9 +258,15 @@ public class JdbcChangeEventSink implements ChangeEventSink {
             LOGGER.debug("Flushing records in JDBC Writer for table: {}", collectionId.name());
             tableChangesStopwatch.start();
             tableChangesStopwatch.stop();
-            String sqlStatement = getSqlStatement(table, toFlush.get(0));
+            final JdbcSinkRecord first = toFlush.get(0);
             flushBufferStopwatch.start();
-            recordWriter.write(toFlush, sqlStatement);
+            if (useMultiValueStatements(first)) {
+                recordWriter.writeMultiValue(toFlush, table);
+            }
+            else {
+                String sqlStatement = getSqlStatement(table, first);
+                recordWriter.write(toFlush, sqlStatement);
+            }
             flushBufferStopwatch.stop();
 
             DebeziumOpenLineageEmitter.emit(connectorContext, DebeziumTaskState.RUNNING, List.of(extractDatasetMetadata(table)));
@@ -398,6 +410,26 @@ public class JdbcChangeEventSink implements ChangeEventSink {
         }
 
         return readTable(collectionId);
+    }
+
+    @VisibleForTesting
+    boolean useMultiValueStatements(JdbcSinkRecord record) {
+        if (!config.isUseMultiValueStatements() || !dialect.supportsMultiValueStatements()) {
+            return false;
+        }
+        if (record.isDelete()) {
+            // A key-less delete is an unfiltered DELETE FROM and must keep the legacy statement
+            return !record.keyFieldNames().isEmpty();
+        }
+        if (record.keyFieldNames().isEmpty() && record.nonKeyFieldNames().isEmpty()) {
+            // Zero bindable fields cannot form a VALUES tuple; keep the legacy statement's error surface
+            return false;
+        }
+        if (config.getInsertMode() == JdbcSinkConnectorConfig.InsertMode.UPSERT && record.keyFieldNames().isEmpty()) {
+            // Let the legacy path raise the established "no key fields" error
+            return false;
+        }
+        return config.getInsertMode() != JdbcSinkConnectorConfig.InsertMode.UPDATE;
     }
 
     private String getSqlStatement(TableDescriptor table, JdbcSinkRecord record) {

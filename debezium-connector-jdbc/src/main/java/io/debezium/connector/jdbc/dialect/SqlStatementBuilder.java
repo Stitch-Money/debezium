@@ -56,6 +56,16 @@ public class SqlStatementBuilder {
         return this;
     }
 
+    public SqlStatementBuilder appendRepeated(String delimiter, int count, String fragment) {
+        for (int i = 0; i < count; i++) {
+            builder.append(fragment);
+            if (i < count - 1) {
+                builder.append(delimiter);
+            }
+        }
+        return this;
+    }
+
     public String build() {
         return builder.toString();
     }

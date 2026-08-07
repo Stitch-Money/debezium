@@ -406,6 +406,10 @@ public interface SinkRecordFactory {
     }
 
     default KafkaDebeziumSinkRecord deleteRecord(String topicName) {
+        return deleteRecord(topicName, (byte) 1);
+    }
+
+    default KafkaDebeziumSinkRecord deleteRecord(String topicName, byte key) {
         return SinkRecordBuilder.delete()
                 .flat(isFlattened())
                 .name("prefix")
@@ -413,8 +417,8 @@ public interface SinkRecordFactory {
                 .keySchema(basicKeySchema())
                 .recordSchema(basicRecordSchema())
                 .sourceSchema(basicSourceSchema())
-                .key("id", (byte) 1)
-                .before("id", (byte) 1)
+                .key("id", key)
+                .before("id", key)
                 .before("name", "John Doe")
                 .source("ts_ms", (int) Instant.now().getEpochSecond())
                 .build();
