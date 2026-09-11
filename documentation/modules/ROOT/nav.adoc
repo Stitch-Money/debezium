@@ -1,5 +1,6 @@
 * Getting Started
-** xref:tutorial.adoc[Tutorial]
+** xref:tutorials.adoc[Tutorials]
+*** xref:kc-tutorial.adoc[Kafka Connect]
 ** xref:install.adoc[Installation]
 *** xref:postgres-plugins.adoc[PostgreSQL Decoding Plugins]
 ** xref:architecture.adoc[Architecture]
@@ -24,6 +25,10 @@
 ** xref:connectors/vitess.adoc[Vitess]
 ** xref:connectors/spanner.adoc[Spanner]
 ** xref:connectors/informix.adoc[Informix]
+** xref:connectors/cockroachdb.adoc[CockroachDB]
+** xref:connectors/yashandb.adoc[YashanDB]
+** xref:connectors/ingres.adoc[Ingres]
+** xref:connectors/milvus.adoc[Milvus]
 * Sink Connectors
 ** xref:connectors/index-sink.adoc[Overview]
 ** xref:connectors/jdbc.adoc[JDBC]
@@ -47,10 +52,13 @@
 ** xref:transformations/timescaledb.adoc[TimescaleDB Integration]
 ** xref:transformations/decode-logical-decoding-message-content.adoc[Decode Logical Decoding Message Content]
 ** xref:transformations/vector-to-json.adoc[Vector Data Types to JSON Types]
+** xref:transformations/neo4j-cud-converter.adoc[Neo4j CUD Converter]
+** xref:transformations/enforce-record-size.adoc[Enforce Record Size]
 ** xref:transformations/swap-geometry-coordinates.adoc[Swap Geometry Coordinates]
 * Post Processors
 ** xref:post-processors/index.adoc[Overview]
 ** xref:post-processors/reselect-columns.adoc[Reselect Columns]
+** xref:post-processors/s3-large-message.adoc[S3 Large Message]
 * API and SPI
 ** xref:development/engine.adoc[Debezium Engine]
 ** xref:development/converters.adoc[Custom Converters]
@@ -61,9 +69,12 @@
 ** xref:integrations/openlineage.adoc[OpenLineage]
 ** xref:integrations/tracing.adoc[OpenTelemetry]
 ** xref:integrations/quarkus-debezium-engine-extension.adoc[Debezium Extensions for Quarkus]
+** xref:integrations/hibernate-cache.adoc[Hibernate Cache Invalidation]
 ** xref:integrations/testcontainers.adoc[Integration Testing with Testcontainers]
 * Debezium AI
+** xref:ai/debezium-ai-python.adoc[PyDebeziumAI]
 ** xref:ai/embeddings.adoc[Embeddings Transformation]
+** xref:ai/docling.adoc[Docling Transformation]
 * Standalone Debezium
 ** xref:operations/debezium-server.adoc[Debezium Server]
 ** xref:operations/debezium-operator.adoc[Debezium Operator]

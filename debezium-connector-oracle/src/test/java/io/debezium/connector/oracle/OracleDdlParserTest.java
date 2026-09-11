@@ -6,6 +6,7 @@
 package io.debezium.connector.oracle;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.sql.Types;
 import java.util.ArrayList;
@@ -27,6 +28,7 @@ import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 import io.debezium.relational.ddl.DdlChanges;
 import io.debezium.relational.ddl.DdlParserListener;
+import io.debezium.text.ParsingException;
 import io.debezium.util.IoUtil;
 
 /**
@@ -504,6 +506,90 @@ public class OracleDdlParserTest {
         table = tables.forTable(new TableId(PDB_NAME, "SCOTT", "TEST"));
         assertThat(table.columns()).hasSize(3);
         assertThat(table.primaryKeyColumnNames()).containsExactly("ID");
+    }
+
+    @Test
+    @FixFor("dbz#2405")
+    public void shouldParseAlterTableAddColumnWithOutOfLineConstraint() throws Exception {
+        parser.setCurrentDatabase(PDB_NAME);
+        parser.setCurrentSchema("SCOTT");
+
+        String SQL = "CREATE TABLE \"SCOTT\".\"TEST\" (id NUMBER(10) PRIMARY KEY)";
+
+        DdlChanges changes = parser.parse(SQL, tables);
+        List<DdlParserListener.EventType> eventTypes = getEventTypesFromChanges(changes);
+        assertThat(eventTypes).containsExactly(DdlParserListener.EventType.CREATE_TABLE);
+
+        changes.reset();
+
+        SQL = "ALTER TABLE \"SCOTT\".\"TEST\" ADD (C1 NUMBER(10), CONSTRAINT CHK_C1 CHECK (C1 >= 0))";
+
+        changes = parser.parse(SQL, tables);
+        eventTypes = getEventTypesFromChanges(changes);
+        assertThat(eventTypes).containsExactly(DdlParserListener.EventType.ALTER_TABLE);
+
+        Table table = tables.forTable(new TableId(PDB_NAME, "SCOTT", "TEST"));
+        assertThat(table.retrieveColumnNames()).containsExactly("ID", "C1");
+        assertThat(table.columnWithName("C1").typeName()).isEqualTo("NUMBER");
+        assertThat(table.columnWithName("C1").length()).isEqualTo(10);
+        assertThat(table.primaryKeyColumnNames()).containsExactly("ID");
+    }
+
+    @Test
+    @FixFor("dbz#2405")
+    public void shouldParseAlterTableAddColumnsWithMixedOutOfLineConstraints() throws Exception {
+        parser.setCurrentDatabase(PDB_NAME);
+        parser.setCurrentSchema("SCOTT");
+
+        String SQL = "CREATE TABLE \"SCOTT\".\"TEST\" (C1 NUMBER(10))";
+
+        DdlChanges changes = parser.parse(SQL, tables);
+        List<DdlParserListener.EventType> eventTypes = getEventTypesFromChanges(changes);
+        assertThat(eventTypes).containsExactly(DdlParserListener.EventType.CREATE_TABLE);
+
+        changes.reset();
+
+        SQL = "ALTER TABLE \"SCOTT\".\"TEST\" ADD (" +
+                "C2 VARCHAR2(50) DEFAULT 'none' NOT NULL, " +
+                "C3 NUMBER(10), " +
+                "CONSTRAINT PK_TEST PRIMARY KEY (C3), " +
+                "CONSTRAINT FK_C1 FOREIGN KEY (C1) REFERENCES \"SCOTT\".\"OTHER_TABLE\" (ID), " +
+                "CONSTRAINT UQ_C2 UNIQUE (C2))";
+
+        changes = parser.parse(SQL, tables);
+        eventTypes = getEventTypesFromChanges(changes);
+        assertThat(eventTypes).containsExactly(DdlParserListener.EventType.ALTER_TABLE);
+
+        Table table = tables.forTable(new TableId(PDB_NAME, "SCOTT", "TEST"));
+        assertThat(table.retrieveColumnNames()).containsExactly("C1", "C2", "C3");
+        assertThat(table.columnWithName("C2").typeName()).isEqualTo("VARCHAR2");
+        assertThat(table.columnWithName("C2").length()).isEqualTo(50);
+        assertThat(table.columnWithName("C2").isOptional()).isFalse();
+        assertThat(table.columnWithName("C3").typeName()).isEqualTo("NUMBER");
+        assertThat(table.primaryKeyColumnNames()).containsExactly("C3");
+    }
+
+    @Test
+    @FixFor("dbz#1362")
+    public void shouldThrowExceptionWhenAddingVirtualColumns() throws Exception {
+        parser.setCurrentDatabase(PDB_NAME);
+        parser.setCurrentSchema("SCOTT");
+
+        String SQL = "CREATE TABLE \"SCOTT\".\"TEST\" (id NUMBER(9,0) PRIMARY KEY, org_id NUMERIC(9,0), NAME varchar2(50))";
+
+        DdlChanges changes = parser.parse(SQL, tables);
+        List<DdlParserListener.EventType> eventTypes = getEventTypesFromChanges(changes);
+        assertThat(eventTypes).containsExactly(DdlParserListener.EventType.CREATE_TABLE);
+
+        Table table = tables.forTable(new TableId(PDB_NAME, "SCOTT", "TEST"));
+        assertThat(table.columns()).hasSize(3);
+        assertThat(table.primaryKeyColumnNames()).containsExactly("ID");
+
+        changes.reset();
+
+        assertThatThrownBy(() -> parser.parse("ALTER TABLE \"SCOTT\".\"TEST\" ADD (id_org_id as (org_id || '-' || id) virtual)", tables))
+                .isInstanceOf(ParsingException.class)
+                .hasMessageContaining("trying to add a virtual column in ORCLPDB1.SCOTT.TEST table: virtual columns are not supported.");
     }
 
     private List<DdlParserListener.EventType> getEventTypesFromChanges(DdlChanges changes) {

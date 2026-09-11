@@ -106,6 +106,43 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
     }
 
     @Test
+    @FixFor("dbz#1778")
+    public void executeMultipleBlockingSnapshots() throws Exception {
+        // Testing.Print.enable();
+
+        populateTable();
+
+        startConnectorWithSnapshot(x -> mutableConfig(false, false));
+
+        waitForSnapshotToBeCompleted(connector(), server(), task(), database());
+
+        insertRecords(ROW_COUNT, ROW_COUNT);
+
+        SourceRecords consumedRecordsByTopic = consumeRecordsByTopic(ROW_COUNT * 2, 10);
+        assertRecordsFromSnapshotAndStreamingArePresent(ROW_COUNT * 2, consumedRecordsByTopic);
+
+        LogInterceptor interceptor = LogInterceptor.forPackage("io.debezium");
+
+        // Send 3 blocking snapshot signals back-to-back
+        sendAdHocSnapshotSignalWithAdditionalConditionWithSurrogateKey("", "", BLOCKING, tableDataCollectionId());
+        sendAdHocSnapshotSignalWithAdditionalConditionWithSurrogateKey("", "", BLOCKING, tableDataCollectionId());
+        sendAdHocSnapshotSignalWithAdditionalConditionWithSurrogateKey("", "", BLOCKING, tableDataCollectionId());
+        Awaitility.await()
+                .alias("Streaming did not resume after all blocking snapshots")
+                .pollInterval(1, TimeUnit.SECONDS)
+                .atMost(waitTimeForRecords() * 60L, TimeUnit.SECONDS)
+                .until(() -> interceptor.countOccurrences("Streaming resumed") >= 3);
+
+        signalingRecords = 3;
+
+        consumeRecordsByTopic((ROW_COUNT * 2 * 3) + signalingRecords, 10);
+
+        insertRecords(ROW_COUNT, ROW_COUNT * 2);
+
+        assertStreamingRecordsArePresent(ROW_COUNT, consumeRecordsByTopic(ROW_COUNT, 10));
+    }
+
+    @Test
     public void executeBlockingSnapshotWhileStreaming() throws Exception {
         // Testing.Debug.enable();
 
@@ -452,11 +489,17 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
 
         waitForStreamingRunning(connector(), server(), getStreamingNamespace(), task());
 
+        LogInterceptor interceptor = new LogInterceptor(ChangeEventSourceCoordinator.class);
+
         sendAdHocSnapshotSignalWithAdditionalConditionsWithSurrogateKey(
                 String.format("{\"data-collection\": \"%s\"}", tableDataCollectionIds().get(1)), "", BLOCKING,
                 tableDataCollectionIds().get(1));
 
-        waitForLogMessage("Error while executing requested blocking snapshot.", ChangeEventSourceCoordinator.class);
+        Awaitility.await()
+                .alias("Snapshot not completed on time")
+                .pollInterval(100, TimeUnit.MILLISECONDS)
+                .atMost(waitTimeForRecords() * 60L, TimeUnit.SECONDS)
+                .until(() -> interceptor.containsMessage("Error while executing requested blocking snapshot."));
 
         insertRecords(ROW_COUNT, ROW_COUNT * 2);
 

@@ -1,5 +1,5 @@
 [![License](http://img.shields.io/:license-apache%202.0-brightgreen.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
-[![Maven Central](https://img.shields.io/maven-central/v/io.debezium/debezium-core?color=bright-green)](https://central.sonatype.com/search?q=io.debezium)
+[![Maven Central](https://img.shields.io/maven-central/v/io.debezium/debezium-connector-common?color=bright-green)](https://central.sonatype.com/search?q=io.debezium)
 [![User chat](https://img.shields.io/badge/chat-users-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302529-users)
 [![Developer chat](https://img.shields.io/badge/chat-devs-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302533-dev)
 [![Google Group](https://img.shields.io/:mailing%20list-debezium-brightgreen.svg)](https://groups.google.com/forum/#!forum/debezium)
@@ -63,7 +63,7 @@ Debezium のコードベースでを編集・ビルドする為には以下に�
 
     $ git --version
     $ javac -version
-    $ mvn -version
+    $ ./mvnw -version
     $ docker --version
 
 ### Docker が必要な理由
@@ -100,7 +100,7 @@ Docker Maven Plugin は Docker host を以下の環境変数を探す事によ�
 
 ビルドには Maven を利用します
 
-    $ mvn clean verify
+    $ ./mvnw clean verify
 
 このビルドは異なるデータベースソフトウェアのためにいくつかの Docker container を開始します。Docker が起動していない・設定されていない場合、恐らく難解なエラーが表示されます —— そのような場合は、常にDockerが起動していることを確認してください。 
 
@@ -108,13 +108,13 @@ Docker Maven Plugin は Docker host を以下の環境変数を探す事によ�
 
 結合テストや Docker build は以下のコマンドでスキップできます。
 
-    $ mvn clean verify -DskipITs
+    $ ./mvnw clean verify -DskipITs
 
 ### テストや CheckStyle を行わずに成果物だけをビルドする
 
 `quick` ビルドプロファイルを利用する事で、必須ではない plugin (tests, integration tests, CheckStyle, formatter, API compatibility check, etc.) をスキップすることができます
 
-    $ mvn clean verify -Dquick
+    $ ./mvnw clean verify -Dquick
 
 これは、品質保証に関連した Maven plugin の実行せずに、ビルド結果だけを生成する一番速い方法です。これは connector JAR やアーカイブをできるだけ速く出力したい場合に便利です。特に、Kafka Connect を手動テストする場合などに利用できます。
 
@@ -122,11 +122,11 @@ Docker Maven Plugin は Docker host を以下の環境変数を探す事によ�
 
 Postgres connector は、データベースの変更ストリームを論理デコードする3つの異なるプラグインをサポートしています： decoderbufs （デフォルト）, wal2json, および pgoutput です。Postgres connector を wal2json を使ってテストしたい場合、"wal2json-decoder" ビルドプロファイルを指定します。 
 
-    $ mvn clean install -pl :debezium-connector-postgres -Pwal2json-decoder
+    $ ./mvnw clean install -pl :debezium-connector-postgres -Pwal2json-decoder
 
 pgoutput を利用してテストするには、 "pgoutput-decoder" と "postgres-10" ビルドプロファイルを有効にします:
 
-    $ mvn clean install -pl :debezium-connector-postgres -Ppgoutput-decoder,postgres-10
+    $ ./mvnw clean install -pl :debezium-connector-postgres -Ppgoutput-decoder,postgres-10
 
 いくつかのテストは、wal2json プラグインを利用した場合パスしません。そのようなクラスは `io.debezium.connector.postgresql.DecoderDifferences` クラスへの参照から見つける事ができます。
 
@@ -134,7 +134,7 @@ pgoutput を利用してテストするには、 "pgoutput-decoder" と "postgre
 
 wal2json または pgoutput 論理デコードプラグインを使う場合、Apicurio のバージョンを選択する事ができます:
 
-    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder 
+    $ ./mvnw clean install -pl debezium-connector-postgres -Pwal2json-decoder 
           -Ddebezium.test.apicurio.version=1.3.1.Final
 
 このプロパティが存在しない場合、安定バージョンの Apicurio が利用されます
@@ -143,7 +143,7 @@ wal2json または pgoutput 論理デコードプラグインを使う場合、A
 
 *RDS ではない* cluster に対してテストを実行したい場合、テストのユーザー名 (`<your user>`)として `replication` 権限だけでなく `pg_hba.conf` で全てのデータベースにログインできる権限を持ったスーパーユーザーを指定する必要があります。また、いくつかのテストのために、サーバー上で `postgis` パッケージが必要です。
 
-    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder \
+    $ ./mvnw clean install -pl debezium-connector-postgres -Pwal2json-decoder \
          -Ddocker.skip.build=true -Ddocker.skip.run=true -Dpostgres.host=<your PG host> \
          -Dpostgres.user=<your user> -Dpostgres.password=<your password> \
          -Ddebezium.test.records.waittime=10
@@ -155,11 +155,11 @@ RDS データベースを設定してテストする方法ついて詳しくは 
 
 ### Oracle XStream を利用して Oracle connector をテストする
 
-    $ mvn clean install -pl debezium-connector-oracle -Poracle-xstream,oracle-tests -Dinstantclient.dir=<path-to-instantclient>
+    $ ./mvnw clean install -pl debezium-connector-oracle -Poracle-xstream,oracle-tests -Dinstantclient.dir=<path-to-instantclient>
 
 ### non-CDB データベースで Oracle connector をテストする
 
-    $ mvn clean install -pl debezium-connector-oracle -Poracle-tests -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
+    $ ./mvnw clean install -pl debezium-connector-oracle -Poracle-tests -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
 
 ## Contributing
 

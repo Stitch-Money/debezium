@@ -12,7 +12,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
@@ -26,7 +25,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
-import io.debezium.connector.base.DefaultQueueProvider;
+import io.debezium.connector.base.QueueProviderService;
 import io.debezium.connector.binlog.BinlogEventMetadataProvider;
 import io.debezium.connector.binlog.BinlogSourceTask;
 import io.debezium.connector.binlog.jdbc.BinlogConnectorConnection;
@@ -121,7 +120,7 @@ public class MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, Mar
 
         this.connection = connectionFactory.mainConnection();
 
-        final Offsets<MariaDbPartition, MariaDbOffsetContext> previousOffsets = getPreviousOffsets(
+        final Offsets<MariaDbPartition, MariaDbOffsetContext> previousOffsets = getSinglePartitionPreviousOffsets(
                 new MariaDbPartition.Provider(connectorConfig, config),
                 new MariaDbOffsetContext.Loader(connectorConfig));
 
@@ -170,8 +169,6 @@ public class MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, Mar
             throw new DebeziumException(e);
         }
 
-        MariaDbOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
-
         validateSchemaHistory(connectorConfig, connection::validateLogPosition, previousOffsets, schema, snapshotter);
 
         LOGGER.info("Reconnecting after validating schema recovery");
@@ -197,21 +194,14 @@ public class MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, Mar
             throw new DebeziumException("Failed to reconnect after schema recovery", e);
         }
 
-        // If the binlog position is not available it is necessary to re-execute snapshot
-        if (previousOffset == null) {
-            LOGGER.info("No previous offset found");
-        }
-        else {
-            LOGGER.info("Found previous offset {}", previousOffset);
-        }
-
         // Set up the task record queue ...
         this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                 .pollInterval(connectorConfig.getPollInterval())
+                .pollDispatchInterval(connectorConfig.getPollDispatchInterval())
                 .maxBatchSize(connectorConfig.getMaxBatchSize())
                 .maxQueueSize(connectorConfig.getMaxQueueSize())
                 .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
-                .queueProvider(new DefaultQueueProvider<>(connectorConfig.getMaxQueueSize()))
+                .queueProvider(connectorConfig.getServiceRegistry().tryGetService(QueueProviderService.class).getQueueProvider())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                 .buffering()
                 .build();
@@ -324,12 +314,15 @@ public class MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, Mar
         if (schema != null) {
             schema.close();
         }
+
+        if (queue != null) {
+            queue.close();
+        }
     }
 
     @Override
     protected List<SourceRecord> doPoll() throws InterruptedException {
-        final List<DataChangeEvent> records = queue.poll();
-        return records.stream().map(DataChangeEvent::getRecord).collect(Collectors.toList());
+        return pollRecords(queue);
     }
 
     @Override

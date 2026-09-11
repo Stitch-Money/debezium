@@ -5,7 +5,6 @@
  */
 package io.debezium.connector.postgresql;
 
-import static io.debezium.config.CommonConnectorConfig.DEFAULT_MAX_QUEUE_SIZE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.jupiter.api.Test;
@@ -20,12 +19,22 @@ import io.debezium.connector.base.DefaultQueueProvider;
 import io.debezium.pipeline.DataChangeEvent;
 
 public class PostgresErrorHandlerTest {
+
+    private static final String ROLE_AUTHORIZATION_ERROR = "FATAL: role not permitted to log in";
+    private static final String PASSWORD_AUTHENTICATION_ERROR = "FATAL: password authentication failed for user debezium";
     private static final String A_CLASSIFIED_EXCEPTION = "Database connection failed when writing to copy";
+
     private final PostgresErrorHandler errorHandler = new PostgresErrorHandler(
             new PostgresConnectorConfig(Configuration.create()
                     .with(CommonConnectorConfig.TOPIC_PREFIX, "postgres")
                     .build()),
-            new ChangeEventQueue.Builder<DataChangeEvent>().queueProvider(new DefaultQueueProvider<>(DEFAULT_MAX_QUEUE_SIZE)).build(), null);
+            new ChangeEventQueue.Builder<DataChangeEvent>().queueProvider(createDefaultQueueProvider(CommonConnectorConfig.DEFAULT_MAX_QUEUE_SIZE)).build(), null);
+
+    private static DefaultQueueProvider<DataChangeEvent> createDefaultQueueProvider(int maxQueueSize) {
+        DefaultQueueProvider<DataChangeEvent> provider = new DefaultQueueProvider<>();
+        provider.configure(java.util.Map.of("max.queue.size", String.valueOf(maxQueueSize)));
+        return provider;
+    }
 
     @Test
     void classifiedPSQLExceptionIsRetryable() {
@@ -63,4 +72,41 @@ public class PostgresErrorHandlerTest {
         RuntimeException testException = new RuntimeException();
         assertThat(errorHandler.isRetriable(testException)).isFalse();
     }
+
+    @Test
+    void connectionFailureIsNotPermanent() {
+        PSQLException psqlException = new PSQLException(A_CLASSIFIED_EXCEPTION, PSQLState.CONNECTION_FAILURE);
+        assertThat(PostgresErrorHandler.isPermanentError(psqlException)).isFalse();
+    }
+
+    @Test
+    void authorizationFailureIsPermanent() {
+        PSQLException psqlException = new PSQLException(ROLE_AUTHORIZATION_ERROR, PSQLState.INVALID_AUTHORIZATION_SPECIFICATION);
+        assertThat(PostgresErrorHandler.isPermanentError(psqlException)).isTrue();
+    }
+
+    @Test
+    void invalidPasswordIsPermanent() {
+        PSQLException psqlException = new PSQLException(PASSWORD_AUTHENTICATION_ERROR, PSQLState.INVALID_PASSWORD);
+        assertThat(PostgresErrorHandler.isPermanentError(psqlException)).isTrue();
+    }
+
+    @Test
+    void authorizationFailureWrappedInDebeziumExceptionIsPermanent() {
+        // Mirrors getDatabaseCharset() wrapping PSQLException in DebeziumException during start()
+        PSQLException psqlException = new PSQLException(ROLE_AUTHORIZATION_ERROR, PSQLState.INVALID_AUTHORIZATION_SPECIFICATION);
+        DebeziumException wrapper = new DebeziumException("Couldn't obtain encoding for database", psqlException);
+        assertThat(PostgresErrorHandler.isPermanentError(wrapper)).isTrue();
+    }
+
+    @Test
+    void nonSqlExceptionIsNotPermanent() {
+        assertThat(PostgresErrorHandler.isPermanentError(new RuntimeException("boom"))).isFalse();
+    }
+
+    @Test
+    void nullIsNotPermanent() {
+        assertThat(PostgresErrorHandler.isPermanentError(null)).isFalse();
+    }
+
 }

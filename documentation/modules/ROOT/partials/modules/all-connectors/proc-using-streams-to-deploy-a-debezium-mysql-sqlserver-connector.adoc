@@ -1,5 +1,4 @@
-With earlier versions of {kafka-streams}, to deploy {ProductName} connectors on OpenShift, you were required to first build a Kafka Connect image for the connector.
-The current preferred method for deploying connectors on OpenShift is to use a build configuration in {kafka-streams} to automatically build a Kafka Connect container image that includes the {prodname} connector plug-ins that you want to use.
+You can deploy a {prodname} connector on OpenShift by using {StreamsName} to automatically build a Kafka Connect container image that includes the connector plug-in, without having to manually build the image first.
 
 During the build process, the {kafka-streams} Operator transforms input parameters in a `KafkaConnect` custom resource, including {prodname} connector definitions, into a Kafka Connect container image.
 The build downloads the necessary artifacts from the Red Hat Maven repository or another configured HTTP server.
@@ -30,7 +29,7 @@ For more information about ImageStreams, see link:{LinkCreatingManagingOpenShift
 . Log in to the OpenShift cluster.
 . Create a {prodname} `KafkaConnect` custom resource (CR) for the connector, or modify an existing one.
 For example, create a `KafkaConnect` CR with the name `dbz-connect.yaml` that specifies the `metadata.annotations` and `spec.build` properties.
-The following example shows an excerpt from a `dbz-connect.yaml` file that describes a `KafkaConnect` custom resource. +
+The following example shows an excerpt from a `dbz-connect.yaml` file that describes a `KafkaConnect` custom resource.
 +
 .A `dbz-connect.yaml` file that defines a `KafkaConnect` custom resource that includes a {prodname} connector
 =====================================================================
@@ -43,11 +42,11 @@ include::../{partialsdir}/modules/all-connectors/ref-deploy-{context}-kafka-conn
 oc create -f dbz-connect.yaml
 ----
 +
-Based on the configuration specified in the custom resource, the Streams Operator prepares a Kafka Connect image to deploy. +
+Based on the configuration specified in the custom resource, the Streams Operator prepares a Kafka Connect image to deploy.
 After the build completes, the Operator pushes the image to the specified registry or ImageStream, and starts the Kafka Connect cluster.
 The connector artifacts that you listed in the configuration are available in the cluster.
 
-. Create a `KafkaConnector` resource to define an instance of each connector that you want to deploy. +
+. Create a `KafkaConnector` resource to define an instance of each connector that you want to deploy.
 For example, create the following `KafkaConnector` CR, and save it as `{context}-inventory-connector.yaml`
 +
 .`{context}-inventory-connector.yaml` file that defines the `KafkaConnector` custom resource for a {prodname} connector

@@ -5,6 +5,14 @@ inputs:
   maven-cache-key:
     description: "The maven build cache key"
     required: true
+  maven-cache-save:
+    description: "Whether to save the Maven cache after the job completes"
+    required: false
+    default: 'true'
+  only-build:
+    description: "Only build without tests, checkstyle, and format"
+    required: false
+    default: 'false'
   shell:
     description: "The shell to use"
     required: false
@@ -18,8 +26,13 @@ runs:
     - uses: ./.github/actions/maven-cache
       with:
         key: ${{ inputs.maven-cache-key }}
+        save: ${{ inputs.maven-cache-save }}
 
     - name: Build Debezium AI module
       shell: ${{ inputs.shell }}
       run: >
-        ./mvnw clean install -B -pl :debezium-ai -am -amd
+        ./mvnw clean install -B -pl :debezium-connector-common,:debezium-connect-plugins,:debezium-ai -am
+        -Dcheckstyle.skip=${{ inputs.only-build == 'true' && 'true' || 'false' }}
+        -Dformat.skip=${{ inputs.only-build == 'true' && 'true' || 'false' }}
+        -DskipLongRunningTests=true
+        ${{ inputs.only-build == 'true' && '-DskipTests=true -DskipITs=true' || '' }}

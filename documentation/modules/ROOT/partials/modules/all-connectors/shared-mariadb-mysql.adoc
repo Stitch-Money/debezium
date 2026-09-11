@@ -43,9 +43,9 @@ The {prodname} {connector-name} connector supports the following {connector-name
 
 Standalone::
 When a single {connector-name} server is used, the server must have the binlog enabled so the {prodname} {connector-name} connector can monitor the server.
- +
+
 include::{snippetsdir}/frag-{context}-props-snippets.adoc[tags=sup-topo-standalone-backupdoc]
- +
+
 In this case, the {connector-name} connector always connects to and follows this standalone {connector-name} server instance.
 
 Primary and replica::
@@ -61,16 +61,16 @@ include::{snippetsdir}/frag-{context}-props-snippets.adoc[tags=sup-topo-ha]
 
 Multi-primary::
 include::{snippetsdir}/frag-{context}-props-snippets.adoc[tags=sup-topo-multi-primary]
- +
+
 A {prodname} {connector-name} connector can use these multi-primary {connector-name} replicas as sources, and can fail over to different multi-primary {connector-name} replicas as long as the new replica is caught up to the old replica.
 That is, the new replica has all transactions that were seen on the first replica.
 This works even if the connector is using only a subset of databases and/or tables, because the connector can be configured to include or exclude specific GTID sources when attempting to reconnect to a new multi-primary {connector-name} replica and find the correct position in the binlog.
-
+ifdef::community[]
 Hosted::
 The {prodname} {connector-name} connector can use hosted database options such as Amazon RDS and Amazon Aurora.
 +
 Because these hosted options do not permit the use of global read locks, the connector uses table-level locks when it creates a consistent snapshot.
-
+endif::community[]
 end::supported-topos[]
 
 
@@ -431,14 +431,14 @@ After the snapshot completes, the connector continues to stream data for the spe
 If you want the connector to capture data only from specific tables you can direct the connector to capture the data for only a subset of tables or table elements by setting properties such as xref:{context}-property-table-include-list[`table.include.list`] or xref:{context}-property-table-exclude-list[`table.exclude.list`].
 
 |3
-|Obtain a global read lock on the tables to be captured to block _writes_ by other database clients. +
- +
+|Obtain a global read lock on the tables to be captured to block _writes_ by other database clients.
+
 The snapshot itself does not prevent other clients from applying DDL that might interfere with the connector's attempt to read the binlog position and table schemas.
 The connector retains the global read lock while it reads the binlog position, and releases the lock as described in a later step.
 
 |4
-include::{snippetsdir}/frag-{context}-props-snippets.adoc[leveloffset=+1,tags=snapshots-default-workflow-repeatable-read-semantics]
- +
+include::{snippetsdir}/frag-{context}-props-snippets.adoc[tags=snapshots-default-workflow-repeatable-read-semantics]
+
 [NOTE]
 ====
 The use of these isolation semantics can slow the progress of the snapshot.
@@ -450,14 +450,14 @@ If the snapshot takes too long to complete, consider using a different isolation
 
 |6
 a|Capture the structure of all tables in the database, or all tables that are designated for capture.
-The connector persists schema information in its internal database schema history topic, including all necessary `DROP...` and `CREATE...` DDL statements. +
+The connector persists schema information in its internal database schema history topic, including all necessary `DROP...` and `CREATE...` DDL statements.
 The schema history provides information about the structure that is in effect when a change event occurs.
- +
+
 [NOTE]
 ====
 By default, the connector captures the schema of every table in the database, including tables that are not configured for capture.
-If tables are not configured for capture, the initial snapshot captures only their structure; it does not capture any table data. +
- +
+If tables are not configured for capture, the initial snapshot captures only their structure; it does not capture any table data.
+
 For more information about why snapshots persist schema information for tables that you did not include in the initial snapshot, see xref:understanding-why-initial-snapshots-capture-the-schema-history-for-all-tables[Understanding why initial snapshots capture the schema for all tables].
 ====
 
@@ -530,16 +530,16 @@ To have the connector capture a subset of tables or table elements, you can set 
 |Obtain table-level locks.
 
 |4
-include::{snippetsdir}/frag-{context}-props-snippets.adoc[leveloffset=+1,tags=snapshots-default-workflow-repeatable-read-semantics]
+include::{snippetsdir}/frag-{context}-props-snippets.adoc[tags=snapshots-default-workflow-repeatable-read-semantics]
 
 |5
 a|Read the current binlog position.
 
 |6
 a|Read the schema of the databases and tables for which the connector is configured to capture changes.
-The connector persists schema information in its internal database schema history topic, including all necessary `DROP...` and `CREATE...` DDL statements. +
+The connector persists schema information in its internal database schema history topic, including all necessary `DROP...` and `CREATE...` DDL statements.
 The schema history provides information about the structure that is in effect when a change event occurs.
- +
+
 [NOTE]
 ====
 By default, the connector captures the schema of every table in the database, including tables that are not configured for capture.
@@ -598,18 +598,14 @@ After the snapshot completes, the connector stops, and does not stream event rec
 |`no_data`
 |The connector captures the structure of all relevant tables, performing all the steps described in the xref:{context}-initial-snapshot-workflow-with-global-read-lock[default workflow for creating an initial snapshot], except that it does not create `READ` events to represent the data set at the point of the connector's start-up (Step 7.2).
 
-|`never`
-|When the connector starts, rather than performing a snapshot, it immediately begins to stream event records for subsequent database changes.
-This option is under consideration for future deprecation, in favor of the `no_data` option.
-
 |`schema_only_recovery`
 |Deprecated, see `recovery`.
 
 |`recovery`
 |Set this option to restore a database schema history topic that is lost or corrupted.
 After a restart, the connector runs a snapshot that rebuilds the topic from the source tables.
-You can also set the property to periodically prune a database schema history topic that experiences unexpected growth. +
- +
+You can also set the property to periodically prune a database schema history topic that experiences unexpected growth.
+
 WARNING: Do not use this mode to perform a snapshot if schema changes were committed to the database after the last connector shutdown.
 
 |`when_needed`
@@ -808,12 +804,139 @@ When the {connector-name} connection is read-only, you can use any of the {link-
 end::adhoc-ro-incremental[]
 
 
+=== Setting the binlog position via a signal
+
+tag::set-binlog-position-intro[]
+In certain situations it can be useful to precisely control the point in the binlog from which the connector begins to capture database changes.
+You can send a {prodname} `set-binlog-position` signal at run time to dynamically specify where the {connector-name} connector begins reading from the database binlog (binary log).
+
+[IMPORTANT]
+====
+Depending on the position that you specify in the `set-binlog-position` signal, the connector either excludes events from the log, or sends duplicate events.
+
+If you specify a binlog position that is later than the current position, the connector skips change events in the history between the current position and the new position.
+The connector does not capture or stream changes in the skipped range.
+
+On the other hand, if the signal directs the connector to resume reading from a point earlier than the current position, the connector replays log entries that it previously sent, emitting duplicate events to the destination topic.
+====
+
+You might want to reset the connector's binlog position under the following circumstances:
+
+Disaster recovery:: Direct the connector to resume streaming from the last known good position in the log after a system failure.
+Restarting from a specified position helps to maintain data consistency across the pipeline by ensuring that data is not lost or duplicated.
+Corrupted data:: You detect corrupted or incorrect data in the database or in the destination Kafka topics, and want to skip the corrupted data and resume from a known good position.
+Avoid replaying old data after a database refresh:: After you refresh a database from another source, such as a backup, the connector might attempt to replay all historical events from an old binlog position, which can result in duplicate topic data, and lead to heavy resource consumption.
+By resuming streaming from a specific recent point, you skip historical events that you don't need, and can help save cost and time.
+Partial replication:: When diverting captured data to a new Kafka topic, you want the connector to process the log from a specific point to exclude the full event history and send only a specific subset of database changes.
+By using this approach, you prevent the connector from processing obsolete, older data so that the connector captures only the relevant recent changes.
+Testing:: Test the connector with a specific subset of data, excluding the full history captured by snapshots.
+end::set-binlog-position-intro[]
 
 
+==== Format of a `set-binlog-position` signal
+
+tag::set-binlog-position-format[]
+A {prodname} `set-binlog-position` signal message includes the standard `id`, `type`, and `data` properties.
+The exact format of the message depends on which signaling channel you use.
+For more information about the format of {prodname} signals, see {link-prefix}:{link-signalling}#debezium-signaling-overview}[Sending signals to a {prodname} connector].
+
+To designate the binlog position in a `set-binlog-position` signal, in the data portion of the signal, you specify either the binlog file and position, or a GTID set, depending on whether GTID (Global Transaction Identifier) mode is enabled.
+You cannot use both formats in the same signal.
+
+The following examples illustrate the two formats for specifying the binlog position in a signal:
+
+Binlog file and position format::
+When GTID mode is disabled, specify the binlog filename and position in the signal, as in the following example:
++
+[example]
+====
+[source,json]
+----
+{"binlog_filename": "mysql-bin.000003", "binlog_position": 1234}
+----
+====
+The `binlog_filename` must match the binlog naming pattern (for example, `mysql-bin.000001` for MySQL or `mariadb-bin.000001` for MariaDB).
++
+The `binlog_position` must be a non-negative integer.
+
+
+GTID set format::
+When GTID mode is enabled, specify the GTID set in the signal.
+The format of the GTID set value differs between MySQL and MariaDB:
++
+--
+* *MySQL* uses UUID-based GTIDs, for example:
++
+[example]
+====
+[source,json]
+----
+{"gtid_set": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100"}
+----
+====
+
+* *MariaDB* uses `domain-server-sequence` tuples, for example:
++
+[example]
+====
+[source,json]
+----
+{"gtid_set": "0-1-100"}
+----
+====
+--
++
+The value of the `gtid_set` attribute must be a valid GTID set string for the database server in use.
+end::set-binlog-position-format[]
+
+
+==== Send a signal to reposition the stream
+
+tag::set-binlog-position-procedure[]
+Send a {prodname} `set-binlog-position` signal at run time to specify the binlog reading position for the {connector-name} connector.
+
+
+.Prerequisites
+
+* The connector is configured to use one of the available {link-prefix}:{link-signalling}#sending-signals-to-a-debezium-connector[{prodname} signaling channels].
+* A {link-prefix}:{link-signalling}#debezium-signaling-enabling-source-signaling-channel[signaling data collection] exists on the source database.
+* The connector configuration property `heartbeat.interval.ms` is set to ensure that offset changes are persisted.
+
+.Procedure
+
+1. Determine the target position in your database history (binlog file and position, or GTID set).
+2. Send a `set-binlog-position` signal that includes the standard `id`, `type`, and `data` properties in the format that is required for your preferred signaling channel.
++
+In the data portion of the signal, specify the target position as determined in step 1.
++
+For example, for the source signaling channel, add one of the following SQL commands to the `data` component of the signal, depending on whether GTID is enabled:
++
+SQL to use when GTID is disabled (uses the binlog file and position)::
++
+[source,sql,indent=0,subs="+attributes"]
+----
+INSERT INTO debezium_signal (id, type, data) VALUES (
+  'set-position-001',
+  'set-binlog-position',
+  '{"binlog_filename": "{binlog-filename-example}", "binlog_position": 1234}'
+);
+----
++
+SQL to use when GTID is enabled (specifies {gtid-label})::
++
+[source,sql,indent=0,subs="+attributes"]
+----
+INSERT INTO debezium_signal (id, type, data) VALUES (
+  'set-gtid-001',
+  'set-binlog-position',
+  '{"gtid_set": "{gtid-value}"}'
+);
+----
+3. Restart the connector to begin streaming from the new position.
+end::set-binlog-position-procedure[]
 
 
 === Topic names
-
 tag::topic-names[]
 By default, the {connector-name} connector writes change events for all of the `INSERT`, `UPDATE`, and `DELETE` operations that occur in a table to a single Apache Kafka topic that is specific to that table.
 
@@ -1104,6 +1227,9 @@ end::event-keys[]
 === Change event values
 
 tag::event-values[]
+A change event value contains the full row state before and after an operation,
+along with source metadata and operation type, structured as a Kafka Connect `Envelope`.
+
 The value in a change event is a bit more complicated than the key. Like the key, the value has a `schema` section and a `payload` section. The `schema` section contains the schema that describes the `Envelope` structure of the `payload` section, including its nested fields. Change events for operations that create, update or delete data all have a value payload with an envelope structure.
 
 Consider the same sample table that was used to show an example of a change event key:
@@ -1135,6 +1261,9 @@ end::event-values[]
 === _create_ events
 
 tag::create-events[]
+
+A _create_ event contains the full row data for an `INSERT` operation,
+capturing the state of the new row in the `after` field of the event value payload.
 
 The following example shows the value portion of a change event that the connector generates for an operation that creates data in the `customers` table:
 
@@ -1780,15 +1909,10 @@ Details are in the following sections:
 * xref:{context}-decimal-types[]
 * xref:{context}-boolean-values[]
 * xref:{context}-spatial-types[]
+* xref:{context}-vector-types[]
 endif::product[]
+
 end::data-type-mappings[]
-tag::data-type-mappings-list-mysql-only[]
-ifdef::product[]
-* xref:mysql-vector-types[]
-endif::product[]
-end::data-type-mappings-list-mysql-only[]
-
-
 
 === Basic types
 
@@ -1810,12 +1934,16 @@ a|_n/a_
 
 |`BIT(>1)`
 |`BYTES`
-a|`io.debezium.data.Bits` +
- +
-The `length` schema parameter contains an integer that represents the number of bits. The `byte[]` contains the bits in _little-endian_ form and is sized to contain the specified number of bits. For example, where `n` is bits: +
+a|`io.debezium.data.Bits`
+
+The `length` schema parameter contains an integer that represents the number of bits. The `byte[]` contains the bits in _little-endian_ form and is sized to contain the specified number of bits. For example, where `n` is bits:
 `numBytes = n/8 + (n%8== 0 ? 0 : 1)`
 
-|`TINYINT`
+|`TINYINT[(M)]`
+|`INT8`
+a|_n/a_
+
+|`TINYINT[(M)] UNSIGNED`
 |`INT16`
 a|_n/a_
 
@@ -1827,7 +1955,7 @@ a|_n/a_
 |`INT32`
 a|_n/a_
 
-|`INT, INTEGER[(M)]`
+|`INT[(M)], INTEGER[(M)]`
 |`INT32`
 a|_n/a_
 
@@ -1851,54 +1979,54 @@ include::{snippetsdir}/frag-{context}-props-snippets.adoc[leveloffset=+1,tags=ba
 |`FLOAT64`
 a|_n/a_
 
-|`CHAR(M)]`
+|`CHAR[(M)]`
 |`STRING`
 a|_n/a_
 
-|`VARCHAR(M)]`
+|`VARCHAR(M)`
 |`STRING`
 a|_n/a_
 
-|`BINARY(M)]`
+|`BINARY[(M)]`
 |`BYTES` or `STRING`
-a|_n/a_ +
- +
+a|_n/a_
+
 Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting.
 
-|`VARBINARY(M)]`
+|`VARBINARY(M)`
 |`BYTES` or `STRING`
-a|_n/a_ +
- +
+a|_n/a_
+
 Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting.
 
 |`TINYBLOB`
 |`BYTES` or `STRING`
-a|_n/a_ +
- +
+a|_n/a_
+
 Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting.
 
 |`TINYTEXT`
 |`STRING`
 a|_n/a_
 
-|`BLOB`
+|`BLOB[(M)]`
 |`BYTES` or `STRING`
-a|_n/a_ +
- +
-Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting. +
- +
+a|_n/a_
+
+Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting.
+
 Only values with a size of up to 2GB are supported. It is recommended to externalize large column values, using the claim check pattern.
 
-|`TEXT`
+|`TEXT[(M)]`
 |`STRING`
-a|_n/a_ +
- +
+a|_n/a_
+
 Only values with a size of up to 2GB are supported. It is recommended to externalize large column values, using the claim check pattern.
 
 |`MEDIUMBLOB`
 |`BYTES` or `STRING`
-a|_n/a_ +
- +
+a|_n/a_
+
 Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting.
 
 |`MEDIUMTEXT`
@@ -1907,46 +2035,46 @@ a|_n/a_
 
 |`LONGBLOB`
 |`BYTES` or `STRING`
-a|_n/a_ +
- +
-Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting. +
- +
+a|_n/a_
+
+Either the raw bytes (the default), a base64-encoded String, or a base64-url-safe-encoded String, or a hex-encoded String, based on the xref:{context}-property-binary-handling-mode[`binary.handling.mode`] connector configuration property setting.
+
 Only values with a size of up to 2GB are supported. It is recommended to externalize large column values, using the claim check pattern.
 
 |`LONGTEXT`
 |`STRING`
-a|_n/a_ +
- +
+a|_n/a_
+
 Only values with a size of up to 2GB are supported. It is recommended to externalize large column values, using the claim check pattern.
 
 |`JSON`
 |`STRING`
-a|`io.debezium.data.Json` +
- +
+a|`io.debezium.data.Json`
+
 Contains the string representation of a `JSON` document, array, or scalar.
 
 |`ENUM`
 |`STRING`
-a|`io.debezium.data.Enum` +
- +
+a|`io.debezium.data.Enum`
+
 The `allowed` schema parameter contains the comma-separated list of allowed values.
 
 |`SET`
 |`STRING`
-a|`io.debezium.data.EnumSet` +
- +
+a|`io.debezium.data.EnumSet`
+
 The `allowed` schema parameter contains the comma-separated list of allowed values.
 
-|`YEAR[(2\|4)]`
+|`YEAR[(4)]`
 |`INT32`
 |`io.debezium.time.Year`
 
-|`TIMESTAMP[(M)]`
+|`TIMESTAMP[(fsp)]`
 |`STRING`
-a|`io.debezium.time.ZonedTimestamp` +
- +
+a|`io.debezium.time.ZonedTimestamp`
+
 In link:https://www.iso.org/iso-8601-date-and-time-format.html[ISO 8601] format with microsecond precision.
-{connector-name} allows `M` to be in the range of `0-6`.
+{connector-name} allows the fractional seconds precision `fsp` to be in the range of `0-6`.
 
 |===
 end::basic-data-types[]
@@ -1962,6 +2090,7 @@ Excluding the `TIMESTAMP` data type, {connector-name} temporal types depend on t
 
 {connector-name} allows zero-values for `DATE`, `DATETIME`, and `TIMESTAMP` columns because zero-values are sometimes preferred over null values.
 The {connector-name} connector represents zero-values as null values when the column definition allows null values, or as the epoch day when the column does not allow null values.
+When `time.precision.mode=structured`, zero or invalid temporal components that are available from captured events are represented in the structured component fields.
 
 .Temporal values without time zones
 The `DATETIME` type represents a local date and time such as "2018-01-13 09:48:27". As you can see, there is no time zone information. Such columns are converted into epoch milliseconds or microseconds based on the column’s precision by using UTC.
@@ -1990,23 +2119,23 @@ The {connector-name} connector determines the literal type and semantic type bas
 
 |`DATE`
 |`INT32`
-a|`io.debezium.time.Date` +
+a|`io.debezium.time.Date`
 Represents the number of days since the epoch.
 
-|`TIME[(M)]`
+|`TIME[(fsp)]`
 |`INT64`
-a|`io.debezium.time.MicroTime` +
+a|`io.debezium.time.MicroTime`
 Represents the time value in microseconds and does not include time zone information.
-{connector-name} allows `M` to be in the range of `0-6`.
+{connector-name} allows the fractional seconds precision `fsp` to be in the range of `0-6`.
 
 |`DATETIME, DATETIME(0), DATETIME(1), DATETIME(2), DATETIME(3)`
 |`INT64`
-a|`io.debezium.time.Timestamp` +
+a|`io.debezium.time.Timestamp`
 Represents the number of milliseconds past the epoch and does not include time zone information.
 
 |`DATETIME(4), DATETIME(5), DATETIME(6)`
 |`INT64`
-a|`io.debezium.time.MicroTimestamp` +
+a|`io.debezium.time.MicroTimestamp`
 Represents the number of microseconds past the epoch and does not include time zone information.
 
 |===
@@ -2025,18 +2154,154 @@ The `connect` setting is expected to be removed in a future version of {prodname
 
 |`DATE`
 |`INT32`
-a|`org.apache.kafka.connect.data.Date` +
+a|`org.apache.kafka.connect.data.Date`
 Represents the number of days since the epoch.
 
-|`TIME[(M)]`
+|`TIME[(fsp)]`
 |`INT64`
-a|`org.apache.kafka.connect.data.Time` +
+a|`org.apache.kafka.connect.data.Time`
 Represents the time value in microseconds since midnight and does not include time zone information.
 
-|`DATETIME[(M)]`
+|`DATETIME[(fsp)]`
 |`INT64`
-a|`org.apache.kafka.connect.data.Timestamp` +
+a|`org.apache.kafka.connect.data.Timestamp`
 Represents the number of milliseconds since the epoch, and does not include time zone information.
+
+|===
+
+time.precision.mode=isostring::
+The {connector-name} connector represents date, time, and datetime values as ISO-8601 formatted strings at the UTC time zone.
+Because the values are represented as strings, this mode preserves the fractional-second precision that the `connect` mode can lose.
++
+.Mappings when `time.precision.mode=isostring`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|{connector-name} type |Literal type |Semantic type
+
+|`DATE`
+|`STRING`
+a|`io.debezium.time.IsoDate`
+
+Represents the date value in UTC format, according to the ISO 8601 standard, for example, `2017-09-15Z`.
+
+|`TIME[(fsp)]`
+|`STRING`
+a|`io.debezium.time.IsoTime`
+
+Represents the time value in UTC format, according to the ISO 8601 standard, for example, `04:05:11.789Z`.
+
+|`DATETIME[(fsp)]`
+|`STRING`
+a|`io.debezium.time.IsoTimestamp`
+
+Represents the datetime value in UTC format, according to the ISO 8601 standard, for example, `2019-07-09T02:28:57.123456Z`.
+
+|===
+
+time.precision.mode=microseconds::
+The {connector-name} connector maps all temporal values to microsecond-precision integers.
+All `DATE` values are represented as the number of days since the epoch, and all `TIME` and `DATETIME` values are represented as the number of microseconds since the epoch or since midnight.
++
+.Mappings when `time.precision.mode=microseconds`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|{connector-name} type |Literal type |Semantic type
+
+|`DATE`
+|`INT32`
+a|`io.debezium.time.Date`
+Represents the number of days since the epoch.
+
+|`TIME[(fsp)]`
+|`INT64`
+a|`io.debezium.time.MicroTime`
+Represents the time value in microseconds since midnight and does not include time zone information.
+{connector-name} allows the fractional seconds precision `fsp` to be in the range of `0-6`.
+
+|`DATETIME[(fsp)]`
+|`INT64`
+a|`io.debezium.time.MicroTimestamp`
+Represents the number of microseconds since the epoch and does not include time zone information.
+
+|`TIMESTAMP[(fsp)]`
+|`STRING`
+a|`io.debezium.time.ZonedTimestamp`
+Represents the timestamp with time zone information.
+
+|===
+
+time.precision.mode=nanoseconds::
+The {connector-name} connector maps all temporal values to nanosecond-precision integers.
+All `DATE` values are represented as the number of days since the epoch, and all `TIME` and `DATETIME` values are represented as the number of nanoseconds since the epoch or since midnight.
++
+NOTE: {connector-name} `DATETIME` and `TIME` columns are limited to microsecond precision (`DATETIME(0-6)`, `TIME(0-6)`), so `nanoseconds` does not provide additional precision beyond what `microseconds` already offers.
++
+[IMPORTANT]
+====
+Nanoseconds since the Unix epoch are stored in a signed `INT64`, restricting the representable range to approximately *`1677-09-21T00:12:43Z` to `2262-04-11T23:47:16Z`*.
+Values outside this range, for example a `9999-12-31` end-of-time sentinel, cannot be represented and cause the connector to throw an `IllegalArgumentException` from the value converter.
+The exception is handled according to the `event.converting.failure.handling.mode` configuration: with `warn` (the default) or `skip`, the affected column value is emitted as `null` and the failure is logged; with `fail`, the connector stops.
+Use `time.precision.mode=microseconds` (or `isostring`) to avoid the limitation.
+====
++
+.Mappings when `time.precision.mode=nanoseconds`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|{connector-name} type |Literal type |Semantic type
+
+|`DATE`
+|`INT32`
+a|`io.debezium.time.Date`
+Represents the number of days since the epoch.
+
+|`TIME[(fsp)]`
+|`INT64`
+a|`io.debezium.time.NanoTime`
+Represents the time value in nanoseconds since midnight and does not include time zone information.
+{connector-name} allows the fractional seconds precision `fsp` to be in the range of `0-6`.
+
+|`DATETIME[(fsp)]`
+|`INT64`
+a|`io.debezium.time.NanoTimestamp`
+Represents the number of nanoseconds since the epoch and does not include time zone information.
+
+|`TIMESTAMP[(fsp)]`
+|`STRING`
+a|`io.debezium.time.ZonedTimestamp`
+Represents the timestamp with time zone information.
+
+|===
+
+time.precision.mode=structured::
+The {connector-name} connector represents temporal values as Kafka Connect structs with separate calendar and clock components.
+This mode can preserve zero and invalid temporal components without converting them to epoch-based numeric values.
+Structured temporal values that have fractional seconds include an optional `precision` field that records the source column's fractional second precision.
+The {prodname} JDBC sink connector can consume these structured temporal schemas directly and maps them according to the target database dialect.
++
+.Mappings when `time.precision.mode=structured`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|{connector-name} type |Literal type |Semantic type
+
+|`DATE`
+|`STRUCT`
+a|`io.debezium.time.StructuredDate` +
+Contains `year`, `month`, and `day` fields.
+
+|`TIME[(M)]`
+|`STRUCT`
+a|`io.debezium.time.StructuredDuration` +
+Contains signed `years`, `months`, `days`, `hours`, `minutes`, `seconds`, `nanos`, and optional `precision` fields.
+
+|`DATETIME[(M)]`
+|`STRUCT`
+a|`io.debezium.time.StructuredTimestamp` +
+Contains `year`, `month`, `day`, `hour`, `minute`, `second`, `nanos`, and optional `precision` fields.
+
+|`TIMESTAMP[(M)]`
+|`STRUCT`
+a|`io.debezium.time.StructuredZonedTimestamp` +
+Contains calendar and clock component fields, `offsetSeconds`, optional `zoneId`, and optional `precision`.
 
 |===
 end::temporal-data-types[]
@@ -2059,12 +2324,12 @@ decimal.handling.mode=precise::
 
 |`NUMERIC[(M[,D])]`
 |`BYTES`
-a|`org.apache.kafka.connect.data.Decimal` +
+a|`org.apache.kafka.connect.data.Decimal`
 The `scale` schema parameter contains an integer that represents how many digits the decimal point shifted.
 
 |`DECIMAL[(M[,D])]`
 |`BYTES`
-a|`org.apache.kafka.connect.data.Decimal` +
+a|`org.apache.kafka.connect.data.Decimal`
 The `scale` schema parameter contains an integer that represents how many digits the decimal point shifted.
 
 |===
@@ -2120,7 +2385,7 @@ During snapshots, {prodname} executes `SHOW CREATE TABLE` to obtain table defini
 To enable you to convert source columns to Boolean data types, {prodname} provides a `TinyIntOneToBooleanConverter` {link-prefix}:{link-custom-converters}#custom-converters[custom converter] that you can use in one of the following ways:
 
 * Map all `TINYINT(1)` or `TINYINT(1) UNSIGNED` columns to `BOOLEAN` types.
-* Enumerate a subset of columns by using a comma-separated list of regular expressions. +
+* Enumerate a subset of columns by using a comma-separated list of regular expressions.
 To use this type of conversion, you must set the xref:{context}-property-converters[`converters`] configuration property with the `selector` parameter, as shown in the following example:
 +
 [source]
@@ -2155,15 +2420,21 @@ Currently, the {prodname} {connector-name} connector supports the following spat
 |===
 |{connector-name} type |Literal type |Semantic type
 
-|`GEOMETRY, +
-LINESTRING, +
-POLYGON, +
-MULTIPOINT, +
-MULTILINESTRING, +
-MULTIPOLYGON, +
-GEOMETRYCOLLECTION`
+|`GEOMETRY`
+
+`LINESTRING`
+
+`POLYGON`
+
+`MULTIPOINT`
+
+`MULTILINESTRING`
+
+`MULTIPOLYGON`
+
+`GEOMETRYCOLLECTION`
 |`STRUCT`
-a|`io.debezium.data.geometry.Geometry` +
+a|`io.debezium.data.geometry.Geometry`
 Contains a structure with two fields:
 
 * `srid (INT32`: spatial reference system ID that defines the type of geometry object stored in the structure
@@ -2173,8 +2444,22 @@ Contains a structure with two fields:
 end::spatial-data-types[]
 
 
+tag::vector-data-types[]
+=== Vector types
 
+Currently, the {prodname} {connector-name} connector supports the following vector data types.
 
+.Description of vector type mappings
+[cols="35%a,15%a,50%a",options="header",subs="+attributes"]
+|===
+|{connector-name} type |Literal type |Semantic type
+
+|`VECTOR`
+|`ARRAY (FLOAT32)`
+|`io.debezium.data.FloatVector`
+
+|===
+end::vector-data-types[]
 
 
 == Custom converters
@@ -2249,6 +2534,72 @@ For example, to set the scope of the Boolean converter, add the following rule t
 end::jdbc-sink-data-types[]
 
 
+=== Zero-date fallback
+
+tag::zero-date-fallback[]
+By default, MySQL/MariaDB allow inserting `0000-00-00` (DATE) and `0000-00-00 00:00:00` (DATETIME / TIMESTAMP) values, which are sentinel "zero-date" values that do not represent any real instant in time.
+{prodname} cannot represent these sentinels in its standard temporal logical types (`io.debezium.time.Date`, `io.debezium.time.Timestamp`, `io.debezium.time.ZonedTimestamp`), so by default it collapses them either to `null` (when the column is nullable) or to the epoch (`1970-01-01[T00:00:00Z]`) when the column is `NOT NULL`.
+
+The `ZeroDateFallbackConverter` custom converter lets you decide, per JDBC type or per column, what value the connector emits for zero-date rows.
+You can also opt to emit `null` for `NOT NULL` columns — the converter promotes the column's Kafka Connect schema to optional and clears its `defaultValue` slot so the `null` row is not back-filled with the column's DDL default during Avro serialization.
+
+.Example: `ZeroDateFallbackConverter` configuration
+[source]
+----
+converters=zero-date
+zero-date.type=io.debezium.connector.binlog.converters.ZeroDateFallbackConverter
+zero-date.target.types=DATE,DATETIME,TIMESTAMP
+zero-date.fallback.date=NULL
+zero-date.fallback.datetime=2000-01-01 00:00:00
+zero-date.fallback.timestamp=1970-01-01T00:00:00Z
+zero-date.column.appdb.users.deleted_at.fallback=NULL
+zero-date.column.appdb.orders.shipped_at.fallback=2099-12-31 23:59:59
+zero-date.selector=.*
+----
+
+[cols="2,1,3"]
+|===
+|Property |Default |Description
+
+|`target.types`
+|`DATE,DATETIME,TIMESTAMP`
+|Comma-separated subset of `DATE`, `DATETIME`, `TIMESTAMP` controlling which JDBC temporal types the converter applies to.
+
+|`fallback.date`
+|`NULL`
+|Value emitted for zero-date `DATE` rows. `NULL` (or unset) promotes the column schema to optional and emits `null`. Otherwise an ISO-8601 date literal (`yyyy-MM-dd`).
+
+|`fallback.datetime`
+|`NULL`
+|Value emitted for zero-date `DATETIME` rows. `NULL` (or unset) promotes the column schema to optional and emits `null`. Otherwise a UTC datetime literal (`yyyy-MM-dd HH:mm:ss`).
+
+|`fallback.timestamp`
+|`NULL`
+|Value emitted for zero-date `TIMESTAMP` rows. `NULL` (or unset) promotes the column schema to optional and emits `null`. Otherwise an ISO-8601 offset datetime literal (for example, `1970-01-01T00:00:00Z`).
+
+|`column.<db>.<table>.<column>.fallback`
+|(unset)
+|Column-specific override of the type-level fallback. Same allowed values as the type-level options (`NULL` or a type-appropriate literal). The lookup key uses the fully-qualified column name reported by `RelationalColumn#dataCollection()`.
+
+|`selector`
+|`.*`
+|Comma-separated list of regular expressions matched against `<db>.<table>.<column>`. Only matching columns are passed through the converter. The default wildcard applies the converter to every column whose JDBC type is included in `target.types`.
+|===
+
+Resolution order for the effective fallback is: column-level override > type-level fallback > `NULL`.
+
+The converter distinguishes zero-date rows from genuine `1970-01-01` rows by relying on the binlog deserializer / JDBC driver to surface zero-date values as `null` at the SPI input.
+Row-level emission therefore has no false positives: a real `1970-01-01 00:00:00 UTC` row continues to emit `0` (epoch days / millis) as it does without the converter, while zero-date rows emit the configured fallback (or `null`).
+
+[NOTE]
+====
+The converter applies the user-configured fallback to the Kafka Connect schema's `defaultValue` slot at schema-build time, regardless of the column's DDL default.
+This relies on `TableSchemaBuilder` invoking the registered converter lambda exactly once during schema build for the purpose of resolving the column's default.
+This is an internal contract rather than a published SPI guarantee.
+====
+end::zero-date-fallback[]
+
+
 
 
 
@@ -2264,6 +2615,10 @@ Details are in the following sections:
 
 * xref:creating-a-{context}-user-for-a-debezium-connector[]
 * xref:enabling-the-{context}-binlog-for-debezium[]
+ifdef::community[]
+* xref:enabling-innodb-binlog-for-debezium[]
+endif::community[]
+
 * xref:enabling-{context}-gtids-for-debezium[]
 * xref:configuring-{context}-session-timeouts-for-debezium[]
 * xref:enabling-query-log-events-for-debezium-{context}-connectors[]
@@ -2304,9 +2659,10 @@ This {connector-name} user must have appropriate permissions on all databases fo
 ----
 +
 For a description of the required permissions, see xref:permissions-explained-{context}-connector[].
+ifdef::community[]
 +
 IMPORTANT: If using a hosted option such as Amazon RDS or Amazon Aurora that does not allow a global read lock, table-level locks are used to create the _consistent snapshot_. In this case, you need to also grant `LOCK TABLES` permissions to the user that you create. See xref:{context}-snapshots[snapshots] for more details.
-
+endif::community[]
 . Finalize the user's permissions:
 +
 [source,SQL,subs="+attributes"]
@@ -2314,8 +2670,14 @@ IMPORTANT: If using a hosted option such as Amazon RDS or Amazon Aurora that doe
 {context}> FLUSH PRIVILEGES;
 ----
 
-+
-[id="permissions-explained-{context}-connector"]
+end::creating-a-db-user[]
+
+
+
+tag::permissions-explained[]
+The following table describes the {connector-name} permissions that you must grant to the {prodname} connector user account,
+with an explanation of why each permission is required.
+
 .Descriptions of user permissions
 [cols="3,7",options="header",subs="+attributes"]
 |===
@@ -2352,10 +2714,7 @@ The connector always requires this.
 |Specifies the user's {connector-name} password.
 
 |===
-
-end::creating-a-db-user[]
-
-
+end::permissions-explained[]
 
 
 
@@ -2390,12 +2749,67 @@ binlog_expire_logs_seconds  = 864000
 . Confirm your changes by checking the binlog status once more:
 +
 include::{snippetsdir}/frag-{context}-props-snippets.adoc[leveloffset=+1,tags=setting-up-the-db-enabling-binlog]
-
+ifdef::community[]
 . If you run {connector-name} on Amazon RDS, you must enable automated backups for your database instance for binary logging to occur.
 If the database instance is not configured to perform automated backups, the binlog is disabled, even if you apply the settings described in the previous steps.
+endif::community[]
+end::enabling-binlog[]
 
+
+=== Enabling the InnoDB-based binary log (MariaDB 12.3 and later)
+
+
+tag::enabling-innodb-binlog[]
+ifdef::community[]
+In MariaDB versions 12.3 and later, you can configure the database to store the binary log in InnoDB-managed, page-structured files (`.ibb`), instead of traditional flat files.
+If you configure the database to store the binary log in InnoDB files, it does not enforce the two-phase commit (2PC) protocol between the binary log and InnoDB, resulting in improved commit latency and simplified crash recovery.
+
+When the database uses InnoDB to store the binary log, the following considerations apply:
+
+* This feature is mutually exclusive with the traditional file-based binlog.
+The server uses the InnoDB-based format to store all entries.
+* Galera Cluster is not supported.
+* Semi-synchronous replication is not supported.
+* The `sync_binlog` option is no longer required and is effectively ignored.
+
+.Prerequisites
+
+* MariaDB version 12.3 or later.
+* GTID-based replication is enabled.
+
+.Procedure
+
+. Add the following options to your MariaDB configuration file:
 +
-[id="binlog-configuration-properties-{context}-connector"]
+[source,properties]
+----
+log_bin
+binlog_storage_engine=innodb
+binlog_format=ROW
+binlog_row_image=FULL
+----
++
+The `log_bin` property must be present in the configuration, but it cannot contain a value.
+The `binlog_storage_engine=innodb` setting enables the database to use InnoDB to store the binary log.
+
+. Verify the binlog format by connecting to the server and running the following SQL command:
++
+[source,sql]
+----
+SHOW BINARY LOGS;
+----
++
+Files are named with an `.ibb` extension (for example, `binlog-000000.ibb`).
+
+For more information about the InnoDB-based binary log, see the https://mariadb.com/docs/server/server-management/server-monitoring-logs/binary-log/innodb-based-binary-log/[MariaDB documentation].
+
+endif::community[]
+end::enabling-innodb-binlog[]
+
+
+tag::binlog-config-props[]
+The following table describes the {connector-name} server configuration properties that you must set to enable and configure the binary log for use with the {prodname} connector.
+
 .Descriptions of {connector-name} binlog configuration properties
 [cols="1,4",options="header",subs="+attributes"]
 |===
@@ -2406,6 +2820,23 @@ If the database instance is not configured to perform automated backups, the bin
 
 |`log_bin`
 |The value of `log_bin` is the base name of the sequence of binlog files.
+ifdef::MARIADB[]
+ifdef::community[]
+If the MariaDB server uses link:https://mariadb.com/docs/server/server-management/server-monitoring-logs/binary-log/innodb-based-binary-log/[InnoDB to store the binary log], add an empty `log_bin` property to the MariaDB configuration.
+That is, list the property in the configuration, but do not specify a value.
+endif::community[]
+endif::MARIADB[]
+
+ifdef::MARIADB[]
+ifdef::community[]
+|`binlog_storage_engine`
+|Specifies the storage engine that manages the binary log.
+Set the value to `innodb` to enable the https://mariadb.com/docs/server/server-management/server-monitoring-logs/binary-log/innodb-based-binary-log/[InnoDB-based binary log]
+feature in MariaDB 12.3 and later.
+When set to `innodb`, the `log_bin` option must be specified with no value, and replication must use GTID-based positioning.
+If you do not set this property, the database uses the default value, `file`, and stores log data in standard flat file format.
+endif::community[]
+endif::MARIADB[]
 
 |`binlog_format`
 |The `binlog-format` must be set to `ROW` or `row`.
@@ -2419,10 +2850,14 @@ This is the number of seconds for automatic binlog file removal.
 The default value is `2592000`, which equals 30 days.
 Set the value to match the needs of your environment.
 For more information, see xref:{context}-purges-binlog-files-used-by-debezium[{connector-name} purges binlog files].
-
+ifdef::MARIADB[]
+|`log_bin_compress`
+|Whether or not the binary log can be compressed. The {prodname}
+{connector-name} connector does not support compressed binary log entries, so
+`log_bin_compress` must be set to `0` (the default), which means no compression.
+endif::MARIADB[]
 |===
-
-end::enabling-binlog[]
+end::binlog-config-props[]
 
 
 
@@ -2453,7 +2888,6 @@ You can prevent this behavior by configuring `interactive_timeout` and `wait_tim
 ----
 {context}> wait_timeout=<duration-in-seconds>
 ----
-
 +
 .Descriptions of {connector-name} session timeout options
 [cols="3,7",options="header",subs="+attributes"]
@@ -2466,6 +2900,37 @@ include::{snippetsdir}/frag-{context}-props-snippets.adoc[leveloffset=+1,tags=se
 |===
 end::cfg-session-timeouts[]
 
+
+
+=== Configuring binlog streaming timeouts
+
+tag::cfg-binlog-streaming-timeouts[]
+During binlog streaming, the {connector-name} server uses session-level `net_write_timeout` and `net_read_timeout` values to determine how long to wait before closing the binlog connection.
+If the server default values for these timeouts are too low, the connector might experience unexpected `EOFException` errors and disconnects, especially in the following scenarios:
+
+* Large transactions that take a long time to transmit over the network.
+* High-latency network environments where read operations take longer than expected.
+
+You can configure the following connector properties to override the server default timeout values at the session level for the binlog streaming connection:
+
+* `binlog.net.write.timeout` - The number of seconds to wait for a block to be written to the binlog connection.
+See xref:{context}-property-binlog-net-write-timeout[`binlog.net.write.timeout`] in the advanced connector configuration properties for more details.
+* `binlog.net.read.timeout` - The number of seconds to wait for more data from the binlog connection.
+See xref:{context}-property-binlog-net-read-timeout[`binlog.net.read.timeout`] in the advanced connector configuration properties for more details.
+
+A value of `0` for either property means that the connector uses the {connector-name} server default.
+
+.Example configuration
+[source,json,subs="+attributes"]
+----
+{
+    ...
+    "binlog.net.write.timeout": 120,
+    "binlog.net.read.timeout": 120,
+    ...
+}
+----
+end::cfg-binlog-streaming-timeouts[]
 
 
 
@@ -2563,14 +3028,7 @@ You can also xref:operations/openshift.adoc[run {prodname} on Kubernetes and Ope
 endif::community[]
 
 ifdef::product[]
-You can use either of the following methods to deploy a {prodname} {connector-name} connector:
-
-* xref:openshift-streams-{context}-connector-deployment[Use {StreamsName} to automatically create an image that includes the connector plug-in].
-+
-This is the preferred method.
-* xref:deploying-debezium-{context}-connectors[Build a custom Kafka Connect container image from a Containerfile]. +
-This Containerfile deployment method is deprecated.
-The instructions for this method are scheduled for removal in future versions of the documentation.
+To deploy a {prodname} {connector-name} connector, use {StreamsName} to automatically create a Kafka Connect image that includes the connector plug-in.
 
 .Additional resources
 
@@ -2581,214 +3039,6 @@ end::deployment[]
 
 
 
-
-=== Deploying connectors by building a custom Kafka Connect container image from a Containerfile
-
-tag::deploy-via-dockerfile[]
-To deploy a {prodname} {connector-name} connector, you must build a custom Kafka Connect container image that contains the {prodname} connector archive, and then push this container image to a container registry.
-You then need to create the following custom resources (CRs):
-
-* A `KafkaConnect` CR that defines your Kafka Connect instance.
-The `image` property in the CR specifies the name of the container image that you create to run your {prodname} connector.
-You apply this CR to the OpenShift instance where link:https://access.redhat.com/products/red-hat-amq#streams[Red Hat {StreamsName}] is deployed.
-{StreamsName} offers operators and images that bring Apache Kafka to OpenShift.
-
-* A `KafkaConnector` CR that defines your {prodname} {connector-name} connector.
-Apply this CR to the same OpenShift instance where you apply the `KafkaConnect` CR.
-
-.Prerequisites
-
-* {connector-name} is running and you completed the steps to xref:setting-up-{context}-to-run-a-debezium-connector[set up {connector-name} to work with a {prodname} connector].
-
-* {StreamsName} is deployed on OpenShift and is running Apache Kafka and Kafka Connect.
-For more information, see link:{LinkDeployManageStreamsOpenShift}[{NameDeployManageStreamsOpenShift}].
-
-* Podman or Docker is installed.
-
-* You have an account and permissions to create and manage containers in the container registry (such as `quay.io` or `docker.io`) to which you plan to add the container that will run your Debezium connector.
-
-.Procedure
-
-. Create the {prodname} {connector-name} container for Kafka Connect:
-
-.. Create a Containerfile that uses `{DockerKafkaConnect}` as the base image.
-For example, from a terminal window, enter the following command to create a Containerfile with the name `debezium-container-for-{context}.yaml` in a specified directory:
-+
-=====================================================================
-
-[source,shell,subs="+attributes,+quotes"]
-----
-cat <<EOF >debezium-container-for-{context}.yaml
-FROM {DockerKafkaConnect}
-USER root:root
-RUN mkdir -p /opt/kafka/plugins/debezium
-RUN cd /opt/kafka/plugins/debezium/ \
-&& curl -O {red-hat-maven-repository}debezium/debezium-connector-{connector-file}/{debezium-version}-redhat-{debezium-build-number}/debezium-connector-{connector-file}-{debezium-version}-redhat-{debezium-build-number}-plugin.zip \
-&& unzip debezium-connector-{connector-file}-{debezium-version}-redhat-{debezium-build-number}-plugin.zip \
-&& rm debezium-connector-{connector-file}-{debezium-version}-redhat-{debezium-build-number}-plugin.zip
-RUN cd /opt/kafka/plugins/debezium/
-USER 1001
-EOF
-----
-=====================================================================
-+
-The following list describes the purpose of some of the lines in the preceding example:
-
-`cat <<EOF >debezium-container-for-{context}.yaml`::
-Specifies a name for the YAML Containerfile to be created.
-You can specify any file name that you want.
-
-`RUN mkdir -p /opt/kafka/plugins/debezium`::
-Creates a `debezium` directory within your Kafka Connect plug-ins directory.
-If your Kafka Connect plug-ins directory is in a different location, modify this path to reflect the actual directory location.
-
-.. Build the container image from the `debezium-container-for-{context}.yaml` Docker file that you created in the previous step.
-From the directory that contains the file, open a terminal window and enter one of the following commands:
-+
-[source,shell,options="nowrap",subs="+attributes,+quotes"]
-----
-podman build -t debezium-container-for-{context}:latest .
-----
-+
-[source,shell,options="nowrap",subs="+attributes,+quotes"]
-----
-docker build -t debezium-container-for-{context}:latest .
-----
-The preceding commands build a container image with the name `debezium-container-for-{context}`.
-
-.. Push your custom image to a container registry, such as `quay.io` or an internal container registry.
-The container registry must be available to the OpenShift instance where you want to deploy the image.
-Enter one of the following commands:
-+
-[source,shell,subs="+attributes,+quotes"]
-----
-podman push _<myregistry.io>_/debezium-container-for-{context}:latest
-----
-+
-[source,shell,subs="+attributes,+quotes"]
-----
-docker push _<myregistry.io>_/debezium-container-for-{context}:latest
-----
-
-.. Create a new {prodname} {connector-name} `KafkaConnect` custom resource (CR).
-For example, create a `KafkaConnect` CR with the name `dbz-connect.yaml` that specifies `annotations` and `image` properties.
-The following example shows an excerpt from a `dbz-connect.yaml` file that describes a `KafkaConnect` custom resource. +
-+
-=====================================================================
-[source,yaml,subs="+attributes"]
-----
-apiVersion: {KafkaConnectApiVersion}
-kind: KafkaConnect
-metadata:
-  name: my-connect-cluster
-  annotations:
-    strimzi.io/use-connector-resources: "true"
-spec:
-  #...
-  image: debezium-container-for-{context}
-
-  ...
-----
-=====================================================================
-+
-The following list describes the purpose of select lines in the preceding example:
-
-`strimzi.io/use-connector-resources: "true"`::
-This annotation indicates to the Cluster Operator that `KafkaConnector` custom resources are used to configure connectors in this Kafka Connect cluster.
-
-`spec.image::
-Specifies the name of the image that you created to run your Debezium connector.
-This property overrides the `STRIMZI_DEFAULT_KAFKA_CONNECT_IMAGE` variable in the Cluster Operator.
-
-.. Apply the `KafkaConnect` CR to the OpenShift Kafka Connect environment by entering the following command:
-+
-[source,shell,options="nowrap"]
-----
-oc create -f dbz-connect.yaml
-----
-+
-The command adds a Kafka Connect instance that specifies the name of the image that you created to run your {prodname} connector.
-
-. Create a `KafkaConnector` custom resource that configures your {prodname} {connector-name} connector instance.
-+
-You configure a {prodname} {connector-name} connector in a `.yaml` file that specifies the configuration properties for the connector.
-The connector configuration might instruct {prodname} to produce events for a subset of the schemas and tables, or it might set properties so that {prodname} ignores, masks, or truncates values in specified columns that are sensitive, too large, or not needed.
-+
-The following example configures a {prodname} connector that connects to a {connector-name} database server, `{context}`, on port `3306`, and captures changes to the `inventory` database.
-+
-.{connector-name} `inventory-connector.yaml`
-[source,yaml,options="nowrap",subs="+attributes"]
-----
-  apiVersion: {KafkaConnectApiVersion}
-  kind: KafkaConnector
-  metadata:
-    name: inventory-connector-{context}
-    labels:
-      strimzi.io/cluster: my-connect-cluster
-  spec:
-    class: io.debezium.connector.{context}.MariaDbConnector
-    tasks.max: 1
-    config:
-      database.hostname: {context}
-      database.port: 3306
-      database.user: debezium
-      database.password: dbz
-      database.server.id: 184054
-      topic.prefix: inventory-connector-{context}
-      table.include.list: inventory
-      schema.history.internal.kafka.bootstrap.servers: my-cluster-kafka-bootstrap:9092
-      schema.history.internal.kafka.topic: schema-changes.inventory
-----
-+
-The following list describes select parameters in the preceding connector CR example:
-
-`name`::
-The name of the connector.
-
-`tasks.max`::
-Specifies the number of tasks that the connector can operate at one time.
-Because the {connector-name} connector reads the {connector-name} server’s `binlog`,
-using a single connector task ensures proper order and event handling.
-The Kafka Connect service uses connectors to start one or more tasks to perform work,
-and it automatically distributes the running tasks across the cluster of Kafka Connect services.
-If any of the services stop or crash, tasks are redistributed to running services.
-
-`config:`::
-The connector’s configuration.
-
-`database.hostname`::
-Specifies the database host, which is the name of the container that runs the {connector-name} server (`{context}`).
-
-`database.server.id`::
-Unique ID of the connector.
-
-`topic.prefix`::
-Specifies the topic prefix for the {connector-name} server or cluster.
-This name is used as the prefix for all Kafka topics that receive change event records from the connector.
-
-`table.include.list`::
-Specifies the tables from which the connector captures changes.
-This connector captures changes only from the `inventory` table.
-
-`schema.history.internal.kafka.bootstrap.servers::
-Specifies the the connector uses `my-cluster-kafka-bootstrap:9092` as the Kafka broker for connecting to the database schema history topic when it writes or reads DDL statements.
-When a connector restarts, it recovers the database schemas that existed in the binlog at the point in time when the connector stopped.
-
-`schema.history.internal.kafka.topic::
-Specifies the name of the database schema history topic.
-This topic is for internal use only and should not be used by consumers.
-
-. Create your connector instance with Kafka Connect.
-For example, if you saved your `KafkaConnector` resource in the `inventory-connector.yaml` file, you would run the following command:
-+
-[source,shell,options="nowrap"]
-----
-oc apply -f inventory-connector.yaml
-----
-+
-The preceding command registers `inventory-connector` and the connector starts to run against the `inventory` database as defined in the `KafkaConnector` CR.
-
-end::deploy-via-dockerfile[]
 
 tag::connector-config-example[]
 ifdef::community[]
@@ -2854,6 +3104,9 @@ Specifies the Kafka brokers that the connector uses to write and recover DDL sta
 `schema.history.internal.kafka.topic`::
 Specifies the name of the database schema history topic.
 This topic is for internal use only and should not be used by consumers.
+ifdef::community[]
+To learn more about the topic configuration requirements, see xref:install.html#configuring-debezium
+endif::community[]
 
 `include.schema.changes`::
 Specifies whether the connector should generate events for DDL changes and emit them to the `fulfillment` schema change topic for use by consumers.
@@ -3020,9 +3273,10 @@ As a result, the replacement tasks might regenerate some events that were proces
 
 Each change event message includes source-specific information that you can use to identify duplicate events, for example:
 
-* Event origin
-* {connector-name} server's event time
-* The binlog file name and position
+* Event origin.
+* {connector-name} server's event time.
+* The binlog file name and position.
+
 include::{snippetsdir}/frag-{context}-props-snippets.adoc[leveloffset=+1,tags=kc-process-crash-gtid-in-change-event-msg]
 
 [id="debezium-{context}-kafka-process-becomes-unavailable"]
@@ -3040,3 +3294,4 @@ If the snapshot is disabled, the connector fails with an error.
 
 See xref:{context}-snapshots[snapshots] for details about how {connector-name} connectors perform initial snapshots.
 end::wrong-things[]
+

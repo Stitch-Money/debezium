@@ -1,5 +1,5 @@
 [![License](http://img.shields.io/:license-apache%202.0-brightgreen.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
-[![Maven Central](https://img.shields.io/maven-central/v/io.debezium/debezium-core?color=bright-green)](https://central.sonatype.com/search?q=io.debezium)
+[![Maven Central](https://img.shields.io/maven-central/v/io.debezium/debezium-connector-common?color=bright-green)](https://central.sonatype.com/search?q=io.debezium)
 [![User chat](https://img.shields.io/badge/chat-users-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302529-users)
 [![Developer chat](https://img.shields.io/badge/chat-devs-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302533-dev)
 [![Google Group](https://img.shields.io/:mailing%20list-debezium-brightgreen.svg)](https://groups.google.com/forum/#!forum/debezium)
@@ -61,7 +61,7 @@ Debezium有很多非常有价值的使用场景，我们在这儿仅仅列出几
 
     $ git --version
     $ javac -version
-    $ mvn -version
+    $ ./mvnw -version
     $ docker --version
 
 ### 为什么选用 Docker?
@@ -97,7 +97,7 @@ Docker Maven插件通过检查以下环境变量来解析Docker主机：
 
 然后用maven构建项目
 
-    $ mvn clean install
+    $ ./mvnw clean install
 
 这行命令会启动构建，并为不同的dbms使用不同的Docker容器。注意，如果未运行或未配置Docker，可能会出现奇怪的错误——如果遇到这种情况，一定要检查Docker是否正在运行，比如可以使用`Docker ps`列出运行中的容器。
 
@@ -105,13 +105,13 @@ Docker Maven插件通过检查以下环境变量来解析Docker主机：
 
 可以使用以下命令跳过集成测试和docker的构建：
 
-    $ mvn clean install -DskipITs
+    $ ./mvnw clean install -DskipITs
 
 ### 仅构建工件（artifacts），不运行测试、代码风格检查等其他插件
 
 可以使用“quick“构建选项来跳过所有非必须的插件，例如测试、集成测试、代码风格检查、格式化、API兼容性检查等：
 
-    $ mvn clean verify -Dquick
+    $ ./mvnw clean verify -Dquick
 
 这行命令是构建工件（artifacts）最快的方法，但它不会运行任何与质量保证（QA）相关的Maven插件。这在需要尽快构建connector jar包、归档时可以派上用场，比如需要在Kafka Connect中进行手动测试。
 
@@ -119,11 +119,11 @@ Docker Maven插件通过检查以下环境变量来解析Docker主机：
 
 Postgres connector支持三个用于从数据库服务器捕获流式数据更改的逻辑解码插件：decoderbufs（默认）、wal2json以及pgoutput。运行PG connector的集成测试时，如果要使用wal2json，需要启用“wal2json decoder”构建配置：
 
-    $ mvn clean install -pl :debezium-connector-postgres -Pwal2json-decoder
+    $ ./mvnw clean install -pl :debezium-connector-postgres -Pwal2json-decoder
     
 要使用pgoutput，需要启用“pgoutput decoder”和“postgres-10”构建配置：
 
-    $ mvn clean install -pl :debezium-connector-postgres -Ppgoutput-decoder,postgres-10
+    $ ./mvnw clean install -pl :debezium-connector-postgres -Ppgoutput-decoder,postgres-10
 
 在使用wal2json插件时，一些测试目前无法通过。 通过查找`io.debezium.connector.postgresql.DecoderDifferences`中定义的类型的引用，可以找到这些测试。
 
@@ -131,14 +131,14 @@ Postgres connector支持三个用于从数据库服务器捕获流式数据更�
 
 如果要使用带有指定版本Apicurio的wal2json或pgoutput逻辑解码插件运行PG connector测试，可以像这样传递测试参数：
 
-    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder -Ddebezium.test.apicurio.version=1.3.1.Final
+    $ ./mvnw clean install -pl debezium-connector-postgres -Pwal2json-decoder -Ddebezium.test.apicurio.version=1.3.1.Final
 
 如果没有设置该参数，将自动获取并设置该参数为Apicurio的稳定版本。
 
 ### 对外部数据库运行Postgres connector测试, 例如：Amazon RDS
 如果要对非RDS集群进行测试，请注意`<your user>`必须是超级用户，不仅要具有`复制`权限，还要有登录`pg_hba.conf`中`所有`数据库的权限。还要求目标服务器上必须有`postgis`包，才能通过某些测试。
 
-    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder \
+    $ ./mvnw clean install -pl debezium-connector-postgres -Pwal2json-decoder \
          -Ddocker.skip.build=true -Ddocker.skip.run=true -Dpostgres.host=<your PG host> \
          -Dpostgres.user=<your user> -Dpostgres.password=<your password> \
          -Ddebezium.test.records.waittime=10
@@ -149,17 +149,17 @@ Postgres connector支持三个用于从数据库服务器捕获流式数据更�
 
 ### 使用Oracle XStream运行Oracle connector测试
 
-    $ mvn clean install -pl debezium-connector-oracle -Poracle-xstream,oracle-tests -Dinstantclient.dir=<path-to-instantclient>
+    $ ./mvnw clean install -pl debezium-connector-oracle -Poracle-xstream,oracle-tests -Dinstantclient.dir=<path-to-instantclient>
 
 ### 使用非CDB数据库运行Oracle connector测试
 
-    $ mvn clean install -pl debezium-connector-oracle -Poracle-tests -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
+    $ ./mvnw clean install -pl debezium-connector-oracle -Poracle-tests -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
 
 ### 使用IDE中的oplog捕获运行MongoDB测试
 
 不使用maven运行测试时，需要确保传递了正确的执行参数。可以在`.github/workflows/mongodb-oplog-workflow.yml`中查正确参数，添加`debezium.test`前缀后，再将这些参数添加到JVM执行参数之后。由于测试运行在Maven生命周期之外，还需要手动启动MongoDB connector目录下的MongoDB镜像:
 
-    $ mvn docker:start -B -am -Passembly -Dcheckstyle.skip=true -Dformat.skip=true -Drevapi.skip -Dcapture.mode=oplog -Dversion.mongo.server=3.6 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dcapture.mode=oplog -Dmongo.server=3.6
+    $ ./mvnw docker:start -B -am -Passembly -Dcheckstyle.skip=true -Dformat.skip=true -Drevapi.skip -Dcapture.mode=oplog -Dversion.mongo.server=3.6 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dcapture.mode=oplog -Dmongo.server=3.6
 
 执行测试命令行的相关部分应该如下：
 

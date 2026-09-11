@@ -36,6 +36,10 @@ import io.debezium.time.Date;
 import io.debezium.time.MicroTime;
 import io.debezium.time.NanoTime;
 import io.debezium.time.NanoTimestamp;
+import io.debezium.time.StructuredDate;
+import io.debezium.time.StructuredTime;
+import io.debezium.time.StructuredTimestamp;
+import io.debezium.time.StructuredZonedTimestamp;
 import io.debezium.time.Time;
 import io.debezium.time.Timestamp;
 import io.debezium.time.ZonedTimestamp;
@@ -95,12 +99,24 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
             "  val_datetimeoffset datetimeoffset, " +
             "  val_datetime datetime, " +
             "  val_smalldatetime smalldatetime, " +
+            "  val_date_min date, " +
+            "  val_date_max date, " +
+            "  val_time_p7_edge time(7), " +
+            "  val_datetime2_edge datetime2(7), " +
+            "  val_datetimeoffset_edge datetimeoffset(7), " +
             "  primary key (id)" +
             ")";
 
     private static final String DDL_XML = "create table type_xml (" +
             "  id int not null, " +
             "  val_xml xml, " +
+            "  primary key (id)" +
+            ")";
+
+    private static final String DDL_UUID = "create table type_uuid (" +
+            "  id int not null, " +
+            "  val_uuid uniqueidentifier, " +
+            "  val_uuid_default uniqueidentifier default NEWID(), " +
             "  primary key (id)" +
             ")";
 
@@ -168,15 +184,55 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
                             .atOffset(ZoneOffset.UTC)
                             .toInstant())));
 
+    private static final Schema STRUCTURED_DATE_SCHEMA = StructuredDate.builder().optional().build();
+    private static final Schema STRUCTURED_TIME_SCHEMA = StructuredTime.builder().optional().build();
+    private static final Schema STRUCTURED_TIMESTAMP_SCHEMA = StructuredTimestamp.builder().optional().build();
+    private static final Schema STRUCTURED_ZONED_TIMESTAMP_SCHEMA = StructuredZonedTimestamp.builder().optional().build();
+
+    private static final List<SchemaAndValueField> EXPECTED_DATE_TIME_AS_STRUCTURED = Arrays.asList(
+            new SchemaAndValueField("val_date", STRUCTURED_DATE_SCHEMA,
+                    StructuredDate.from(STRUCTURED_DATE_SCHEMA, LocalDate.of(2018, 7, 13))),
+            new SchemaAndValueField("val_time_p2", STRUCTURED_TIME_SCHEMA,
+                    StructuredTime.from(STRUCTURED_TIME_SCHEMA, LocalTime.of(10, 23, 45, 680_000_000), 2)),
+            new SchemaAndValueField("val_time", STRUCTURED_TIME_SCHEMA,
+                    StructuredTime.from(STRUCTURED_TIME_SCHEMA, LocalTime.of(10, 23, 45, 678_900_000), 4)),
+            new SchemaAndValueField("val_time_p7", STRUCTURED_TIME_SCHEMA,
+                    StructuredTime.from(STRUCTURED_TIME_SCHEMA, LocalTime.of(10, 23, 45, 678_901_200), 7)),
+            new SchemaAndValueField("val_datetime2", STRUCTURED_TIMESTAMP_SCHEMA,
+                    StructuredTimestamp.from(STRUCTURED_TIMESTAMP_SCHEMA, LocalDateTime.of(2018, 7, 13, 11, 23, 45, 340_000_000), 7)),
+            new SchemaAndValueField("val_datetimeoffset", STRUCTURED_ZONED_TIMESTAMP_SCHEMA,
+                    StructuredZonedTimestamp.from(STRUCTURED_ZONED_TIMESTAMP_SCHEMA, 2018, 7, 13, 12, 23, 45, 456_000_000, 39_600, null, 7)),
+            new SchemaAndValueField("val_datetime", STRUCTURED_TIMESTAMP_SCHEMA,
+                    StructuredTimestamp.from(STRUCTURED_TIMESTAMP_SCHEMA, LocalDateTime.of(2018, 7, 13, 13, 23, 45, 780_000_000), 3)),
+            new SchemaAndValueField("val_smalldatetime", STRUCTURED_TIMESTAMP_SCHEMA,
+                    StructuredTimestamp.from(STRUCTURED_TIMESTAMP_SCHEMA, LocalDateTime.of(2018, 7, 13, 14, 24, 0), 0)));
+
+    private static final List<SchemaAndValueField> EXPECTED_DATE_TIME_EDGE_AS_STRUCTURED = Arrays.asList(
+            new SchemaAndValueField("val_date_min", STRUCTURED_DATE_SCHEMA,
+                    StructuredDate.from(STRUCTURED_DATE_SCHEMA, LocalDate.of(1, 1, 1))),
+            new SchemaAndValueField("val_date_max", STRUCTURED_DATE_SCHEMA,
+                    StructuredDate.from(STRUCTURED_DATE_SCHEMA, LocalDate.of(9999, 12, 31))),
+            new SchemaAndValueField("val_time_p7_edge", STRUCTURED_TIME_SCHEMA,
+                    StructuredTime.from(STRUCTURED_TIME_SCHEMA, LocalTime.of(23, 59, 59, 999_999_900), 7)),
+            new SchemaAndValueField("val_datetime2_edge", STRUCTURED_TIMESTAMP_SCHEMA,
+                    StructuredTimestamp.from(STRUCTURED_TIMESTAMP_SCHEMA, LocalDateTime.of(9999, 12, 31, 23, 59, 59, 999_999_900), 7)),
+            new SchemaAndValueField("val_datetimeoffset_edge", STRUCTURED_ZONED_TIMESTAMP_SCHEMA,
+                    StructuredZonedTimestamp.from(STRUCTURED_ZONED_TIMESTAMP_SCHEMA, 9999, 12, 31, 23, 59, 59, 999_999_900, 50_400, null, 7)));
+
     private static final List<SchemaAndValueField> EXPECTED_XML = Arrays.asList(
             new SchemaAndValueField("val_xml", Schema.OPTIONAL_STRING_SCHEMA, "<a>b</a>"));
+
+    private static final List<SchemaAndValueField> EXPECTED_UUID = Arrays.asList(
+            new SchemaAndValueField("val_uuid", Schema.OPTIONAL_STRING_SCHEMA, "6F9619FF-8B86-D011-B42D-00C04FC964FF"),
+            new SchemaAndValueField("val_uuid_default", Schema.OPTIONAL_STRING_SCHEMA, null));
 
     private static final String[] ALL_TABLES = {
             "type_int",
             "type_fp",
             "type_string",
             "type_time",
-            "type_xml"
+            "type_xml",
+            "type_uuid"
     };
 
     private static final String[] ALL_DDLS = {
@@ -184,7 +240,8 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
             DDL_FP,
             DDL_STRING,
             DDL_TIME,
-            DDL_XML
+            DDL_XML,
+            DDL_UUID
     };
 
     private boolean useSnapshot = true;
@@ -298,6 +355,65 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
     }
 
     @Test
+    void dateTimeTypesAsStructured() throws Exception {
+        stopConnector();
+        init(TemporalPrecisionMode.STRUCTURED, useSnapshot);
+
+        if (!useSnapshot) {
+            insertTimeTypes();
+        }
+
+        Testing.debug("Inserted");
+
+        final SourceRecords records = consumeRecordsByTopic(getExpectedRecordCount());
+
+        List<SourceRecord> testTableRecords = records.recordsForTopic("server1.testDB1.dbo.type_time");
+        assertThat(testTableRecords).hasSize(1);
+
+        validateRecord(testTableRecords.get(0));
+        Struct after = (Struct) ((Struct) testTableRecords.get(0).value()).get("after");
+        assertRecord(after, EXPECTED_DATE_TIME_AS_STRUCTURED);
+    }
+
+    @Test
+    void dateTimeTypeEdgesAsStructured() throws Exception {
+        stopConnector();
+
+        if (useSnapshot) {
+            deleteStructuredEdgeTimeTypes();
+            insertStructuredEdgeTimeTypes();
+        }
+
+        try {
+            init(TemporalPrecisionMode.STRUCTURED, useSnapshot);
+
+            if (!useSnapshot) {
+                insertStructuredEdgeTimeTypes();
+            }
+
+            final SourceRecords records = consumeRecordsByTopic(useSnapshot ? getExpectedRecordCount() + 1 : 1);
+            final List<SourceRecord> testTableRecords = records.recordsForTopic("server1.testDB1.dbo.type_time");
+            final SourceRecord record = findRecordById(testTableRecords, 1);
+
+            if (useSnapshot) {
+                VerifyRecord.isValidRead(record);
+            }
+            else {
+                VerifyRecord.isValidInsert(record, "id", 1);
+            }
+
+            final Struct after = (Struct) ((Struct) record.value()).get("after");
+            assertRecord(after, EXPECTED_DATE_TIME_EDGE_AS_STRUCTURED);
+        }
+        finally {
+            stopConnector();
+            if (useSnapshot) {
+                deleteStructuredEdgeTimeTypes();
+            }
+        }
+    }
+
+    @Test
     void otherTypes() throws Exception {
         Testing.debug("Inserted");
 
@@ -316,8 +432,36 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
         assertRecord(after, EXPECTED_XML);
     }
 
+    @Test
+    void uniqueIdentifierTypes() throws Exception {
+        Testing.debug("Inserted");
+
+        if (!useSnapshot) {
+            insertUniqueIdentifierTypes();
+        }
+
+        final SourceRecords records = consumeRecordsByTopic(getExpectedRecordCount());
+
+        List<SourceRecord> testTableRecords = records.recordsForTopic("server1.testDB1.dbo.type_uuid");
+        assertThat(testTableRecords).hasSize(1);
+
+        validateRecord(testTableRecords.get(0));
+        Struct after = (Struct) ((Struct) testTableRecords.get(0).value()).get("after");
+        assertRecord(after, EXPECTED_UUID);
+    }
+
     private void assertRecord(Struct record, List<SchemaAndValueField> expected) {
         expected.forEach(schemaAndValueField -> schemaAndValueField.assertFor(record));
+    }
+
+    private SourceRecord findRecordById(List<SourceRecord> records, int id) {
+        return records.stream()
+                .filter(record -> {
+                    final Struct after = (Struct) ((Struct) record.value()).get("after");
+                    return ((Number) after.get("id")).intValue() == id;
+                })
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("No record found for id " + id));
     }
 
     public void init(TemporalPrecisionMode temporalPrecisionMode, boolean useSnapshot) throws Exception {
@@ -371,8 +515,22 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
     protected static void insertTimeTypes() throws SQLException {
         try (SqlServerConnection connection = TestHelper.testConnection()) {
             connection.execute(
-                    "INSERT INTO type_time VALUES (0, '2018-07-13', '10:23:45.678', '10:23:45.6789', '10:23:45.6789012', '2018-07-13 11:23:45.34', '2018-07-13 12:23:45.456+11:00', '2018-07-13 13:23:45.78', '2018-07-13 14:23:45')");
+                    "INSERT INTO type_time VALUES (0, '2018-07-13', '10:23:45.678', '10:23:45.6789', '10:23:45.6789012', '2018-07-13 11:23:45.34', '2018-07-13 12:23:45.456+11:00', '2018-07-13 13:23:45.78', '2018-07-13 14:23:45', null, null, null, null, null)");
             TestHelper.waitForCdcRecord(connection, "type_time", rs -> rs.getInt("id") == 0);
+        }
+    }
+
+    protected static void insertStructuredEdgeTimeTypes() throws SQLException {
+        try (SqlServerConnection connection = TestHelper.testConnection()) {
+            connection.execute(
+                    "INSERT INTO type_time VALUES (1, null, null, null, null, null, null, null, null, '0001-01-01', '9999-12-31', '23:59:59.9999999', '9999-12-31 23:59:59.9999999', '9999-12-31 23:59:59.9999999 +14:00')");
+            TestHelper.waitForCdcRecord(connection, "type_time", rs -> rs.getInt("id") == 1);
+        }
+    }
+
+    protected static void deleteStructuredEdgeTimeTypes() throws SQLException {
+        try (SqlServerConnection connection = TestHelper.testConnection()) {
+            connection.execute("DELETE FROM type_time WHERE id = 1");
         }
     }
 
@@ -380,6 +538,13 @@ public abstract class AbstractSqlServerDatatypesTest extends AbstractAsyncEngine
         try (SqlServerConnection connection = TestHelper.testConnection()) {
             connection.execute("INSERT INTO type_xml VALUES (0, '<a>b</a>')");
             TestHelper.waitForCdcRecord(connection, "type_xml", rs -> rs.getInt("id") == 0);
+        }
+    }
+
+    protected static void insertUniqueIdentifierTypes() throws SQLException {
+        try (SqlServerConnection connection = TestHelper.testConnection()) {
+            connection.execute("INSERT INTO type_uuid VALUES (0, '6F9619FF-8B86-D011-B42D-00C04FC964FF', NULL)");
+            TestHelper.waitForCdcRecord(connection, "type_uuid", rs -> rs.getInt("id") == 0);
         }
     }
 

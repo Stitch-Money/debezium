@@ -9,9 +9,9 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,7 +50,8 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     private static final TableId NO_SUCH_TABLE = new TableId(null, null, "__NULL");
 
     private final OracleDdlParser ddlParser;
-    private final ConcurrentMap<TableId, List<Column>> lobColumnsByTableId = new ConcurrentHashMap<>();
+    private final Map<TableId, List<Column>> lobColumnsByTableId = new ConcurrentHashMap<>();
+    private final Map<String, TableId> tableIdCache = new ConcurrentHashMap<>();
     private final OracleValueConverters valueConverters;
     private final LRUCacheMap<Long, TableId> objectIdToTableId;
     private final boolean extendedStringsSupported;
@@ -71,7 +72,8 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                         customConverterRegistry,
                         connectorConfig.getSourceInfoStructMaker().schema(),
                         connectorConfig.getFieldNamer(),
-                        false),
+                        false,
+                        connectorConfig.getEventConvertingFailureHandlingMode()),
                 TableNameCaseSensitivity.INSENSITIVE.equals(tableNameCaseSensitivity),
                 connectorConfig.getKeyMapper(), taskContext);
 
@@ -129,6 +131,7 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     protected void removeSchema(TableId id) {
         super.removeSchema(id);
         lobColumnsByTableId.remove(id);
+        tableIdCache.remove(id.identifier());
     }
 
     @Override
@@ -141,7 +144,17 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
 
             // Cache Object ID to Table ID for performance
             buildAndRegisterTableObjectIdReferences(table);
+
+            tableIdCache.putIfAbsent(table.id().identifier(), table.id());
         }
+    }
+
+    public TableId resolveTableId(String catalogName, String schemaName, String tableName) {
+        // In practice, the tableIdCache should generally be primed with tables via buildAndRegister
+        // or cleaned up by calls to removeSchema. But for performance reasons, we will cache it if
+        // there isn't a table record registered, solely for optimal memory footprint in buffers.
+        final TableId tableId = new TableId(catalogName, schemaName, tableName);
+        return tableIdCache.computeIfAbsent(tableId.identifier(), k -> tableId);
     }
 
     /**
@@ -192,7 +205,7 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      * Returns whether the specified value is the unavailable value placeholder for an LOB column.
      */
     public boolean isColumnUnavailableValuePlaceholder(Column column, Object value) {
-        if (isClobColumn(column) || isXmlColumn(column) || isExtendedStringColumn(column)) {
+        if (isClobColumn(column) || isXmlColumn(column) || isExtendedStringColumn(column) || isJsonColumn(column)) {
             return valueConverters.getUnavailableValuePlaceholderString().equals(value);
         }
         else if (isBlobColumn(column)) {
@@ -205,14 +218,14 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      * Return whether the column is replaced by the {@code unavailable.value.placeholder}.
      */
     public static boolean isNullReplacedByUnavailableValue(Column column) {
-        return isLobColumn(column) || isXmlColumn(column) || isExtendedStringColumn(column);
+        return isLobColumn(column) || isXmlColumn(column) || isExtendedStringColumn(column) || isJsonColumn(column);
     }
 
     /**
      * Return whether the provided relational column model is a LOB data type.
      */
     private static boolean isLobColumn(Column column) {
-        return isClobColumn(column) || isBlobColumn(column);
+        return isClobColumn(column) || isBlobColumn(column) || isJsonColumn(column);
     }
 
     /**
@@ -246,6 +259,10 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
         return column.jdbcType() == OracleTypes.NVARCHAR && column.length() > 2000;
     }
 
+    private static boolean isJsonColumn(Column column) {
+        return "JSON".equals(column.typeName());
+    }
+
     private void buildAndRegisterTableObjectIdReferences(Table table) {
         final Attribute attribute = table.attributeWithName(ATTRIBUTE_OBJECT_ID);
         if (attribute != null) {
@@ -273,6 +290,11 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                         lobColumns.add(column);
                     }
                     break;
+                default: {
+                    if (isJsonColumn(column)) {
+                        lobColumns.add(column);
+                    }
+                }
             }
         }
         if (!lobColumns.isEmpty()) {

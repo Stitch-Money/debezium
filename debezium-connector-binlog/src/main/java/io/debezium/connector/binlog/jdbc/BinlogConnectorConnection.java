@@ -47,6 +47,7 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
 
     private static final String SQL_SHOW_SYSTEM_VARIABLES = "SHOW VARIABLES";
     private static final String SQL_SHOW_SYSTEM_VARIABLES_CHARACTER_SET = "SHOW VARIABLES WHERE Variable_name IN ('character_set_server','collation_server')";
+    private static final String SQL_SHOW_SYSTEM_VARIABLES_SQL_MODE = "SHOW VARIABLES WHERE Variable_name = 'sql_mode'";
     private static final String SQL_SHOW_SESSION_VARIABLE_SSL_VERSION = "SHOW SESSION STATUS LIKE 'Ssl_version'";
     private static final String QUOTED_CHARACTER = "`";
     public static final String MASTER_STATUS_STATEMENT = "SHOW MASTER STATUS";
@@ -55,9 +56,13 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
     private final BinlogFieldReader fieldReader;
 
     public BinlogConnectorConnection(ConnectionConfiguration configuration, BinlogFieldReader fieldReader) {
-        super(configuration.config(), configuration.factory(), QUOTED_CHARACTER, QUOTED_CHARACTER);
+        super(configuration.config(), configuration.factory(), initialOperations(), QUOTED_CHARACTER, QUOTED_CHARACTER);
         this.connectionConfig = configuration;
         this.fieldReader = fieldReader;
+    }
+
+    private static Operations initialOperations() {
+        return statement -> statement.getConnection().setAutoCommit(false);
     }
 
     @Override
@@ -80,6 +85,23 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
 
         // Use the connection's getAllTableIds method which also tracks readable databases
         return getAllTableIdsWithReadableDatabases().getTableIds();
+    }
+
+    @Override
+    public String buildSelectPrimaryKeyBoundaries(TableId tableId, long size, String projection, String orderBy, String condition) {
+        StringBuilder sql = new StringBuilder("SELECT ")
+                .append(projection)
+                .append(" FROM ")
+                .append(quotedTableIdString(tableId));
+        if (!Strings.isNullOrBlank(condition)) {
+            sql.append(" WHERE ")
+                    .append(condition);
+        }
+        sql.append(" ORDER BY ")
+                .append(orderBy)
+                .append(" LIMIT 1 OFFSET ").append(size);
+        return sql
+                .toString();
     }
 
     @Override
@@ -233,6 +255,16 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
     }
 
     /**
+     * Read the sql_mode system variable from the server.
+     *
+     * @return a map containing the sql_mode variable; never null
+     */
+    public Map<String, String> readSqlModeSystemVariable() {
+        LOGGER.debug("Reading sql_mode system variable before parsing DDL history.");
+        return querySystemVariables(SQL_SHOW_SYSTEM_VARIABLES_SQL_MODE);
+    }
+
+    /**
      * Executes a {@code SET} statement, setting each variable with it's specified value.
      *
      * @param variables key/value variable names as keys and the value(s) to be set
@@ -269,6 +301,29 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
      * @return {@code true} if the {@code binlog_row_image} is set to {@code FULL}, {@code false} otherwise
      */
     public boolean isBinlogRowImageFull() {
+        return isBinlogRowImage("FULL");
+    }
+
+    /**
+     * Determines whether the binlog format used by the database server is {@code binlog_row_image='NOBLOB'}.
+     *
+     * @return {@code true} if the {@code binlog_row_image} is set to {@code NOBLOB}, {@code false} otherwise
+     */
+    public boolean isBinlogRowImageNoblob() {
+        return isBinlogRowImage("NOBLOB");
+    }
+
+    /**
+     * Determines whether the binlog format used by the database server is {@code binlog_row_image='FULL'} or
+     * {@code binlog_row_image='NOBLOB'}.
+     *
+     * @return {@code true} if the {@code binlog_row_image} is set to {@code FULL} or {@code NOBLOB}, {@code false} otherwise
+     */
+    public boolean isBinlogRowImageFullOrNoblob() {
+        return isBinlogRowImageFull() || isBinlogRowImageNoblob();
+    }
+
+    protected boolean isBinlogRowImage(String expectedType) {
         try {
             final String rowImage = queryAndMap("SHOW GLOBAL VARIABLES LIKE 'binlog_row_image'", rs -> {
                 if (rs.next()) {
@@ -279,7 +334,7 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
                 return "FULL";
             });
             LOGGER.debug("binlog_row_image={}", rowImage);
-            return "FULL".equalsIgnoreCase(rowImage);
+            return expectedType.equalsIgnoreCase(rowImage);
         }
         catch (SQLException e) {
             throw new DebeziumException("Unexpected error while connecting to the database and looking at BINLOG_ROW_IMAGE mode: ", e);
@@ -449,7 +504,7 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
 
             // Get the GTID set that is available on the server
             if (gtidSet.isContainedWithin(availableGtidSet)) {
-                LOGGER.info("The current GTID set '{}' does not contain the GTID set '{}' required by the connector",
+                LOGGER.info("The server's GTID set '{}' contains the connector's stored GTID set '{}'; checking whether any still-needed GTIDs have been purged",
                         availableGtidSet, gtidSet);
 
                 final GtidSet knownServerSet = availableGtidSet.retainAll(config.getGtidSourceFilter());
@@ -506,9 +561,16 @@ public abstract class BinlogConnectorConnection extends JdbcConnection {
     }
 
     public boolean validateLogPosition(Partition partition, OffsetContext offset, CommonConnectorConfig config) {
-        final String gtidSet = ((BinlogOffsetContext) offset).gtidSet();
-        final String binlogFilename = ((BinlogOffsetContext) offset).getSource().binlogFilename();
-        return isBinlogPositionAvailable((BinlogConnectorConfig) config, gtidSet, binlogFilename);
+        final BinlogConnectorConfig binlogConfig = (BinlogConnectorConfig) config;
+        final BinlogOffsetContext offsetContext = (BinlogOffsetContext) offset;
+        // When the user has opted to ignore GTID during recovery, treat the stored GTID as if it
+        // were absent so that isBinlogPositionAvailable falls through to binlog file/position
+        // validation — consistent with the bypass already applied in shouldRecoverUsingGtid().
+        final String gtidSet = binlogConfig.shouldIgnoreGtidOnRecovery()
+                ? null
+                : offsetContext.gtidSet();
+        final String binlogFilename = offsetContext.getSource().binlogFilename();
+        return isBinlogPositionAvailable(binlogConfig, gtidSet, binlogFilename);
     }
 
     public String binaryLogStatusStatement() {

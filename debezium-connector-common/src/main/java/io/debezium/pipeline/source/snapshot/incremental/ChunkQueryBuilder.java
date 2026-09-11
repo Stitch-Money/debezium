@@ -1,0 +1,97 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.pipeline.source.snapshot.incremental;
+
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.List;
+import java.util.Optional;
+
+import io.debezium.jdbc.JdbcConnection;
+import io.debezium.relational.Column;
+import io.debezium.relational.Table;
+import io.debezium.spi.schema.DataCollectionId;
+
+/**
+ * Builds queries for reading incremental snapshot chunks from a table.
+ */
+public interface ChunkQueryBuilder<T extends DataCollectionId> {
+
+    /**
+     * Builds a query for reading the next incremental snapshot chunk from a table using the chunk size configured by the connector.
+     */
+    String buildChunkQuery(IncrementalSnapshotContext<T> context, Table table, Optional<String> additionalCondition);
+
+    /**
+     * Builds a query for reading the next incremental snapshot chunk from a table using the specified limit.
+     */
+    String buildChunkQuery(IncrementalSnapshotContext<T> context, Table table, int limit, Optional<String> additionalCondition);
+
+    /**
+     * Appends an optimized inclusive/exclusive lower bound condition for the given columns. It uses boundaryValues to check for NULLs if needed.
+     */
+    void addLowerBound(List<Column> pkColumns, Object[] boundaryValues, StringBuilder condition, boolean inclusiveFinal);
+
+    /**
+     * Appends an optimized inclusive/exclusive upper bound condition for the given columns. It uses boundaryValues to check for NULLs if needed.
+     */
+    void addUpperBound(List<Column> pkColumns, Object[] boundaryValues, StringBuilder condition, boolean inclusiveFinal);
+
+    /**
+     * A single boundary parameter: the column it binds to and the value bound to it.
+     */
+    record QueryParam(Column column, Object value) {
+    }
+
+    /**
+     * Generates the ordered list of boundary parameters for the given columns and the corresponding values.
+     */
+    List<QueryParam> generateBoundaryParams(List<Column> columns, Object[] values);
+
+    /**
+     * Generates Boundary Params (typically using {@link #generateBoundaryParams(List, Object[])}) for given columns and the corresponding values.
+     * Then, binds generated Boundary Params to {@code statement} starting at position {@code startIndex}.
+     */
+    int bindBoundaryParams(PreparedStatement statement, List<Column> columns, Object[] values, int startIndex, JdbcConnection connection) throws SQLException;
+
+    /**
+     * Prepares a statement for reading the next incremental snapshot chunk from a table using the SQL statement returned by buildChunkQuery.
+     */
+    PreparedStatement readTableChunkStatement(IncrementalSnapshotContext<T> context, Table table, String sql) throws SQLException;
+
+    /**
+     * Builds a query for reading the maximum primary key value from a table.
+     */
+    String buildMaxPrimaryKeyQuery(IncrementalSnapshotContext<T> context, Table table, Optional<String> additionalCondition);
+
+    /**
+     * Returns the columns that are used for paginating the incremental snapshot chunks.
+     */
+    List<Column> getQueryColumns(IncrementalSnapshotContext<T> context, Table table);
+
+    /**
+     * Allows builders to adjust the {@link Table} metadata before it is used for chunking.
+     * <p>
+     * Default implementation is a no-op, returning the provided table instance.
+     */
+    default Table prepareTable(IncrementalSnapshotContext<T> context, Table table) {
+        return table;
+    }
+
+    /**
+     * Resolves the chunk-end position for the next chunk.
+     * <p>
+     * Defaults to {@code lastRowKey}. Implementations may return a separately computed boundary when chunk ordering differs from result ordering.
+     *
+     * @param context the current incremental snapshot context
+     * @param table the table being snapshotted
+     * @param lastRowKey the key from the last row of the current chunk
+     * @return the key to use as the next chunk start position
+     */
+    default Object[] resolveChunkEndPosition(IncrementalSnapshotContext<T> context, Table table, Object[] lastRowKey) {
+        return lastRowKey;
+    }
+}

@@ -13,6 +13,7 @@
 :include-list-example: inventory.*
 :MYSQL:
 :collection-container: database
+:supports-skipping-unchanged-events:
 
 ifdef::community[]
 :toc:
@@ -179,6 +180,30 @@ endif::community[]
 
 include::{partialsdir}/modules/all-connectors/con-connector-blocking-snapshot.adoc[leveloffset=+3]
 
+// Type: assembly
+// ModuleID: debezium-mysql-connector-send-a-signal-to-reset-the-binlog-reading-position
+// Title: Send a signal to reset the binlog reading position
+=== Setting the binlog position via a signal
+
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=set-binlog-position-intro]
+
+// Type: concept
+// ModuleID: debezium-mysql-connector-format-of-a-set-binlog-position-signal
+// Title: Format of a set-binlog-position signal
+==== Format of a `set-binlog-position` signal
+
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=set-binlog-position-format]
+
+// Type: procedure
+// ModuleID: debezium-mysql-connector-send-a-signal-to-change-the-binlog-reading-position
+// Title: Send a signal to change the binlog reading position
+==== Send a signal to reposition the stream
+
+:binlog-filename-example: mysql-bin.000003
+:gtid-label: UUID-based GTID set
+:gtid-value: 3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=set-binlog-position-procedure]
+
 // Type: concept
 // Title: Default names of Kafka topics that receive {prodname} MySQL change event records
 [[mysql-topic-names]]
@@ -260,7 +285,6 @@ include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloff
 == Data type mappings
 
 include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=data-type-mappings]
-include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=data-type-mappings-list-mysql-only]
 
 [id="mysql-basic-types"]
 === Basic types
@@ -291,18 +315,7 @@ include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloff
 [id="mysql-vector-types"]
 === Vector types
 
-Currently, the {prodname} {connector-name} connector supports the following vector data types.
-
-.Description of vector type mappings
-[cols="35%a,15%a,50%a",options="header",subs="+attributes"]
-|===
-|{connector-name} type |Literal type |Semantic type
-
-|`VECTOR`
-|`ARRAY (FLOAT32)`
-|`io.debezium.data.FloatVector` +
-
-|===
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=vector-data-types]
 
 // Type: concept
 // Title: Custom converters for mapping {connector-name} data to alternative data types
@@ -318,6 +331,10 @@ include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloff
 === JDBC sink data types
 
 include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=jdbc-sink-data-types]
+
+=== Zero-date fallback
+
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=zero-date-fallback]
 
 
 // Type: assembly
@@ -336,6 +353,11 @@ include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloff
 
 include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=creating-a-db-user]
 
+[id="permissions-explained-mysql-connector"]
+==== Descriptions of user permissions
+
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=permissions-explained]
+
 // Type: procedure
 // ModuleID: enabling-the-mysql-binlog-for-debezium
 // Title: Enabling the MySQL binlog for {prodname}
@@ -344,6 +366,10 @@ include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloff
 
 include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=enabling-binlog]
 
+[id="binlog-configuration-properties-mysql-connector"]
+==== Descriptions of MySQL binlog configuration properties
+
+include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=binlog-config-props]
 
 // Type: procedure
 // ModuleID: enabling-mysql-gtids-for-debezium
@@ -487,11 +513,6 @@ include::{partialsdir}/modules/all-connectors/con-connector-streams-deployment.a
 
 include::{partialsdir}/modules/all-connectors/proc-using-streams-to-deploy-a-debezium-mysql-sqlserver-connector.adoc[leveloffset=+1]
 
-// Type: procedure
-// ModuleID: deploying-debezium-mysql-connectors
-=== Deploying {prodname} MySQL connectors by building a custom Kafka Connect container image from a Dockerfile
-
-include::{partialsdir}/modules/all-connectors/shared-mariadb-mysql.adoc[leveloffset=+1,tags=deploy-via-dockerfile]
 endif::product[]
 
 ifdef::community[]

@@ -1113,8 +1113,33 @@ The following table lists the streaming metrics that are available.
 |`long`
 |The number of unrecoverable errors while processing commit logs.
 
+|`CdcDirectoryTotalBytes`
+|`long`
+|The total size in bytes of the CDC directory on disk, sampled each time the connector scans the directory for new commit logs.
+
 |===
 
+[[cassandra-tracing]]
+=== Tracing
+
+The Cassandra connector supports distributed tracing through the https://opentelemetry.io/docs/specs/otel/[OpenTelemetry] API.
+When tracing is enabled, the connector creates the following nested spans for each change event that it emits:
+
+`db-log-write`:: Backdated to the Cassandra mutation timestamp, with source attributes including keyspace, table, cluster, commit log file and position, snapshot flag, and connector version.
+`debezium-read`:: A child span timestamped at {prodname} processing time, with the operation type and processing timestamp.
+
+The connector injects the trace context into Kafka `ProducerRecord` headers (`traceparent`) so that downstream consumers can continue the distributed trace.
+
+[NOTE]
+====
+Unlike other {prodname} connectors, the Cassandra connector does not use the Kafka Connect framework, so the `ActivateTracingSpan` SMT is not supported.
+Tracing is implemented natively at the Kafka emitter level.
+====
+
+To enable tracing, set `tracing.enabled=true` in the connector configuration and ensure that the OpenTelemetry API JAR is available on the connector classpath.
+If tracing is enabled but the OpenTelemetry API is not present on the classpath, the connector starts normally without tracing.
+
+For information about how to install and configure the OpenTelemetry API, see the xref:integrations/tracing.adoc[{prodname} distributed tracing documentation].
 
 [[cassandra-connector-properties]]
 === Connector properties
@@ -1243,6 +1268,12 @@ For example, if you set `max.queue.size=1000`, and `max.queue.size.in.bytes=5000
 |[[cassandra-property-poll-interval-ms]]<<cassandra-property-poll-interval-ms, `poll.interval.ms`>>
 |`1000`
 |Positive integer value that specifies the number of milliseconds the commit log processor should wait during each iteration for new change events to appear in the queue. Defaults to 1000 milliseconds, or 1 second.
+If a value greater than 5000 milliseconds (5 seconds) is provided, the effective wait time will be capped at 5000 milliseconds.
+
+|[[cassandra-property-poll-dispatch-interval-ms]]<<cassandra-property-poll-dispatch-interval-ms, `+poll.dispatch.interval.ms+`>>
+|`0`
+|An integer value that specifies the number of milliseconds the connector should accumulate events in the queue before each queue consumption.
+
 
 |[[cassandra-property-schema-refresh-interval-ms]]<<cassandra-property-schema-refresh-interval-ms, `schema.refresh.interval.ms`>>
 |`10000`
@@ -1311,7 +1342,19 @@ The topic name has the following pattern: +
  +
 _topic.heartbeat.prefix_._topic.prefix_ +
  +
-For example, if the database server name or topic prefix is `fulfillment`, the default topic name is `__debezium-heartbeat.fulfillment`.
+For example, if the database server name or topic prefix is `fulfillment`, the default topic name is `__debezium-heartbeat.fulfillment`. +
+ +
+This property is ignored if `topic.heartbeat.name` is set.
+
+|[[cassandra-property-topic-heartbeat-name]]<<cassandra-property-topic-heartbeat-name, `+topic.heartbeat.name+`>>
+|_empty_
+|Specifies an explicit, full name for the topic to which the connector sends heartbeat messages, overriding the prefix-based naming derived from `topic.heartbeat.prefix` and `topic.prefix`. +
+ +
+When set, all heartbeat messages are routed to this exact topic name, regardless of the connector's `topic.prefix`. This is useful when running multiple connectors and you want to consolidate heartbeat events into a single shared topic, avoiding the creation of a large number of single-partition heartbeat topics. +
+ +
+For example, setting this to `debezium-heartbeat` routes all heartbeat messages to a topic named `debezium-heartbeat`. +
+ +
+If this property is empty or unset, the connector falls back to the default behavior: _topic.heartbeat.prefix_._topic.prefix_.
 
 |[[cassandra-property-varint-handling-mode]]<<cassandra-property-varint-handling-mode, `varint.handling.mode`>>
 |`long`
@@ -1355,6 +1398,27 @@ See xref:{link-avro-serialization}#avro-naming[Avro naming] for more details.
 |`No default`
 |The custom metric tags will accept key-value pairs to customize the MBean object name which should be appended the end of regular name, each key would represent a tag for the MBean object name, and the corresponding value would be the value of that tag the key is. For example: `k1=v1,k2=v2`.
 
+|[[cassandra-property-custom-sanitize-pattern]]<<cassandra-property-custom-sanitize-pattern, `custom.sanitize.pattern`>>
+|`.*secret$\|.*password$\|.*sasl\.jaas\.config$\|.*basic\.auth\.user\.info$\|.*registry\.auth\.client-secret`
+|An optional regular expression that specifies a custom pattern for masking sensitive configuration keys.
+
+By default, {prodname} masks the value of configuration keys that match a predefined pattern for commonly known sensitive properties such as passwords and authentication tokens.
+To customize the way that the connector masks configuration key values, set this property to a regular expression that matches specific configuration key values that you want to mask.   
+
+For example, to mask keys the contain the strings `api.key` or `token`, set this property to the following value:
+
+----
+"custom.sanitize.pattern": ".*api\\.key.*\\|.*token.*"
+----
+
+If you set this property for the connector, {prodname} masks any matching instances of configuration key values that it returns for display, logging, or in response to API calls.
+A string of asterisks replaces the original values, for example,  `pass:[********]`.
+
+[IMPORTANT]
+====
+The pattern that you specify for the `custom.sanitize.pattern` property overrides the default {prodname} masking pattern; the specified value does not extend or augment the default pattern.
+====
+
 |[[cassandra-property-errors-max-retires]]<<cassandra-property-errors-max-retires, `errors.max.retries`>>
 |`-1`
 |Specifies how the connector responds after an operation fails with a retriable error, such as a connection error. +
@@ -1380,6 +1444,12 @@ The property adds following headers:
 `__debezium.context.connectorLogicalName`:: The logical name of the {prodname} connector.
 `__debezium.context.taskId`:: The unique identifier of the connector task.
 `__debezium.context.connectorName`::  The name of the {prodname} connector.
+
+|[[cassandra-property-tracing-enabled]]<<cassandra-property-tracing-enabled, `tracing.enabled`>>
+|`false`
+|Specifies whether to enable OpenTelemetry tracing for change events emitted by the connector. 
+To enable tracing, the OpenTelemetry API JAR must be available on the classpath.
+For more information, see xref:cassandra-tracing[Tracing].
 
 |===
 

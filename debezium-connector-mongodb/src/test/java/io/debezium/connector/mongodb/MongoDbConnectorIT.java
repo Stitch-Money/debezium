@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -35,6 +36,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.common.config.Config;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.awaitility.Awaitility;
 import org.bson.BsonDocument;
 import org.bson.Document;
 import org.bson.conversions.Bson;
@@ -3139,6 +3141,162 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         assertThat(doc.getString("name")).isEqualTo("streaming_test");
 
         assertNoRecordsToConsume();
+        stopConnector();
+    }
+
+    @Test
+    @FixFor("dbz#1531")
+    public void shouldCorrectlySetSourceCollectionWithMultiThreadedSnapshot() throws Exception {
+        // Use the DB configuration to define the connector's configuration with multiple snapshot threads
+        config = TestHelper.getConfiguration(mongo).edit()
+                .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
+                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.INITIAL)
+                .with(MongoDbConnectorConfig.SNAPSHOT_MAX_THREADS, 4) // Use multiple threads to trigger race condition
+                .build();
+
+        // Set up the replication context for connections
+        context = new MongoDbTaskContext(config);
+
+        // Cleanup database
+        TestHelper.cleanDatabase(mongo, "dbit");
+
+        // Create multiple collections with data to ensure concurrent snapshot threads
+        storeDocuments("dbit", "restaurants1", "restaurants1.json");
+        storeDocuments("dbit", "restaurants2", "restaurants2.json");
+        storeDocuments("dbit", "simpletons", "simple_objects.json");
+
+        // Start the connector which will perform initial snapshot with multiple threads
+        start(MongoDbConnector.class, config);
+
+        // Consume all snapshot records
+        SourceRecords records = consumeRecordsByTopic(18); // 6 + 4 + 8 records from the test data files
+        assertThat(records.topics().size()).isEqualTo(3);
+
+        // Verify source.collection field matches the expected collection for each record
+        // This is the key assertion for dbz#1531 - the race condition causes incorrect source.collection values
+        verifySourceCollectionFieldForAllRecords(records.recordsForTopic("mongo.dbit.restaurants1"), "restaurants1");
+        verifySourceCollectionFieldForAllRecords(records.recordsForTopic("mongo.dbit.restaurants2"), "restaurants2");
+        verifySourceCollectionFieldForAllRecords(records.recordsForTopic("mongo.dbit.simpletons"), "simpletons");
+
+        assertNoRecordsToConsume();
+        stopConnector();
+    }
+
+    @Test
+    @FixFor("DBZ-3126")
+    public void shouldFailToValidateWithInvalidCredentials() {
+        config = TestHelper.getConfiguration(mongo)
+                .edit()
+                .with(MongoDbConnectorConfig.USER, "invalidUser")
+                .with(MongoDbConnectorConfig.PASSWORD, "invalidPassword")
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
+                .build();
+
+        MongoDbConnector connector = new MongoDbConnector();
+        Config result = connector.validate(config.asMap());
+        assertConfigurationErrors(result, MongoDbConnectorConfig.CONNECTION_STRING, 1);
+    }
+
+    @Test
+    @FixFor("DBZ-3126")
+    public void shouldValidateSuccessfullyWithValidCredentials() {
+        config = TestHelper.getConfiguration(mongo)
+                .edit()
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
+                .build();
+
+        MongoDbConnector connector = new MongoDbConnector();
+        Config result = connector.validate(config.asMap());
+        assertNoConfigurationErrors(result, MongoDbConnectorConfig.CONNECTION_STRING);
+    }
+
+    /**
+     * Helper method to verify that all records have the correct source.collection field.
+     * This catches the race condition reported in dbz#1531 where multiple snapshot threads
+     * share a single MongoDbOffsetContext, causing the collectionId to be overwritten by
+     * concurrent threads.
+     */
+    private void verifySourceCollectionFieldForAllRecords(List<SourceRecord> records, String expectedCollection) {
+        assertThat(records).isNotNull();
+        assertThat(records).isNotEmpty();
+
+        for (SourceRecord record : records) {
+            Struct value = (Struct) record.value();
+            Struct source = value.getStruct(Envelope.FieldName.SOURCE);
+            String sourceCollection = source.getString(SourceInfo.COLLECTION);
+
+            assertThat(sourceCollection)
+                    .describedAs("Record has incorrect source.collection field. Expected=%s, Actual=%s, Topic=%s",
+                            expectedCollection, sourceCollection, record.topic())
+                    .isEqualTo(expectedCollection);
+        }
+    }
+
+    /**
+     * Verify that the connector correctly recovers from an interrupted snapshot.
+     *
+     * Scenario:
+     * 1. Insert many documents and start the connector with throttled batching
+     * 2. Consume only a partial set of snapshot records
+     * 3. Stop the connector mid-snapshot
+     * 4. Restart the connector
+     * 5. Verify the connector logs "previous snapshot was incomplete" and re-snapshots
+     * 6. Verify the connector produces snapshot records (not a crash loop)
+     */
+    @Test
+    @FixFor("DBZ-1708")
+    void shouldRecoverFromInterruptedSnapshot() throws InterruptedException {
+        var documentCount = 500;
+        var dbName = "dbit";
+        var collectionName = "recovery_test";
+        var topic = "mongo.dbit.recovery_test";
+
+        config = TestHelper.getConfiguration(mongo).edit()
+                .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, dbName + "." + collectionName)
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
+                .with(MongoDbConnectorConfig.MAX_BATCH_SIZE, 1)
+                .with(MongoDbConnectorConfig.SNAPSHOT_MAX_THREADS, 1)
+                .build();
+
+        // Insert enough documents so snapshot takes time
+        try (var client = connect()) {
+            MongoDatabase db = client.getDatabase(dbName);
+            MongoCollection<Document> coll = db.getCollection(collectionName);
+            coll.drop();
+            var docs = new ArrayList<Document>();
+            for (int i = 0; i < documentCount; i++) {
+                docs.add(new Document("_id", i).append("name", "item_" + i).append("data", "padding_" + "x".repeat(200)));
+            }
+            coll.insertMany(docs);
+        }
+
+        // Start the connector and stop it as soon as we get the first record,
+        // guaranteeing the snapshot is still in progress
+        start(MongoDbConnector.class, config);
+        consumeRecordsByTopic(1);
+        stopConnector();
+
+        // Restart with a log interceptor to verify the incomplete snapshot is detected
+        var logInterceptor = new LogInterceptor(MongoDbConnectorTask.class);
+
+        start(MongoDbConnector.class, config);
+
+        // The connector should detect the incomplete snapshot and re-snapshot
+        Awaitility.await()
+                .alias("Connector should detect incomplete snapshot")
+                .atMost(120, TimeUnit.SECONDS)
+                .until(() -> logInterceptor.containsMessage("The previous snapshot was incomplete, so restarting the snapshot"));
+
+        // Verify the connector produces snapshot records from the re-snapshot
+        var records = consumeRecordsByTopic(documentCount);
+        assertThat(records.recordsForTopic(topic)).hasSize(documentCount);
+        records.forEach(record -> validate(record));
+
         stopConnector();
     }
 }

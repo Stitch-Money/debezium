@@ -7,19 +7,24 @@ package io.debezium.connector.oracle.logminer.buffered;
 
 import static io.debezium.config.CommonConnectorConfig.DEFAULT_MAX_BATCH_SIZE;
 import static io.debezium.config.CommonConnectorConfig.DEFAULT_MAX_QUEUE_SIZE;
+import static io.debezium.config.CommonConnectorConfig.DEFAULT_POLL_DISPATCH_INTERVAL_MILLIS;
 import static java.util.Collections.emptyList;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 
 import java.math.BigInteger;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.Calendar;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -40,16 +45,20 @@ import io.debezium.connector.oracle.OracleOffsetContext;
 import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.OracleTaskContext;
 import io.debezium.connector.oracle.OracleValueConverters;
+import io.debezium.connector.oracle.RedoThreadState;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.StreamingAdapter.TableNameCaseSensitivity;
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
+import io.debezium.connector.oracle.jdbc.StandardOracleConnectionFactory;
+import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
-import io.debezium.connector.oracle.logminer.OffsetActivityMonitor;
 import io.debezium.connector.oracle.logminer.buffered.BufferedLogMinerStreamingChangeEventSource.ProcessResult;
 import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.doc.FixFor;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
+import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
@@ -62,6 +71,7 @@ import io.debezium.schema.SchemaTopicNamingStrategy;
 import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
 
+import oracle.jdbc.OracleTypes;
 import oracle.sql.CharacterSet;
 
 /**
@@ -73,9 +83,13 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AbstractBufferedLogMinerStreamingChangeEventSourceTest.class);
 
+    private static final String LOB_TABLE_NAME = "TEST_LOB_TABLE";
     private static final String TRANSACTION_ID_1 = "1234567890";
     private static final String TRANSACTION_ID_2 = "9876543210";
     private static final String TRANSACTION_ID_3 = "9880212345";
+    private static final String PARTIAL_TXN_ID_FULL = "0e001c0012345678";
+    private static final String PARTIAL_TXN_ID_PARTIAL = "0e001c00ffffffff";
+    private static final String PARTIAL_TXN_ID_OTHER = "0f001d0087654321";
 
     protected ChangeEventSourceContext context;
     protected EventDispatcher<OraclePartition, TableId> dispatcher;
@@ -83,7 +97,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
     protected LogMinerStreamingChangeEventSourceMetrics metrics;
     protected OraclePartition partition;
     protected OracleOffsetContext offsetContext;
-    protected OracleConnection connection;
+    protected OracleConnectionFactory connectionFactory;
 
     @BeforeEach
     @SuppressWarnings({ "unchecked" })
@@ -97,7 +111,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
         final CommitScn commitScn = CommitScn.valueOf((String) null);
         Mockito.when(this.offsetContext.getCommitScn()).thenReturn(commitScn);
         Mockito.when(this.offsetContext.getSnapshotScn()).thenReturn(Scn.valueOf("1"));
-        this.connection = createOracleConnection(false);
+        this.connectionFactory = createOracleConnectionFactory(false);
         this.schema = createOracleDatabaseSchema();
         this.metrics = createMetrics(schema);
     }
@@ -346,7 +360,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
             final BufferedLogMinerStreamingChangeEventSource mock = Mockito.spy(source);
             Mockito.doReturn(ps).when(mock).createQueryStatement();
 
-            final ProcessResult result = mock.process(Scn.valueOf(100), Scn.valueOf(200));
+            final ProcessResult result = mock.process(Scn.valueOf(100), Scn.valueOf(100), Scn.valueOf(200));
             assertThat(result.readStartScn()).isEqualTo(Scn.valueOf(100));
         }
     }
@@ -364,8 +378,10 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
             Mockito.when(rs.getString(1)).thenReturn("101");
             Mockito.when(rs.getString(2)).thenReturn("insert into \"DEBEZIUM\".\"ABC\"(\"ID\",\"DATA\") values ('1','test');");
             Mockito.when(rs.getInt(3)).thenReturn(EventType.INSERT.getValue());
+            Mockito.when(rs.getTimestamp(eq(4), any(Calendar.class))).thenReturn(Timestamp.valueOf(LocalDateTime.now()));
             Mockito.when(rs.getString(7)).thenReturn("ABC");
             Mockito.when(rs.getString(8)).thenReturn("DEBEZIUM");
+            Mockito.when(rs.getString(10)).thenReturn("AAAAAAAAAAAAAAAAAB");
 
             final PreparedStatement ps = Mockito.mock(PreparedStatement.class);
             Mockito.when(ps.executeQuery()).thenReturn(rs);
@@ -373,6 +389,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
             final BufferedStreamingChangeEventSource mock = Mockito.spy(source);
             Mockito.doReturn(ps).when(mock).createQueryStatement();
 
+            final OracleConnection connection = connectionFactory.mainConnection();
             Mockito.doReturn("CREATE TABLE DEBEZIUM.ABC (ID primary key(9,0), data varchar2(50))")
                     .when(connection)
                     .getTableMetadataDdl(Mockito.any(TableId.class));
@@ -387,7 +404,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
                     .when(mock)
                     .dispatchSchemaChangeEventAndGetTableForNewConfiguredTable(Mockito.any(TableId.class));
 
-            final ProcessResult result = mock.process(Scn.valueOf(100), Scn.valueOf(200));
+            final ProcessResult result = mock.process(Scn.valueOf(100), Scn.valueOf(100), Scn.valueOf(200));
             assertThat(result.miningSessionStartScn()).isEqualTo(Scn.valueOf(100));
             assertThat(result.readStartScn()).isEqualTo(Scn.valueOf(101));
         }
@@ -487,7 +504,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
         // re-create some mocked objects
         this.schema.close();
 
-        connection = createOracleConnection(true);
+        connectionFactory = createOracleConnectionFactory(true);
         schema = createOracleDatabaseSchema();
         metrics = createMetrics(schema);
 
@@ -523,7 +540,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
         // re-create some mocked objects
         this.schema.close();
 
-        connection = createOracleConnection(true);
+        connectionFactory = createOracleConnectionFactory(true);
         schema = createOracleDatabaseSchema();
         metrics = createMetrics(schema);
 
@@ -546,11 +563,155 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
         }
     }
 
+    @Test
+    @FixFor("DBZ-1145")
+    public void testCacheIsEmptyWhenTransactionIsRolledBackWithPartialTransactionId() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.processEvent(getStartLogMinerEventRow(1, PARTIAL_TXN_ID_FULL));
+            source.processEvent(getInsertLogMinerEventRow(2, PARTIAL_TXN_ID_FULL));
+
+            assertThat(source.getTransactionCache().isEmpty()).isFalse();
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_FULL)).isTrue();
+
+            source.processEvent(getRollbackLogMinerEventRow(3, PARTIAL_TXN_ID_PARTIAL));
+
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_FULL)).isFalse();
+            assertThat(metrics.getRolledBackTransactionIds()).contains(PARTIAL_TXN_ID_PARTIAL);
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1145")
+    public void testCacheIsNotEmptyWhenOnlyMatchingTransactionIsRolledBackWithPartialTransactionId() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.processEvent(getStartLogMinerEventRow(1, PARTIAL_TXN_ID_FULL));
+            source.processEvent(getInsertLogMinerEventRow(2, PARTIAL_TXN_ID_FULL));
+            source.processEvent(getStartLogMinerEventRow(3, PARTIAL_TXN_ID_OTHER));
+            source.processEvent(getInsertLogMinerEventRow(4, PARTIAL_TXN_ID_OTHER));
+
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_FULL)).isTrue();
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_OTHER)).isTrue();
+
+            source.processEvent(getRollbackLogMinerEventRow(5, PARTIAL_TXN_ID_PARTIAL));
+
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_FULL)).isFalse();
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_OTHER)).isTrue();
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1145")
+    public void testCacheIsNotEmptyWhenNoMatchingTransactionExistsForPartialTransactionId() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.processEvent(getStartLogMinerEventRow(1, PARTIAL_TXN_ID_OTHER));
+            source.processEvent(getInsertLogMinerEventRow(2, PARTIAL_TXN_ID_OTHER));
+
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_OTHER)).isTrue();
+
+            source.processEvent(getRollbackLogMinerEventRow(3, PARTIAL_TXN_ID_PARTIAL));
+
+            assertThat(source.getTransactionCache().containsTransaction(PARTIAL_TXN_ID_OTHER)).isTrue();
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-9615")
+    public void testSavepointRollbackInsertWithNullLob() throws Exception {
+        final Configuration config = getConfig()
+                .with(OracleConnectorConfig.LOB_ENABLED, true)
+                .build();
+
+        try (var source = getChangeEventSource(config)) {
+            source.processEvent(getStartLogMinerEventRow(1, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(2, TRANSACTION_ID_1, Instant.now(), LOB_TABLE_NAME, "AAAAAAAAAAAAAAAAAA", "EMPTY_CLOB()"));
+            source.processEvent(getUpdateLogMinerEventRow(3, TRANSACTION_ID_1, Instant.now(), LOB_TABLE_NAME, "AAAAAAAAAAAAAAAAAB", "NULL"));
+            source.processEvent(getRollbackToSavepointLogMinerEventRow(4, TRANSACTION_ID_1, Instant.now(), LOB_TABLE_NAME, "AAAAAAAAAAAAAAAAAB"));
+            source.processEvent(getCommitLogMinerEventRow(5, TRANSACTION_ID_1));
+            Mockito.verify(dispatcher, Mockito.never())
+                    .dispatchDataChangeEvent(any(), any(), any());
+        }
+    }
+
+    @Test
+    @FixFor("dbz#2049")
+    void testEventFromPublicThreadIsNotSkipped() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentRedoThreadState(buildRedoThreadState(1, "PUBLIC"));
+
+            final LogMinerEventRow start = getStartLogMinerEventRow(1, TRANSACTION_ID_1);
+            Mockito.when(start.getThread()).thenReturn(1);
+            source.processEvent(start);
+
+            final LogMinerEventRow insert = getInsertLogMinerEventRow(2, TRANSACTION_ID_1);
+            Mockito.when(insert.getThread()).thenReturn(1);
+            source.processEvent(insert);
+
+            assertThat(source.getTransactionCache().isEmpty()).isFalse();
+        }
+    }
+
+    @Test
+    @FixFor("dbz#2049")
+    void testEventFromPrivateThreadIsSkipped() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentRedoThreadState(buildTwoThreadRedoThreadState(1, "PUBLIC", 2, "PRIVATE"));
+
+            final LogMinerEventRow start1 = getStartLogMinerEventRow(1, TRANSACTION_ID_1);
+            Mockito.when(start1.getThread()).thenReturn(2);
+            source.processEvent(start1);
+
+            final LogMinerEventRow insert1 = getInsertLogMinerEventRow(2, TRANSACTION_ID_1);
+            Mockito.when(insert1.getThread()).thenReturn(2);
+            source.processEvent(insert1);
+
+            final LogMinerEventRow start2 = getStartLogMinerEventRow(3, TRANSACTION_ID_2);
+            Mockito.when(start2.getThread()).thenReturn(1);
+            source.processEvent(start2);
+
+            final LogMinerEventRow insert2 = getInsertLogMinerEventRow(4, TRANSACTION_ID_2);
+            Mockito.when(insert2.getThread()).thenReturn(1);
+            source.processEvent(insert2);
+
+            assertThat(source.getTransactionCache().isEmpty()).isFalse();
+            assertThat(source.getTransactionCache().getTransaction(TRANSACTION_ID_1)).isNull();
+            assertThat(source.getTransactionCache().getTransaction(TRANSACTION_ID_2)).isNotNull();
+        }
+    }
+
+    @Test
+    @FixFor("dbz#2049")
+    void testRedoThreadTransitionFromPublicToPrivateLogsWarning() throws Exception {
+        final LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentRedoThreadState(buildRedoThreadState(1, "PUBLIC"));
+            source.detectRedoThreadTransitions(buildRedoThreadState(1, "PRIVATE"));
+
+            assertThat(logInterceptor.containsWarnMessage(
+                    "Redo Thread 1 just changed from PUBLIC to PRIVATE, which can lead to data loss and unexpected results."))
+                    .isTrue();
+        }
+    }
+
+    @Test
+    @FixFor("dbz#2049")
+    void testRedoThreadTransitionFromPrivateToPublicLogsWarning() throws Exception {
+        final LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentRedoThreadState(buildRedoThreadState(1, "PRIVATE"));
+            source.detectRedoThreadTransitions(buildRedoThreadState(1, "PUBLIC"));
+
+            assertThat(logInterceptor.containsWarnMessage(
+                    "Redo Thread 1 just changed from PRIVATE to PUBLIC, which can lead to unexpected results."))
+                    .isTrue();
+        }
+    }
+
     private OracleDatabaseSchema createOracleDatabaseSchema() throws Exception {
         Configuration configuration = getConfig().build();
         final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(configuration);
         final TopicNamingStrategy topicNamingStrategy = SchemaTopicNamingStrategy.create(connectorConfig);
         final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
+        final OracleConnection connection = connectionFactory.mainConnection();
         final OracleValueConverters converters = connectorConfig.getAdapter().getValueConverter(connectorConfig, connection);
         final OracleDefaultValueConverter defaultValueConverter = new OracleDefaultValueConverter(converters, connection);
         final TableNameCaseSensitivity sensitivity = connectorConfig.getAdapter().getTableNameCaseSensitivity(connection);
@@ -569,11 +730,19 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
                 .addColumn(Column.editor().name("DATA").create())
                 .create();
 
+        Table lobTable = Table.editor()
+                .tableId(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_LOB_TABLE"))
+                .addColumn(Column.editor().name("ID").type("VARCHAR2(50)").create())
+                .addColumn(Column.editor().name("DATA").type("CLOB").jdbcType(OracleTypes.CLOB).create())
+                .setPrimaryKeyNames("ID")
+                .create();
+
         schema.refresh(table);
+        schema.refresh(lobTable);
         return schema;
     }
 
-    private OracleConnection createOracleConnection(boolean singleOptionalValueThrowException) throws Exception {
+    private OracleConnectionFactory createOracleConnectionFactory(boolean singleOptionalValueThrowException) throws Exception {
         final ResultSet rs = Mockito.mock(ResultSet.class);
         Mockito.when(rs.next()).thenReturn(true);
         Mockito.when(rs.getFloat(1)).thenReturn(2.f);
@@ -588,6 +757,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
         Mockito.when(connection.connection(Mockito.anyBoolean())).thenReturn(conn);
         Mockito.when(connection.connection()).thenReturn(conn);
         Mockito.when(connection.getNationalCharacterSet()).thenReturn(CharacterSet.make(CharacterSet.UTF8_CHARSET));
+        Mockito.when(connection.getDatabaseCharacterSet()).thenReturn(CharacterSet.make(CharacterSet.AL32UTF8_CHARSET));
         if (!singleOptionalValueThrowException) {
             Mockito.when(connection.singleOptionalValue(anyString(), any())).thenReturn(BigInteger.TWO);
         }
@@ -595,7 +765,13 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
             Mockito.when(connection.singleOptionalValue(anyString(), any()))
                     .thenThrow(new SQLException("ORA-01555 Snapshot too old", null, 1555));
         }
-        return connection;
+        Mockito.when(connection.isArchiveLogDestinationValid(eq("LOG_ARCHIVE_DEST_1"))).thenReturn(true);
+
+        final OracleConnectionFactory factory = Mockito.mock(StandardOracleConnectionFactory.class);
+        Mockito.when(factory.mainConnection()).thenReturn(connection);
+        Mockito.when(factory.streamingConnectionFactory()).thenReturn(factory);
+
+        return factory;
     }
 
     private LogMinerStreamingChangeEventSourceMetrics createMetrics(OracleDatabaseSchema schema) throws Exception {
@@ -605,12 +781,19 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
 
         final ChangeEventQueue<DataChangeEvent> queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                 .pollInterval(Duration.of(DEFAULT_MAX_QUEUE_SIZE, ChronoUnit.MILLIS))
+                .pollDispatchInterval(Duration.of(DEFAULT_POLL_DISPATCH_INTERVAL_MILLIS, ChronoUnit.MILLIS))
                 .maxBatchSize(DEFAULT_MAX_BATCH_SIZE)
                 .maxQueueSize(DEFAULT_MAX_QUEUE_SIZE)
-                .queueProvider(new DefaultQueueProvider<>(DEFAULT_MAX_QUEUE_SIZE))
+                .queueProvider(createDefaultQueueProvider(DEFAULT_MAX_QUEUE_SIZE))
                 .build();
 
         return new LogMinerStreamingChangeEventSourceMetrics(taskContext, queue, null, connectorConfig, java.util.Collections::emptyList);
+    }
+
+    private static DefaultQueueProvider<DataChangeEvent> createDefaultQueueProvider(int maxQueueSize) {
+        DefaultQueueProvider<DataChangeEvent> provider = new DefaultQueueProvider<>();
+        provider.configure(java.util.Map.of("max.queue.size", String.valueOf(maxQueueSize)));
+        return provider;
     }
 
     private LogMinerEventRow getStartLogMinerEventRow(long scn, String transactionId) {
@@ -649,16 +832,57 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
     }
 
     private LogMinerEventRow getInsertLogMinerEventRow(long scn, String transactionId, Instant changeTime) {
+        return getInsertLogMinerEventRow(scn, transactionId, changeTime, "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Test'");
+    }
+
+    private LogMinerEventRow getInsertLogMinerEventRow(long scn, String transactionId, Instant changeTime, String tableName, String rowId, String dataValue) {
         LogMinerEventRow row = Mockito.mock(LogMinerEventRow.class);
         Mockito.when(row.getEventType()).thenReturn(EventType.INSERT);
         Mockito.when(row.getTransactionId()).thenReturn(transactionId);
         Mockito.when(row.getScn()).thenReturn(Scn.valueOf(scn));
         Mockito.when(row.getChangeTime()).thenReturn(changeTime);
-        Mockito.when(row.getRowId()).thenReturn("1234567890");
+        Mockito.when(row.getRowId()).thenReturn(rowId);
         Mockito.when(row.getOperation()).thenReturn("INSERT");
-        Mockito.when(row.getTableName()).thenReturn("TEST_TABLE");
-        Mockito.when(row.getTableId()).thenReturn(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE"));
-        Mockito.when(row.getRedoSql()).thenReturn("insert into \"DEBEZIUM\".\"TEST_TABLE\"(\"ID\",\"DATA\") values ('1','Test');");
+        Mockito.when(row.getTableName()).thenReturn(tableName);
+        Mockito.when(row.getTableId()).thenReturn(TableId.parse("ORCLPDB1.DEBEZIUM." + tableName));
+        Mockito.when(row.getRedoSql()).thenReturn("insert into \"DEBEZIUM\".\"%s\"(\"ID\",\"DATA\") values ('1',%s);".formatted(tableName, dataValue));
+        Mockito.when(row.getRsId()).thenReturn("A.B.C");
+        Mockito.when(row.getTablespaceName()).thenReturn("DEBEZIUM");
+        Mockito.when(row.getUserName()).thenReturn(TestHelper.SCHEMA_USER);
+        return row;
+    }
+
+    private LogMinerEventRow getUpdateLogMinerEventRow(long scn, String transactionId, Instant changeTime, String tableName, String rowId, String dataValue) {
+        LogMinerEventRow row = Mockito.mock(LogMinerEventRow.class);
+        Mockito.when(row.getEventType()).thenReturn(EventType.UPDATE);
+        Mockito.when(row.getTransactionId()).thenReturn(transactionId);
+        Mockito.when(row.getScn()).thenReturn(Scn.valueOf(scn));
+        Mockito.when(row.getChangeTime()).thenReturn(changeTime);
+        Mockito.when(row.getRowId()).thenReturn(rowId);
+        Mockito.when(row.getOperation()).thenReturn("UPDATE");
+        Mockito.when(row.getTableName()).thenReturn(tableName);
+        Mockito.when(row.getTableId()).thenReturn(TableId.parse("ORCLPDB1.DEBEZIUM." + tableName));
+        Mockito.when(row.getRedoSql()).thenReturn(
+                "update \"DEBEZIUM\".\"%s\" set \"DATA\" = %s where \"ID\" = '1' and ROWID = '%s';".formatted(tableName, dataValue, rowId));
+        Mockito.when(row.getRsId()).thenReturn("A.B.C");
+        Mockito.when(row.getTablespaceName()).thenReturn("DEBEZIUM");
+        Mockito.when(row.getUserName()).thenReturn(TestHelper.SCHEMA_USER);
+        return row;
+    }
+
+    private LogMinerEventRow getRollbackToSavepointLogMinerEventRow(long scn, String transactionId, Instant changeTime, String tableName, String rowId) {
+        LogMinerEventRow row = Mockito.mock(LogMinerEventRow.class);
+        Mockito.when(row.getEventType()).thenReturn(EventType.DELETE);
+        Mockito.when(row.isRollbackFlag()).thenReturn(true);
+        Mockito.when(row.getTransactionId()).thenReturn(transactionId);
+        Mockito.when(row.getScn()).thenReturn(Scn.valueOf(scn));
+        Mockito.when(row.getChangeTime()).thenReturn(changeTime);
+        Mockito.when(row.getRowId()).thenReturn(rowId);
+        Mockito.when(row.getOperation()).thenReturn("DELETE");
+        Mockito.when(row.getTableName()).thenReturn(tableName);
+        Mockito.when(row.getTableId()).thenReturn(TableId.parse("ORCLPDB1.DEBEZIUM." + tableName));
+        Mockito.when(row.getRedoSql()).thenReturn(
+                "delete from \"DEBEZIUM\".\"%s\" where ROWID = '%s';".formatted(tableName, rowId));
         Mockito.when(row.getRsId()).thenReturn("A.B.C");
         Mockito.when(row.getTablespaceName()).thenReturn("DEBEZIUM");
         Mockito.when(row.getUserName()).thenReturn(TestHelper.SCHEMA_USER);
@@ -671,7 +895,7 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
 
         final BufferedStreamingChangeEventSource source = new BufferedStreamingChangeEventSource(
                 connectorConfig,
-                connection,
+                connectionFactory,
                 dispatcher,
                 schema,
                 metrics,
@@ -680,38 +904,110 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
 
         source.init(offsetContext);
 
+        try {
+            source.setCurrentRedoThreadState(buildRedoThreadState(1, "PUBLIC"));
+        }
+        catch (Exception e) {
+            throw new RuntimeException("Failed to set redo thread state", e);
+        }
+
         return source;
+    }
+
+    private static RedoThreadState buildRedoThreadState(int threadId, String enabled) {
+        return RedoThreadState.builder()
+                .thread()
+                .threadId(threadId)
+                .status("OPEN")
+                .enabled(enabled)
+                .logGroups(2L)
+                .instanceName("ORCLCDB")
+                .openTime(Instant.now())
+                .currentGroupNumber(1L)
+                .currentSequenceNumber(1L)
+                .checkpointScn(Scn.valueOf(1))
+                .checkpointTime(Instant.now())
+                .enabledScn(Scn.valueOf(1))
+                .enabledTime(Instant.now())
+                .disabledScn(Scn.valueOf(0))
+                .disabledTime(null)
+                .lastRedoSequenceNumber(1L)
+                .lastRedoBlock(1L)
+                .lastRedoScn(Scn.valueOf(1))
+                .lastRedoTime(Instant.now())
+                .conId(0L)
+                .build()
+                .build();
+    }
+
+    private static RedoThreadState buildTwoThreadRedoThreadState(int threadId1, String enabled1, int threadId2, String enabled2) {
+        return RedoThreadState.builder()
+                .thread()
+                .threadId(threadId1)
+                .status("OPEN")
+                .enabled(enabled1)
+                .logGroups(2L)
+                .instanceName("ORCLCDB1")
+                .openTime(Instant.now())
+                .currentGroupNumber(1L)
+                .currentSequenceNumber(1L)
+                .checkpointScn(Scn.valueOf(1))
+                .checkpointTime(Instant.now())
+                .enabledScn(Scn.valueOf(1))
+                .enabledTime(Instant.now())
+                .disabledScn(Scn.valueOf(0))
+                .disabledTime(null)
+                .lastRedoSequenceNumber(1L)
+                .lastRedoBlock(1L)
+                .lastRedoScn(Scn.valueOf(1))
+                .lastRedoTime(Instant.now())
+                .conId(0L)
+                .build()
+                .thread()
+                .threadId(threadId2)
+                .status("OPEN")
+                .enabled(enabled2)
+                .logGroups(2L)
+                .instanceName("ORCLCDB2")
+                .openTime(Instant.now())
+                .currentGroupNumber(1L)
+                .currentSequenceNumber(1L)
+                .checkpointScn(Scn.valueOf(1))
+                .checkpointTime(Instant.now())
+                .enabledScn(Scn.valueOf(1))
+                .enabledTime(Instant.now())
+                .disabledScn(Scn.valueOf(0))
+                .disabledTime(null)
+                .lastRedoSequenceNumber(1L)
+                .lastRedoBlock(1L)
+                .lastRedoScn(Scn.valueOf(1))
+                .lastRedoTime(Instant.now())
+                .conId(0L)
+                .build()
+                .build();
     }
 
     // Helper class that permits exposing some protected methods for mocking
     protected static class BufferedStreamingChangeEventSource extends BufferedLogMinerStreamingChangeEventSource {
 
         private final ChangeEventSourceContext context;
-        private final OffsetActivityMonitor offsetActivityMonitor;
 
         public BufferedStreamingChangeEventSource(
                                                   OracleConnectorConfig connectorConfig,
-                                                  OracleConnection connection,
+                                                  OracleConnectionFactory connectionFactory,
                                                   EventDispatcher<OraclePartition, TableId> dispatcher,
                                                   OracleDatabaseSchema schema,
                                                   LogMinerStreamingChangeEventSourceMetrics metrics,
                                                   ChangeEventSourceContext context,
                                                   OracleOffsetContext offsetContext) {
-            super(connectorConfig, connection, dispatcher, null, Clock.SYSTEM, schema, connectorConfig.getJdbcConfig(), metrics);
+            super(connectorConfig, connectionFactory, dispatcher, null, Clock.SYSTEM, schema, connectorConfig.getJdbcConfig(), metrics);
             this.context = context;
-            this.offsetActivityMonitor = new OffsetActivityMonitor(25, offsetContext, metrics);
         }
 
         @Override
         protected ChangeEventSourceContext getContext() {
             // Necessary for mock purposes only
             return context;
-        }
-
-        @Override
-        protected OffsetActivityMonitor getOffsetActivityMonitor() {
-            // Necessary for mock purposes only
-            return offsetActivityMonitor;
         }
 
         @Override
@@ -724,6 +1020,17 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
         public void processEvent(LogMinerEventRow event) throws SQLException, InterruptedException {
             // Necessary for mock purposes only
             super.processEvent(event);
+        }
+
+        public void setCurrentRedoThreadState(RedoThreadState state) throws Exception {
+            var field = AbstractLogMinerStreamingChangeEventSource.class.getDeclaredField("currentRedoThreadState");
+            field.setAccessible(true);
+            field.set(this, state);
+        }
+
+        @Override
+        public void detectRedoThreadTransitions(RedoThreadState newRedoThreadState) {
+            super.detectRedoThreadTransitions(newRedoThreadState);
         }
     }
 }

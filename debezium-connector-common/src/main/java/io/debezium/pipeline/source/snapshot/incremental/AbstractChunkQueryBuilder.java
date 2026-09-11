@@ -1,0 +1,323 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.pipeline.source.snapshot.incremental;
+
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.debezium.jdbc.JdbcConnection;
+import io.debezium.relational.Column;
+import io.debezium.relational.Key.KeyMapper;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.relational.Table;
+import io.debezium.relational.TableId;
+import io.debezium.relational.Tables.ColumnNameFilter;
+import io.debezium.spi.schema.DataCollectionId;
+
+/**
+ * Base class for building queries for reading incremental snapshot chunks from a table.
+ */
+public abstract class AbstractChunkQueryBuilder<T extends DataCollectionId>
+        implements ChunkQueryBuilder<T> {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(AbstractChunkQueryBuilder.class);
+
+    protected final RelationalDatabaseConnectorConfig connectorConfig;
+    protected final JdbcConnection jdbcConnection;
+    protected ColumnNameFilter columnFilter;
+
+    public AbstractChunkQueryBuilder(RelationalDatabaseConnectorConfig config,
+                                     JdbcConnection jdbcConnection) {
+        this.connectorConfig = config;
+        this.jdbcConnection = jdbcConnection;
+        this.columnFilter = config.getColumnFilter();
+    }
+
+    @Override
+    public String buildChunkQuery(IncrementalSnapshotContext<T> context, Table table, Optional<String> additionalCondition) {
+        return buildChunkQuery(context, table, connectorConfig.getIncrementalSnapshotChunkSize(), additionalCondition);
+    }
+
+    @Override
+    public String buildChunkQuery(IncrementalSnapshotContext<T> context, Table table, int limit, Optional<String> additionalCondition) {
+        final Optional<Object[]> upperBound = getChunkUpperBound(context);
+        final List<Column> queryColumns = getQueryColumns(context, table);
+        String condition = null;
+        // Add condition when this is not the first query
+        if (context.isNonInitialChunk()) {
+            final Object[] chunkEndPosition = context.chunkEndPosititon();
+            final StringBuilder sql = new StringBuilder();
+            // Window boundaries
+            final List<Column> pkColumns = getQueryColumns(context, table);
+            addLowerBound(pkColumns, chunkEndPosition, sql, false);
+            // Table boundaries
+            if (upperBound.isPresent()) {
+                sql.append(" AND ");
+                addUpperBound(pkColumns, upperBound.get(), sql, true);
+            }
+            condition = sql.toString();
+        }
+        else if (upperBound.isPresent()) {
+            final StringBuilder sql = new StringBuilder();
+            final List<Column> pkColumns = getQueryColumns(context, table);
+            addUpperBound(pkColumns, upperBound.get(), sql, true);
+            condition = sql.toString();
+        }
+        final List<Column> orderByColumns = getOrderByColumns(context, table);
+        if (jdbcConnection.nullsSortLast().isEmpty() && queryColumns.stream().anyMatch(Column::isOptional)) {
+            // You need to override nullsSortLast on JdbcConnection for your connector if you want to be able to chunk based on nullable columns.
+            throw new UnsupportedOperationException("The sort order of NULL values in the incremental snapshot key is unknown.");
+        }
+        final String orderBy = orderByColumns.stream()
+                .map(c -> jdbcConnection.quoteIdentifier(c.name()))
+                .collect(Collectors.joining(", "));
+        return jdbcConnection.buildSelectWithRowLimits(table.id(),
+                limit,
+                buildProjection(table),
+                Optional.ofNullable(condition),
+                additionalCondition,
+                orderBy,
+                getTableAlias(table));
+    }
+
+    protected String buildProjection(Table table) {
+        String projection = "*";
+        if (connectorConfig.isColumnsFiltered()) {
+            TableId tableId = table.id();
+            projection = table.columns().stream()
+                    .filter(column -> columnFilter.matches(tableId.catalog(), tableId.schema(), tableId.table(), column.name()))
+                    .map(column -> jdbcConnection.quoteIdentifier(column.name()))
+                    .collect(Collectors.joining(", "));
+        }
+        return projection;
+    }
+
+    public void addLowerBound(List<Column> pkColumns, Object[] boundaryKey, StringBuilder condition, boolean inclusiveFinal) {
+        // To make window boundaries working for more than one column it is necessary to calculate
+        // with independently increasing values in each column independently.
+        // To include the boundary using inclusiveFinal, we can add an equality condition at the end.
+        // For one column with inclusiveFinal = false the condition will be (? will always be the last value seen for the given column)
+        // (k1 > ?)
+        // For two columns with inclusiveFinal = true
+        // (k1 > ?) OR (k1 = ? AND k2 >= ?)
+        // For four columns with inclusiveFinal = false
+        // (k1 > ?) OR (k1 = ? AND k2 > ?) OR (k1 = ? AND k2 = ? AND k3 > ?) OR (k1 = ? AND k2 = ? AND k3 = ? AND k4 > ?)
+        // etc.
+        //
+        // Special considerations are needed when a column is nullable. First, the ORDER BY clause will return NULL values
+        // in different sort orders depending on the database, so jdbcConnection.nullsSortLast() helps us figure that out.
+        // Next, each individual comparison as shown in the simple non-NULLABLE example above is translated as follows:
+        //
+        // Databases where NULL sorts last (e.g. PostgreSQL):
+        // (k1 > ?) where ? is non-NULL: (k1 > ? OR k1 IS NULL): find bigger values; NULL is considered bigger & not seen yet
+        // (k1 > ?) where ? is NULL: (FALSE): by definition, NULL is the last value and no value can possibly be higher
+        // (k1 = ?) where ? is non-NULL: (k1 = ?): no translation needed for non-NULL values
+        // (k1 = ?) where ? is NULL: (k1 IS NULL): need to use IS NULL instead of equality comparison
+        //
+        // Databases where NULL sorts first (e.g. MySQL):
+        // (k1 > ?) where ? is non-NULL: (k1 > ? AND k1 IS NOT NULL): find bigger values; NULL is smaller & already seen
+        // (k1 > ?) where ? is NULL: (k1 IS NOT NULL): by definition, NULL is the first value and every value is always higher
+        // (k1 = ?) where ? is non-NULL: (k1 = ?): no translation needed for non-NULL values
+        // (k1 = ?) where ? is NULL: (k1 IS NULL): need to use IS NULL instead of equality comparison
+
+        final Optional<Boolean> nullsSortLast = jdbcConnection.nullsSortLast();
+        if (pkColumns.size() > 1) {
+            condition.append('(');
+        }
+        for (int i = 0; i < pkColumns.size(); i++) {
+            final boolean isLastIterationForI = (i == pkColumns.size() - 1);
+            condition.append('(');
+            for (int j = 0; j < i + 1; j++) {
+                final boolean isLastIterationForJ = (i == j);
+                final String operator =
+                        // not the last item in this iteration
+                        !isLastIterationForJ ? " = ?" :
+                        // the last item in this iteration
+                        // and in all iterations
+                        // and the last condition should be inclusive
+                                (isLastIterationForI && inclusiveFinal) ? " >= ?"
+                                        // the last item in this iteration but we don't need an inclusive condition
+                                        : " > ?";
+                final String pkColumnName = jdbcConnection.quoteIdentifier(pkColumns.get(j).name());
+                if (pkColumns.get(j).isRequired()) {
+                    condition.append(pkColumnName);
+                    condition.append(operator);
+                }
+                else if (boundaryKey[j] != null) {
+                    if (isLastIterationForJ) {
+                        condition.append('(');
+                        condition.append(pkColumnName);
+                        condition.append(operator);
+                        if (nullsSortLast.get()) {
+                            condition.append(" OR ");
+                            condition.append(pkColumnName);
+                            condition.append(" IS NULL)");
+                        }
+                        else {
+                            condition.append(" AND ");
+                            condition.append(pkColumnName);
+                            condition.append(" IS NOT NULL)");
+                        }
+                    }
+                    else {
+                        condition.append(pkColumnName);
+                        condition.append(operator);
+                    }
+                }
+                else {
+                    if (isLastIterationForJ) {
+                        // Identifies values greater than NULL based on the database sorting behavior
+                        if (nullsSortLast.get()) {
+                            if (isLastIterationForI && inclusiveFinal) {
+                                // solving for x >= NULL in case nulls sort last, x can only be NULL
+                                condition.append(pkColumnName);
+                                condition.append(" IS NULL");
+                            }
+                            else {
+                                // Basically a FALSE literal: works around lack of FALSE literal in some databases, like Oracle
+                                condition.append("1 = 0"); // nothing is greater than NULL
+                            }
+                        }
+                        else {
+                            if (isLastIterationForI && inclusiveFinal) {
+                                // solving for x >= NULL in case nulls DON'T sort last, x can be anything. So, anything is >= NULL.
+                                condition.append("1 = 1");
+                            }
+                            else {
+                                condition.append(pkColumnName);
+                                condition.append(" IS NOT NULL"); // everything is greater than NULL
+                            }
+                        }
+                    }
+                    else {
+                        condition.append(pkColumnName);
+                        condition.append(" IS NULL");
+                    }
+                }
+                if (!isLastIterationForJ) {
+                    condition.append(" AND ");
+                }
+            }
+            condition.append(")");
+            if (!isLastIterationForI) {
+                condition.append(" OR ");
+            }
+        }
+        if (pkColumns.size() > 1) {
+            condition.append(')');
+        }
+    }
+
+    public void addUpperBound(List<Column> pkColumns, Object[] boundaryKey, StringBuilder sql, boolean inclusiveFinal) {
+        sql.append("NOT ");
+        addLowerBound(pkColumns, boundaryKey, sql, !inclusiveFinal);
+    }
+
+    @Override
+    public PreparedStatement readTableChunkStatement(IncrementalSnapshotContext<T> context, Table table, String sql) throws SQLException {
+        final PreparedStatement statement = jdbcConnection.readTablePreparedStatement(connectorConfig, sql,
+                OptionalLong.empty());
+        final Optional<Object[]> upperBound = getChunkUpperBound(context);
+        if (context.isNonInitialChunk()) {
+            final Object[] chunkEndPosition = context.chunkEndPosititon();
+            final List<Column> queryColumns = getQueryColumns(context, table);
+
+            int pos = bindBoundaryParams(statement, queryColumns, chunkEndPosition, 1, jdbcConnection);
+            if (upperBound.isPresent()) {
+                bindBoundaryParams(statement, queryColumns, upperBound.get(), pos, jdbcConnection);
+            }
+        }
+        else if (upperBound.isPresent()) {
+            final List<Column> queryColumns = getQueryColumns(context, table);
+            bindBoundaryParams(statement, queryColumns, upperBound.get(), 1, jdbcConnection);
+        }
+        return statement;
+    }
+
+    @Override
+    public List<QueryParam> generateBoundaryParams(List<Column> columns, Object[] values) {
+        List<QueryParam> params = new ArrayList<>();
+        for (int i = 0; i < values.length; i++) {
+            for (int j = 0; j <= i; j++) {
+                params.add(new QueryParam(columns.get(j), values[j]));
+            }
+        }
+        return params;
+    }
+
+    public int bindBoundaryParams(PreparedStatement statement, List<Column> columns, Object[] values, int startIndex, JdbcConnection connection)
+            throws SQLException {
+        List<QueryParam> queryParams = generateBoundaryParams(columns, values);
+        int paramIndex = startIndex;
+        for (QueryParam queryParam : queryParams) {
+            if (queryParam.value() != null) {
+                connection.setQueryColumnValue(statement, queryParam.column(), paramIndex++, queryParam.value());
+            }
+        }
+        return paramIndex;
+    }
+
+    @Override
+    public String buildMaxPrimaryKeyQuery(IncrementalSnapshotContext<T> context, Table table, Optional<String> additionalCondition) {
+        final String orderBy = getQueryColumns(context, table).stream()
+                .map(c -> jdbcConnection.quoteIdentifier(c.name()))
+                .collect(Collectors.joining(" DESC, ")) + " DESC";
+        String selectWithRowLimits = jdbcConnection.buildSelectWithRowLimits(table.id(), 1, buildProjection(table), Optional.empty(),
+                additionalCondition, orderBy, getTableAlias(table));
+        LOGGER.debug("MaxPrimaryKeyQuery {}", selectWithRowLimits);
+        return selectWithRowLimits;
+    }
+
+    protected Optional<String> getTableAlias(Table table) {
+        return Optional.empty();
+    }
+
+    protected KeyMapper getKeyMapper() {
+        return connectorConfig.getKeyMapper() == null ? Table::primaryKeyColumns : connectorConfig.getKeyMapper();
+    }
+
+    /**
+     * Returns the upper bound for chunk queries.
+     * <p>
+     * Defaults to the maximum key for non-initial chunks. Subclasses may return a precomputed boundary to constrain earlier chunks.
+     */
+    protected Optional<Object[]> getChunkUpperBound(IncrementalSnapshotContext<T> context) {
+        return context.isNonInitialChunk() ? context.maximumKey() : Optional.empty();
+    }
+
+    /**
+     * Returns the columns for the ORDER BY clause of a chunk query.
+     * <p>
+     * Defaults to the chunking columns. Override when result ordering should differ from chunk boundaries.
+     */
+    protected List<Column> getOrderByColumns(IncrementalSnapshotContext<T> context, Table table) {
+        return getQueryColumns(context, table);
+    }
+
+    @Override
+    public List<Column> getQueryColumns(IncrementalSnapshotContext<T> context, Table table) {
+        if (context != null && context.currentDataCollectionId() != null) {
+            Optional<String> surrogateKey = context.currentDataCollectionId().getSurrogateKey();
+            if (surrogateKey.isPresent()) {
+                Column column = table.columnWithName(surrogateKey.get());
+                if (column == null) {
+                    throw new IllegalArgumentException("Surrogate key \"" + surrogateKey.get() + "\" doesn't exist in table \"" + table.id() + "\"");
+                }
+                return Collections.singletonList(column);
+            }
+        }
+        return getKeyMapper().getKeyKolumns(table);
+    }
+}

@@ -5,7 +5,12 @@
  */
 package io.debezium.connector.binlog.history;
 
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.VisibleForTesting;
 import io.debezium.connector.binlog.BinlogOffsetContext;
@@ -22,8 +27,15 @@ import io.debezium.relational.history.HistoryRecordComparator;
  */
 public abstract class BinlogHistoryRecordComparator extends HistoryRecordComparator {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(BinlogHistoryRecordComparator.class);
+
     private final Predicate<String> gtidSourceFilter;
     private final GtidSetFactory gtidSetFactory;
+
+    // isPositionAtOrBefore() is invoked once per recorded history entry during recovery, so a base-name
+    // change would otherwise log for every differing record. Track the transitions already reported to
+    // keep the warning to one line per distinct base-name change.
+    private final Set<String> warnedBaseNameChanges = ConcurrentHashMap.newKeySet();
 
     public BinlogHistoryRecordComparator(Predicate<String> gtidSourceFilter, GtidSetFactory gtidSetFactory) {
         this.gtidSourceFilter = gtidSourceFilter;
@@ -98,8 +110,9 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
             return false;
         }
 
-        // Both positions are missing GTIDs, compare servers
-        if (getServerId(recorded) != getServerId(desired)) {
+        // Both positions are missing GTIDs, compare servers. A missing server id is not a different server:
+        // snapshot offsets never carry one, as there is no way to tell which primary of a topology wrote the change.
+        if (hasServerId(recorded) && hasServerId(desired) && getServerId(recorded) != getServerId(desired)) {
             // These are from different servers.
             // Their binlog coordinates are not related, so the only thing that is possible is to compare
             // timestamps, and assume that the server timestamps can be compared.
@@ -109,15 +122,30 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
         // Compare binlog file names
         final BinlogFileName recordedFileName = getBinlogFileName(recorded);
         final BinlogFileName desiredFileName = getBinlogFileName(desired);
+        if (!recordedFileName.baseName.equals(desiredFileName.baseName)) {
+            // The binlog base name changed (e.g. after a restore, failover, or a log_bin_basename change),
+            // so the numeric extensions belong to unrelated coordinate spaces and cannot be compared. Rather
+            // than failing schema history recovery, treat the recorded position as at-or-before the desired
+            // one so its DDL is applied and the in-memory schema is rebuilt completely. Skipping the DDL is
+            // the unsafe direction: it would leave the schema incomplete and break parsing of later events.
+            final String change = recordedFileName.baseName + " -> " + desiredFileName.baseName;
+            if (warnedBaseNameChanges.add(change)) {
+                LOGGER.warn("Binlog base name changed during schema history recovery ({}); the recorded DDL is "
+                        + "applied because the numeric extensions are no longer comparable. This is expected after a "
+                        + "restore or log_bin_basename change, but if it results from switching back and forth between "
+                        + "primary and failover the recovered schema history may be incomplete.", change);
+            }
+            return true;
+        }
         final int fileNameCheck = recordedFileName.compareTo(desiredFileName);
         if (fileNameCheck != 0) {
             return fileNameCheck < 0;
         }
 
         // With the filenames the same, compare positions
-        final int recordedPosition = getBinlogPosition(recorded);
-        final int desiredPosition = getBinlogPosition(desired);
-        final int positionCheck = recordedPosition - desiredPosition;
+        final long recordedPosition = getBinlogPosition(recorded);
+        final long desiredPosition = getBinlogPosition(desired);
+        final int positionCheck = Long.compare(recordedPosition, desiredPosition);
         if (positionCheck != 0) {
             return positionCheck < 0;
         }
@@ -148,13 +176,25 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
     }
 
     /**
+     * Get whether the position carries a server unique identifier.
+     *
+     * @param document the document to inspect, should not be null
+     * @return true if the document has a server identifier, false otherwise
+     */
+    protected boolean hasServerId(Document document) {
+        return document.has(BinlogSourceInfo.SERVER_ID_KEY);
+    }
+
+    /**
      * Get the server unique identifier.
      *
      * @param document the document to inspect, should not be null
      * @return the unique server identifier
      */
-    protected int getServerId(Document document) {
-        return document.getInteger(BinlogSourceInfo.SERVER_ID_KEY, 0);
+    protected long getServerId(Document document) {
+        // server_id is a 32-bit unsigned value, so identifiers above Integer.MAX_VALUE are
+        // legitimate and must be read as a long for the same reason as the binlog position
+        return document.getLong(BinlogSourceInfo.SERVER_ID_KEY, 0);
     }
 
     /**
@@ -171,10 +211,10 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
      * Get the timestamp.
      *
      * @param document the document to inspect, should not be null
-     * @return the timestamp value
+     * @return the timestamp value, in seconds
      */
     protected long getTimestamp(Document document) {
-        return document.getLong(BinlogSourceInfo.TIMESTAMP_KEY, 0);
+        return document.getLong(BinlogOffsetContext.TIMESTAMP_KEY, 0);
     }
 
     /**
@@ -193,8 +233,11 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
      * @param document the document to inspect, should not be null
      * @return the binlog position value
      */
-    protected int getBinlogPosition(Document document) {
-        return document.getInteger(BinlogSourceInfo.BINLOG_POSITION_OFFSET_KEY, -1);
+    protected long getBinlogPosition(Document document) {
+        // Positions are unsigned and a binlog file can exceed Integer.MAX_VALUE bytes, so the
+        // value must be read as a long; Document#getInteger would return null for such values,
+        // silently turning every large position into the default
+        return document.getLong(BinlogSourceInfo.BINLOG_POSITION_OFFSET_KEY, -1);
     }
 
     /**

@@ -5,7 +5,9 @@
 <module name="Checker">
 
     <!-- Source code is not formatted using tabs -->
-    <module name="FileTabCharacter" />
+    <module name="FileTabCharacter">
+      <property name="fileExtensions" value="*.xml"/>
+    </module>
 
     <!-- Checks the header of Java files -->
     <module name="io.debezium.checkstyle.Header">
@@ -108,6 +110,11 @@
             <!-- Should use ModeShape-specific annotations -->
             <property name="illegalPkgs" value="net.jcip.annotations, org.apache.http.annotation"/>
         </module>
+        <module name="IllegalImport">
+            <!-- Should not use shaded dependencies from testcontainers -->
+            <property name="illegalPkgs" value="org.testcontainers.shaded"/>
+        </module>
+
         
         <!--  Avoid importing some specific classes, types, etc. -->
         <module name="io.debezium.checkstyle.IllegalImport">

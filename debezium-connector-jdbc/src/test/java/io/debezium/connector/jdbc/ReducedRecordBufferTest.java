@@ -60,13 +60,13 @@ class ReducedRecordBufferTest extends AbstractRecordBufferTest {
 
     protected JdbcSinkConnectorConfig getJdbcConnectorConfig(PrimaryKeyMode primaryKeyMode, String primaryKeyFields) {
         if (null == primaryKeyFields) {
-            return new JdbcSinkConnectorConfig(
+            return getConfig(
                     Map.of(
                             SinkConnectorConfig.BATCH_SIZE, "5",
                             SinkConnectorConfig.PRIMARY_KEY_MODE, primaryKeyMode.getValue()));
 
         }
-        return new JdbcSinkConnectorConfig(
+        return getConfig(
                 Map.of(
                         SinkConnectorConfig.BATCH_SIZE, "5",
                         SinkConnectorConfig.PRIMARY_KEY_MODE, primaryKeyMode.getValue(),
@@ -145,7 +145,7 @@ class ReducedRecordBufferTest extends AbstractRecordBufferTest {
                 .mapToObj(i -> createRecordPkFieldId(factory, (byte) i, config))
                 .collect(Collectors.toList());
 
-        KafkaDebeziumSinkRecord sinkRecordWithDifferentKeySchema = factory.updateBuilder()
+        KafkaDebeziumSinkRecord sinkRecordWithDifferentKeySchema = factory.updateBuilder(config)
                 .name("prefix")
                 .topic("topic")
                 .keySchema(factory.keySchema(UnaryOperator.identity(), Schema.INT16_SCHEMA))
@@ -180,7 +180,7 @@ class ReducedRecordBufferTest extends AbstractRecordBufferTest {
                 .mapToObj(i -> createRecordPkFieldId(factory, (byte) i, config))
                 .collect(Collectors.toList());
 
-        KafkaDebeziumSinkRecord sinkRecordWithDifferentValueSchema = factory.updateBuilder()
+        KafkaDebeziumSinkRecord sinkRecordWithDifferentValueSchema = factory.updateBuilder(config)
                 .name("prefix")
                 .topic("topic")
                 .keySchema(factory.basicKeySchema())
@@ -259,14 +259,9 @@ class ReducedRecordBufferTest extends AbstractRecordBufferTest {
                             List.of("value_id", "name"),
                             List.of(SchemaBuilder.type(Schema.INT8_SCHEMA.type()).optional().build(),
                                     SchemaBuilder.type(Schema.STRING_SCHEMA.type()).optional().build()),
-                            Arrays.asList((byte) (i % 2 == 0 ? i : i - 1), "John Doe " + i));
-                    return new JdbcKafkaSinkRecord(
-                            record.getOriginalKafkaRecord(),
-                            config.getPrimaryKeyMode(),
-                            config.getPrimaryKeyFields(),
-                            config.getFieldFilter(),
-                            config.cloudEventsSchemaNamePattern(),
-                            dialect);
+                            Arrays.asList((byte) (i % 2 == 0 ? i : i - 1), "John Doe " + i),
+                            config);
+                    return new JdbcKafkaSinkRecord(record.getOriginalKafkaRecord(), config);
                 })
                 .collect(Collectors.toList());
 

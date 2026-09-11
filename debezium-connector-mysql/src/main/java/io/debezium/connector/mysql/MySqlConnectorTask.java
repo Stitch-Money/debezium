@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
@@ -24,7 +23,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
-import io.debezium.connector.base.DefaultQueueProvider;
+import io.debezium.connector.base.QueueProviderService;
 import io.debezium.connector.binlog.BinlogEventMetadataProvider;
 import io.debezium.connector.binlog.BinlogSourceTask;
 import io.debezium.connector.binlog.jdbc.BinlogConnectorConnection;
@@ -112,7 +111,7 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
 
         connection = connectionFactory.mainConnection();
 
-        Offsets<MySqlPartition, MySqlOffsetContext> previousOffsets = getPreviousOffsets(
+        Offsets<MySqlPartition, MySqlOffsetContext> previousOffsets = getSinglePartitionPreviousOffsets(
                 new MySqlPartition.Provider(connectorConfig, config),
                 new MySqlOffsetContext.Loader(connectorConfig));
 
@@ -162,8 +161,6 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
             throw new DebeziumException(e);
         }
 
-        MySqlOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
-
         validateSchemaHistory(connectorConfig, connection::validateLogPosition, previousOffsets, schema, snapshotter);
 
         LOGGER.info("Reconnecting after validating schema recovery");
@@ -189,21 +186,14 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
             throw new DebeziumException("Failed to reconnect after schema recovery", e);
         }
 
-        // If the binlog position is not available it is necessary to re-execute snapshot
-        if (previousOffset == null) {
-            LOGGER.info("No previous offset found");
-        }
-        else {
-            LOGGER.info("Found previous offset {}", previousOffset);
-        }
-
         // Set up the task record queue ...
         this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                 .pollInterval(connectorConfig.getPollInterval())
+                .pollDispatchInterval(connectorConfig.getPollDispatchInterval())
                 .maxBatchSize(connectorConfig.getMaxBatchSize())
                 .maxQueueSize(connectorConfig.getMaxQueueSize())
                 .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
-                .queueProvider(new DefaultQueueProvider<>(connectorConfig.getMaxQueueSize()))
+                .queueProvider(connectorConfig.getServiceRegistry().tryGetService(QueueProviderService.class).getQueueProvider())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                 .buffering()
                 .build();
@@ -219,7 +209,8 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
                 previousOffsets);
 
         final Configuration heartbeatConfig = config;
-
+        final DebeziumHeaderProducer debeziumHeaderProducer = connectorConfig.getServiceRegistry().tryGetService(
+                DebeziumHeaderProducer.class);
         final EventDispatcher<MySqlPartition, TableId> dispatcher = new EventDispatcher<>(
                 connectorConfig,
                 topicNamingStrategy,
@@ -236,7 +227,9 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
                                 MySqlFieldReaderResolver.resolve(connectorConfig)),
                         new BinlogHeartbeatErrorHandler(),
                         queue),
-                schemaNameAdjuster, signalProcessor, connectorConfig.getServiceRegistry().tryGetService(DebeziumHeaderProducer.class));
+                schemaNameAdjuster,
+                signalProcessor,
+                debeziumHeaderProducer);
 
         // Create the binary log client that will be used for streaming change events
         final BinaryLogClient binaryLogClient = new BinaryLogClient(
@@ -293,13 +286,13 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
                 configuration.binaryHandlingMode(),
                 configuration.isTimeAdjustedEnabled() ? MySqlValueConverters::adjustTemporal : x -> x,
                 configuration.getEventConvertingFailureHandlingMode(),
-                configuration.getServiceRegistry());
+                configuration.getServiceRegistry(),
+                configuration.getUnavailableValuePlaceholder());
     }
 
     @Override
     public List<SourceRecord> doPoll() throws InterruptedException {
-        final List<DataChangeEvent> records = queue.poll();
-        return records.stream().map(DataChangeEvent::getRecord).collect(Collectors.toList());
+        return pollRecords(queue);
     }
 
     @Override
@@ -329,6 +322,10 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
 
         if (schema != null) {
             schema.close();
+        }
+
+        if (queue != null) {
+            queue.close();
         }
     }
 

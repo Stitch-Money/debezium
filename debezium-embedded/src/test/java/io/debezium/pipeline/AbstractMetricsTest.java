@@ -31,6 +31,8 @@ import io.debezium.config.Configuration;
 import io.debezium.doc.FixFor;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.embedded.util.MetricsHelper;
+import io.debezium.junit.EqualityCheck;
+import io.debezium.junit.SkipWhenConnectorUnderTest;
 import io.debezium.util.Testing;
 
 public abstract class AbstractMetricsTest<T extends SourceConnector> extends AbstractAsyncEngineConnectorTest {
@@ -72,7 +74,7 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
     }
 
     @Test
-    void testLifecycle() throws Exception {
+    public void testLifecycle() throws Exception {
 
         start();
 
@@ -106,7 +108,7 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
     }
 
     @Test
-    void testSnapshotOnlyMetrics() throws Exception {
+    public void testSnapshotOnlyMetrics() throws Exception {
         // Setup
         executeInsertStatements();
 
@@ -117,7 +119,7 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
     }
 
     @Test
-    void testSnapshotAndStreamingMetrics() throws Exception {
+    public void testSnapshotAndStreamingMetrics() throws Exception {
         // Setup
         executeInsertStatements();
 
@@ -126,14 +128,15 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         assertConnectorIsRunning();
 
         assertSnapshotMetrics();
-        consumeRecords(2);
+        consumeRecords((int) expectedEvents());
 
         assertStreamingMetrics(false, expectedEvents());
+        assertStreamingStatistics(expectedEvents());
     }
 
     @Test
     @FixFor("DBZ-6603")
-    void testSnapshotAndStreamingWithCustomMetrics() throws Exception {
+    public void testSnapshotAndStreamingWithCustomMetrics() throws Exception {
         // Setup
         executeInsertStatements();
 
@@ -143,12 +146,12 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         start(x -> x.with(CommonConnectorConfig.CUSTOM_METRIC_TAGS, "env=test,bu=bigdata"));
 
         assertSnapshotWithCustomMetrics(customMetricTags);
-        consumeRecords(2);
+        consumeRecords((int) expectedEvents());
         assertStreamingWithCustomMetrics(customMetricTags, expectedEvents());
     }
 
     @Test
-    void testStreamingOnlyMetrics() throws Exception {
+    public void testStreamingOnlyMetrics() throws Exception {
 
         // start connector
         start(this::noSnapshot);
@@ -156,10 +159,11 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         waitForStreamingRunning(connector(), server(), getStreamingNamespace(), task());
         assertSnapshotNotExecutedMetrics();
         assertStreamingMetrics(false, expectedEvents());
+        assertStreamingStatistics(expectedEvents());
     }
 
     @Test
-    void testAdvancedStreamingMetrics() throws Exception {
+    public void testAdvancedStreamingMetrics() throws Exception {
 
         // start connector
         start(x -> noSnapshot(x)
@@ -168,10 +172,11 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         waitForStreamingRunning(connector(), server(), getStreamingNamespace(), task());
         assertSnapshotNotExecutedMetrics();
         assertStreamingMetrics(true, expectedEvents());
+        assertStreamingStatistics(expectedEvents());
     }
 
     @Test
-    void testPauseAndResumeAdvancedStreamingMetrics() throws Exception {
+    public void testPauseAndResumeAdvancedStreamingMetrics() throws Exception {
 
         // start connector
         start(x -> noSnapshot(x)
@@ -183,12 +188,40 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
 
         invokeOperation(getMultiplePartitionStreamingMetricsObjectName(), "pause");
         insertRecords();
-        assertAdvancedMetrics(2);
+        assertAdvancedMetrics(expectedEvents());
 
         invokeOperation(getMultiplePartitionStreamingMetricsObjectName(), "resume");
         insertRecords();
-        consumeRecords(4);
-        assertAdvancedMetrics(4);
+        consumeRecords(2 * (int) expectedEvents());
+        assertAdvancedMetrics(2 * expectedEvents());
+        assertStreamingStatistics(2 * expectedEvents());
+    }
+
+    @Test
+    @SkipWhenConnectorUnderTest(check = EqualityCheck.EQUAL, value = SkipWhenConnectorUnderTest.Connector.SQL_SERVER)
+    public void testDisabledStreamingStatistics() throws Exception {
+        // start connector
+        start(x -> noSnapshot(x)
+                .with(CommonConnectorConfig.STATISTICS_METRICS_ENABLED, Boolean.FALSE));
+
+        waitForStreamingRunning(connector(), server(), getStreamingNamespace(), task());
+        assertSnapshotNotExecutedMetrics();
+        assertStreamingMetrics(false, expectedEvents());
+
+        // Insert new records and wait for them to become available
+        executeInsertStatements();
+
+        consumeRecordsByTopic((int) expectedEvents());
+        Thread.sleep(Duration.ofSeconds(2).toMillis());
+
+        // Check streaming statistics disabled
+        final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceMinValue")).isNotNull();
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceMaxValue")).isNotNull();
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceAverageValue")).isNotNull();
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceP50")).isNull();
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceP95")).isNull();
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceP99")).isNull();
     }
 
     private void insertRecords() throws Exception {
@@ -207,7 +240,7 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         // Check snapshot metrics
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalTableCount")).isEqualTo(1);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "CapturedTables")).isEqualTo(new String[]{ tableName() });
-        assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalNumberOfEventsSeen")).isEqualTo(2L);
+        assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalNumberOfEventsSeen")).isEqualTo(expectedEvents());
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "RemainingTableCount")).isEqualTo(0);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "SnapshotRunning")).isEqualTo(false);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "SnapshotAborted")).isEqualTo(false);
@@ -226,7 +259,7 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         // Check snapshot metrics
         assertThat(mBeanServer.getAttribute(objectName, "TotalTableCount")).isEqualTo(1);
         assertThat(mBeanServer.getAttribute(objectName, "CapturedTables")).isEqualTo(new String[]{ tableName() });
-        assertThat(mBeanServer.getAttribute(objectName, "TotalNumberOfEventsSeen")).isEqualTo(2L);
+        assertThat(mBeanServer.getAttribute(objectName, "TotalNumberOfEventsSeen")).isEqualTo(expectedEvents());
         assertThat(mBeanServer.getAttribute(objectName, "RemainingTableCount")).isEqualTo(0);
         assertThat(mBeanServer.getAttribute(objectName, "SnapshotRunning")).isEqualTo(false);
         assertThat(mBeanServer.getAttribute(objectName, "SnapshotAborted")).isEqualTo(false);
@@ -251,6 +284,8 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         // Check snapshot metrics
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalNumberOfEventsSeen")).isEqualTo(0L);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "SnapshotCompleted")).isEqualTo(snapshotCompleted());
+        // debezium/dbz#1479: with snapshot.mode=no_data no table is data-snapshotted, so no tables remain
+        assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "RemainingTableCount")).isEqualTo(0);
     }
 
     protected void assertStreamingMetrics(boolean checkAdvancedMetrics, long expectedEvents) throws Exception {
@@ -271,8 +306,63 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "CapturedTables")).isEqualTo(new String[]{ tableName() });
 
         if (checkAdvancedMetrics) {
-            assertAdvancedMetrics(2L);
+            assertAdvancedMetrics(expectedEvents());
         }
+    }
+
+    protected void assertStreamingStatistics(long expectedEvents) throws Exception {
+        final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+
+        waitForStreamingRunning(connector(), server(), getStreamingNamespace(), task());
+
+        // Insert new records and wait for them to become available
+        executeInsertStatements();
+
+        consumeRecordsByTopic((int) expectedEvents);
+        Thread.sleep(Duration.ofSeconds(2).toMillis());
+
+        // Check streaming statistics
+        Testing.print("****ASSERTIONS****");
+        // Lag between database and Debezium can be negative (see dbz#2033), possibly when Db time is ahead of local DBZ time.
+        // As the values are compared in the test, compare the absolute values.
+        final Long milliSecondsBehindSourceMinValue = Math.abs((Long) mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(),
+                "MilliSecondsBehindSourceMinValue"));
+        final Long milliSecondsBehindSourceMaxValue = Math.abs((Long) mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(),
+                "MilliSecondsBehindSourceMaxValue"));
+        final Double milliSecondsBehindSourceAverageValue = Math.abs((Double) mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(),
+                "MilliSecondsBehindSourceAverageValue"));
+        final Double milliSecondsBehindSourceP50 = Math
+                .abs((Double) mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceP50"));
+        final Double milliSecondsBehindSourceP95 = Math
+                .abs((Double) mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceP95"));
+        final Double milliSecondsBehindSourceP99 = Math
+                .abs((Double) mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "MilliSecondsBehindSourceP99"));
+
+        Testing.print("MilliSecondsBehindSourceMinValue: " + milliSecondsBehindSourceMinValue);
+        Testing.print("MilliSecondsBehindSourceMaxValue: " + milliSecondsBehindSourceMaxValue);
+        Testing.print("MilliSecondsBehindSourceAverageValue: " + milliSecondsBehindSourceAverageValue);
+        Testing.print("MilliSecondsBehindSourceP50: " + milliSecondsBehindSourceP50);
+        Testing.print("MilliSecondsBehindSourceP95: " + milliSecondsBehindSourceP95);
+        Testing.print("MilliSecondsBehindSourceP99: " + milliSecondsBehindSourceP99);
+
+        // Non-null checks
+        assertThat(milliSecondsBehindSourceMinValue).isNotNull();
+        assertThat(milliSecondsBehindSourceMaxValue).isNotNull();
+        assertThat(milliSecondsBehindSourceAverageValue).isNotNull();
+        assertThat(milliSecondsBehindSourceP50).isNotNull();
+        assertThat(milliSecondsBehindSourceP95).isNotNull();
+        assertThat(milliSecondsBehindSourceP99).isNotNull();
+
+        // Few sanity checks
+        // Equality is needed for very small amount of events
+        // Quantile values can have sometimes bigger values than max value. Very likely the issue is small statistics (2 numbers in many tests).
+        assertThat(milliSecondsBehindSourceMaxValue).isGreaterThanOrEqualTo(milliSecondsBehindSourceMinValue);
+        assertThat(milliSecondsBehindSourceMaxValue).isGreaterThanOrEqualTo(milliSecondsBehindSourceAverageValue.longValue());
+        assertThat(milliSecondsBehindSourceMinValue).isLessThanOrEqualTo(milliSecondsBehindSourceAverageValue.longValue());
+        assertThat(milliSecondsBehindSourceMinValue).isLessThanOrEqualTo(milliSecondsBehindSourceP95.longValue());
+        assertThat(milliSecondsBehindSourceP50.longValue()).isLessThanOrEqualTo(milliSecondsBehindSourceMaxValue);
+        assertThat(milliSecondsBehindSourceP50).isLessThanOrEqualTo(milliSecondsBehindSourceP95);
+        assertThat(milliSecondsBehindSourceP95).isLessThanOrEqualTo(milliSecondsBehindSourceP99);
     }
 
     public void assertAdvancedMetrics(long expectedInsert) {

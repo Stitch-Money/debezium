@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.oracle.util;
 
+import static io.debezium.connector.oracle.jdbc.OracleJdbcConfiguration.SECONDARY_PREFIX;
+
 import java.math.BigInteger;
 import java.nio.file.Path;
 import java.sql.SQLException;
@@ -76,6 +78,9 @@ public class TestHelper {
     public static final String OPENLOGREPLICATOR_HOST = System.getProperty("openlogreplicator.host", "localhost");
     public static final String OPENLOGREPLICATOR_PORT = System.getProperty("openlogreplicator.port", "9000");
 
+    // Maximum SCN value from Oracle 19+
+    public static final Scn SCN_MAX = Scn.valueOf("18446744073709551615");
+
     /**
      * Key for schema parameter used to store a source column's type name.
      */
@@ -100,6 +105,7 @@ public class TestHelper {
         cacheMappings.put(CacheProvider.PROCESSED_TRANSACTIONS_CACHE_NAME, OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_PROCESSED_TRANSACTIONS);
         cacheMappings.put(CacheProvider.SCHEMA_CHANGES_CACHE_NAME, OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_SCHEMA_CHANGES);
         cacheMappings.put(CacheProvider.EVENTS_CACHE_NAME, OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_EVENTS);
+        cacheMappings.put(CacheProvider.ROLLBACKS_CACHE_NAME, OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_ROLLBACKS);
     }
 
     /**
@@ -155,6 +161,15 @@ public class TestHelper {
         jdbcConfiguration.forEach(
                 (field, value) -> builder.with(ConfigurationNames.DATABASE_CONFIG_PREFIX + field, value));
 
+        // Allows specifying -Dcapture.mode from CLI
+        if (!Strings.isNullOrEmpty(System.getProperty("capture.mode"))) {
+            builder.with(OracleConnectorConfig.CAPTURE_MODE, System.getProperty("capture.mode"));
+        }
+
+        // Allows specifying -Dsecondary.* properties from CLI
+        Configuration.fromSystemProperties(SECONDARY_PREFIX)
+                .forEach((field, value) -> builder.with(SECONDARY_PREFIX + field, value));
+
         if (isXStream()) {
             builder.withDefault(OracleConnectorConfig.XSTREAM_SERVER_NAME, "dbzxout");
         }
@@ -163,20 +178,7 @@ public class TestHelper {
             builder.withDefault(OracleConnectorConfig.OLR_HOST, OPENLOGREPLICATOR_HOST);
             builder.withDefault(OracleConnectorConfig.OLR_PORT, OPENLOGREPLICATOR_PORT);
         }
-        else if (isUnbufferedLogMiner()) {
-            // Speeds up tests
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_MIN_MS, 0);
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_INCREMENT_MS, 500);
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_DEFAULT_MS, 500);
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_MAX_MS, 1000);
-        }
-        else {
-            // Speeds up tests
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_MIN_MS, 0);
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_INCREMENT_MS, 500);
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_DEFAULT_MS, 500);
-            builder.with(OracleConnectorConfig.LOG_MINING_SLEEP_TIME_MAX_MS, 1000);
-
+        else if (isBufferedLogMiner()) {
             final Boolean readOnly = Boolean.parseBoolean(System.getProperty(OracleConnectorConfig.LOG_MINING_READ_ONLY.name()));
             if (readOnly) {
                 builder.with(OracleConnectorConfig.LOG_MINING_READ_ONLY, readOnly);
@@ -201,6 +203,7 @@ public class TestHelper {
                 builder.with(OracleConnectorConfig.LOG_MINING_BUFFER_EHCACHE_PROCESSED_TRANSACTIONS_CONFIG, getEhcacheBasicCacheConfig(cacheSize));
                 builder.with(OracleConnectorConfig.LOG_MINING_BUFFER_EHCACHE_SCHEMA_CHANGES_CONFIG, getEhcacheBasicCacheConfig(cacheSize));
                 builder.with(OracleConnectorConfig.LOG_MINING_BUFFER_EHCACHE_EVENTS_CONFIG, getEhcacheBasicCacheConfig(cacheSize));
+                builder.with(OracleConnectorConfig.LOG_MINING_BUFFER_EHCACHE_ROLLBACKS_CONFIG, getEhcacheBasicCacheConfig(cacheSize));
             }
             builder.withDefault(OracleConnectorConfig.LOG_MINING_BUFFER_DROP_ON_STOP, true);
         }
@@ -395,7 +398,10 @@ public class TestHelper {
      * @return the connection
      */
     private static OracleConnection createConnection(Configuration config, JdbcConfiguration jdbcConfig, boolean autoCommit) {
-        OracleConnection connection = new OracleConnection(jdbcConfig);
+        // Setting this to true at least keeps existing behavior, expecting tests to set this to false
+        // as needed since this connection is not used in the connector but as part of the test, to
+        // perform required database SQL operations.
+        OracleConnection connection = new OracleConnection(jdbcConfig, true);
         try {
             connection.setAutoCommit(autoCommit);
 
@@ -415,7 +421,7 @@ public class TestHelper {
         Configuration config = adminConfig().build();
         Configuration jdbcConfig = config.subset(DATABASE_PREFIX, true);
 
-        try (OracleConnection jdbcConnection = new OracleConnection(JdbcConfiguration.adapt(jdbcConfig))) {
+        try (OracleConnection jdbcConnection = new OracleConnection(JdbcConfiguration.adapt(jdbcConfig), true)) {
             if (!Strings.isNullOrEmpty((new OracleConnectorConfig(defaultConfig().build())).getPdbName())) {
                 jdbcConnection.resetSessionToCdb();
             }
@@ -430,7 +436,7 @@ public class TestHelper {
         Configuration config = adminConfig().build();
         Configuration jdbcConfig = config.subset(DATABASE_PREFIX, true);
 
-        try (OracleConnection jdbcConnection = new OracleConnection(JdbcConfiguration.adapt(jdbcConfig))) {
+        try (OracleConnection jdbcConnection = new OracleConnection(JdbcConfiguration.adapt(jdbcConfig), true)) {
             if (!Strings.isNullOrEmpty((new OracleConnectorConfig(defaultConfig().build())).getPdbName())) {
                 jdbcConnection.resetSessionToCdb();
             }
@@ -511,7 +517,15 @@ public class TestHelper {
      */
     public static void streamTable(OracleConnection connection, String table) throws SQLException {
         connection.execute(String.format("GRANT SELECT ON %s TO %s", table, getConnectorUserName()));
-        connection.execute(String.format("ALTER TABLE %s ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS", table));
+        try {
+            connection.execute(String.format("ALTER TABLE %s ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS", table));
+        }
+        catch (SQLException e) {
+            // Supplemental logging already exists, we can ignore
+            if (e.getErrorCode() != 32588) {
+                throw e;
+            }
+        }
     }
 
     /**
@@ -796,7 +810,7 @@ public class TestHelper {
      * @throws SQLException if a database error occurred
      */
     public static Scn getCurrentScn() throws SQLException {
-        try (OracleConnection admin = new OracleConnection(adminJdbcConfig())) {
+        try (OracleConnection admin = new OracleConnection(adminJdbcConfig(), true)) {
             // Force the connection to the CDB$ROOT if we're operating w/a PDB
             if (isUsingPdb()) {
                 admin.resetSessionToCdb();
@@ -881,4 +895,15 @@ public class TestHelper {
         };
     }
 
+    public static void enableGoldenGateReplication() throws SQLException {
+        try (OracleConnection admin = adminConnection(true)) {
+            admin.execute("ALTER SYSTEM SET enable_goldengate_replication=TRUE SCOPE=BOTH");
+        }
+    }
+
+    public static void disableGoldenGateReplication() throws SQLException {
+        try (OracleConnection admin = adminConnection(true)) {
+            admin.execute("ALTER SYSTEM SET enable_goldengate_replication=TRUE SCOPE=BOTH");
+        }
+    }
 }

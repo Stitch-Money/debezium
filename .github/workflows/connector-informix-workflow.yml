@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       checkout-ref:
-        description: "The checkout reference to be used for the Cassandra repository."
+        description: "The checkout reference to be used for the Informix repository."
         required: true
         type: string
       max-parallel:
@@ -27,12 +27,12 @@ jobs:
 
     steps:
       - name: Checkout (Debezium Core)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: core
 
       - name: Checkout (Informix)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: debezium/debezium-connector-informix
           path: informix

@@ -4,7 +4,7 @@
   <parent>
     <groupId>io.debezium</groupId>
     <artifactId>debezium-build-parent</artifactId>
-    <version>3.5.0-SNAPSHOT</version>
+    <version>3.7.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
 
@@ -24,6 +24,9 @@
 
         <!-- Don't skip integration tests by default -->
         <skipITs>false</skipITs>
+
+        <!-- Skip ArchUnit tests when running specific tests -->
+        <archunit.skip>false</archunit.skip>
 
         <!-- Do not skip formatting source code by default -->
         <format.skip>false</format.skip>
@@ -49,6 +52,9 @@
         <!-- Assembly configuration -->
         <assembly.descriptor>connector-distribution</assembly.descriptor>
 
+        <!-- Schema generator output directory -->
+        <schema.generator.output.dir>${project.build.outputDirectory}/META-INF/descriptors/</schema.generator.output.dir>
+
         <!-- Needed for pre jdk 9 -->
         <useSystemClassLoader>true</useSystemClassLoader>
 
@@ -58,7 +64,19 @@
         <!-- Order in which Maven Failsafe plugin runs integration tests, the default is in alphabetical order -->
         <runOrder>alphabetical</runOrder>
 
+        <!-- For Java Outreach Jobs Running Later JDKs -->
+        <!-- Set this to true for experimental JDK versions not yet supported by Bytebuddy -->
+        <net.bytebuddy.experimental>false</net.bytebuddy.experimental>
+
         <version.openlineage>1.31.0</version.openlineage>
+
+        <!-- Apicurio -->
+        <apicurio.image>quay.io/apicurio/apicurio-registry</apicurio.image>
+        <apicurio.image.log>.*Using the following RegistryStorage.*</apicurio.image.log>
+        <apicurio.port>8080</apicurio.port>
+        <apicurio.init.timeout>60000</apicurio.init.timeout> <!-- 60 seconds -->
+        <apicurio.image.audit.level>OFF</apicurio.image.audit.level> <!-- Controls audit logging level -->
+
     </properties>
 
     <dependencyManagement>
@@ -81,6 +99,8 @@
                     <artifactId>maven-failsafe-plugin</artifactId>
                     <version>${version.failsafe.plugin}</version>
                     <configuration>
+                        <printSummary>true</printSummary>
+                        <reportFormat>plain</reportFormat>
                         <argLine>${debug.argline} ${modules.argline} ${test.argline} ${mockito.argLine}</argLine>
                         <useSystemClassLoader>${useSystemClassLoader}</useSystemClassLoader>
                         <systemPropertyVariables combine.children="append">
@@ -137,6 +157,28 @@
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>exec-maven-plugin</artifactId>
                     <version>3.0.0</version>
+                </plugin>
+                <plugin>
+                    <!--
+                        Schema generator plugin for connectors and transformations.
+                        Configuration defined here, activated in child modules with simple reference.
+                        Descriptors are placed in META-INF/descriptors/ for easy collection in CI/Jenkins.
+                    -->
+                    <groupId>io.debezium</groupId>
+                    <artifactId>debezium-schema-generator</artifactId>
+                    <version>${project.version}</version>
+                    <executions>
+                        <execution>
+                            <id>generate-connector-metadata</id>
+                            <goals>
+                                <goal>generate-api-spec</goal>
+                            </goals>
+                            <phase>prepare-package</phase>
+                            <configuration>
+                                <outputDirectory>${schema.generator.output.dir}</outputDirectory>
+                            </configuration>
+                        </execution>
+                    </executions>
                 </plugin>
                 <plugin>
                     <groupId>io.smallrye</groupId>
@@ -221,6 +263,8 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
+                    <printSummary>true</printSummary>
+                    <reportFormat>plain</reportFormat>
                     <systemPropertyVariables combine.children="append">
                         <java.io.tmpdir>${project.build.directory}</java.io.tmpdir>
                         <skipLongRunningTests>${skipLongRunningTests}</skipLongRunningTests>
@@ -236,6 +280,24 @@
                     <reuseForks>${reuseForks}</reuseForks>
                     <useSystemClassLoader>${useSystemClassLoader}</useSystemClassLoader>
                 </configuration>
+                <executions>
+                    <execution>
+                        <id>archunit</id>
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                        <configuration>
+                            <skipTests>${archunit.skip}</skipTests>
+                            <dependenciesToScan>
+                                <dependency>io.debezium:debezium-archunit</dependency>
+                            </dependenciesToScan>
+                            <includes>
+                                <include>**/DebeziumArchitectureTest*</include>
+                            </includes>
+                            <reportNameSuffix>${project.artifactId}</reportNameSuffix>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <!-- Serves as support for configuring Revapi -->
@@ -315,6 +377,8 @@
                                 <sourceDirectory>${project.build.sourceDirectory}</sourceDirectory>
                                 <sourceDirectory>${project.build.testSourceDirectory}</sourceDirectory>
                             </sourceDirectories>
+                            <includeResources>true</includeResources>
+                            <includeTestResources>true</includeTestResources>
                         </configuration>
                         <executions>
                             <execution>

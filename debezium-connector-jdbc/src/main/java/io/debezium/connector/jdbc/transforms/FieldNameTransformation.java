@@ -25,6 +25,7 @@ import io.debezium.connector.jdbc.util.NamingStyle;
 import io.debezium.connector.jdbc.util.NamingStyleUtils;
 import io.debezium.data.Envelope.FieldName;
 import io.debezium.data.SchemaUtil;
+import io.debezium.metadata.ConfigDescriptor;
 import io.debezium.transforms.SmtManager;
 import io.debezium.util.Strings;
 
@@ -45,7 +46,7 @@ import io.debezium.util.Strings;
  * @author Gustavo Lira
  * @param <R> The record type
  */
-public class FieldNameTransformation<R extends ConnectRecord<R>> implements Transformation<R>, Versioned {
+public class FieldNameTransformation<R extends ConnectRecord<R>> implements Transformation<R>, Versioned, ConfigDescriptor {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(FieldNameTransformation.class);
 
@@ -70,8 +71,7 @@ public class FieldNameTransformation<R extends ConnectRecord<R>> implements Tran
 
     private static final io.debezium.config.Field NAMING_STYLE = io.debezium.config.Field.create(COLUMN_STYLE_PARAM)
             .withDisplayName("Column Naming Style")
-            .withType(ConfigDef.Type.STRING)
-            .withDefault("default")
+            .withEnum(NamingStyle.class, NamingStyle.DEFAULT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDescription("The style of column naming: UPPERCASE, lowercase, snake_case, camelCase, kebab-case.");
 
@@ -173,13 +173,13 @@ public class FieldNameTransformation<R extends ConnectRecord<R>> implements Tran
                 final Map<String, Object> newValues = new HashMap<>();
                 for (Field field : originalSchema.fields()) {
                     if (field.name().equals(FieldName.BEFORE) || field.name().equals(FieldName.AFTER)) {
-                        var transformed = transform(field.schema(), (Struct) originalValue.get(field));
+                        var transformed = transform(field.schema(), (Struct) originalValue.getWithoutDefault(field.name()));
                         schema.field(field.name(), transformed.schema());
                         newValues.put(field.name(), transformed.value());
                     }
                     else {
                         schema.field(field.name(), field.schema());
-                        newValues.put(field.name(), originalValue.get(field));
+                        newValues.put(field.name(), originalValue.getWithoutDefault(field.name()));
                     }
                 }
 
@@ -216,7 +216,7 @@ public class FieldNameTransformation<R extends ConnectRecord<R>> implements Tran
         if (originalValue != null) {
             value = new Struct(valueSchema);
             for (Field field : originalSchema.fields()) {
-                value.put(transformFieldName(field.name()), originalValue.get(field));
+                value.put(transformFieldName(field.name()), originalValue.getWithoutDefault(field.name()));
             }
         }
 
@@ -316,4 +316,10 @@ public class FieldNameTransformation<R extends ConnectRecord<R>> implements Tran
     public String version() {
         return Module.version();
     }
+
+    @Override
+    public io.debezium.config.Field.Set getConfigFields() {
+        return io.debezium.config.Field.setOf(PREFIX, SUFFIX, NAMING_STYLE);
+    }
+
 }

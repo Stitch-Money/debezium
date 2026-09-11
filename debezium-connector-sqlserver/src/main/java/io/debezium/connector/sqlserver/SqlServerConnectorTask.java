@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
@@ -22,7 +21,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
-import io.debezium.connector.base.DefaultQueueProvider;
+import io.debezium.connector.base.QueueProviderService;
 import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.common.DebeziumHeaderProducer;
@@ -94,7 +93,8 @@ public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, S
         final TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY, true);
         final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
         final SqlServerValueConverters valueConverters = new SqlServerValueConverters(connectorConfig.getDecimalMode(),
-                connectorConfig.getTemporalPrecisionMode(), connectorConfig.binaryHandlingMode());
+                connectorConfig.getTemporalPrecisionMode(), connectorConfig.binaryHandlingMode(),
+                connectorConfig.getUnavailableValuePlaceholder());
 
         MainConnectionProvidingConnectionFactory<SqlServerConnection> connectionFactory = new DefaultMainConnectionProvidingConnectionFactory<>(
                 () -> new SqlServerConnection(connectorConfig,
@@ -140,10 +140,11 @@ public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, S
         // Set up the task record queue ...
         this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                 .pollInterval(connectorConfig.getPollInterval())
+                .pollDispatchInterval(connectorConfig.getPollDispatchInterval())
                 .maxBatchSize(connectorConfig.getMaxBatchSize())
                 .maxQueueSize(connectorConfig.getMaxQueueSize())
                 .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
-                .queueProvider(new DefaultQueueProvider<>(connectorConfig.getMaxQueueSize()))
+                .queueProvider(connectorConfig.getServiceRegistry().tryGetService(QueueProviderService.class).getQueueProvider())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                 .build();
 
@@ -207,11 +208,7 @@ public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, S
 
     @Override
     public List<SourceRecord> doPoll() throws InterruptedException {
-        final List<DataChangeEvent> records = queue.poll();
-
-        return records.stream()
-                .map(DataChangeEvent::getRecord)
-                .collect(Collectors.toList());
+        return pollRecords(queue);
     }
 
     @Override
@@ -249,6 +246,10 @@ public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, S
 
         if (schema != null) {
             schema.close();
+        }
+
+        if (queue != null) {
+            queue.close();
         }
     }
 

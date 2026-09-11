@@ -7,6 +7,8 @@ package io.debezium.connector.oracle;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -27,6 +29,7 @@ public class OracleConnectionTest {
 
     private Statement statement;
     private JdbcConfiguration jdbcConfiguration;
+    private Connection connection;
     private JdbcConnection.ConnectionFactory connectionFactory;
 
     @BeforeEach
@@ -35,9 +38,11 @@ public class OracleConnectionTest {
         jdbcConfiguration = mock(JdbcConfiguration.class);
         when(jdbcConfiguration.getQueryTimeout()).thenReturn(Duration.ZERO);
         connectionFactory = mock(JdbcConnection.ConnectionFactory.class);
-        Connection connection = mock(Connection.class);
+        connection = mock(Connection.class);
+        doNothing().when(connection).setAutoCommit(anyBoolean());
         statement = mock(Statement.class);
         when(connection.createStatement()).thenReturn(statement);
+        when(statement.getConnection()).thenReturn(connection);
         when(connectionFactory.connect(jdbcConfiguration)).thenReturn(connection);
 
     }
@@ -48,8 +53,11 @@ public class OracleConnectionTest {
         when(statement.executeQuery(any()))
                 .thenThrow(new SQLRecoverableException("IO Error: The Network Adapter could not establish the connection (CONNECTION_ID=u/VErjYySfO0HgLtwdCuTQ==)"));
 
+        when(connection.getMetaData())
+                .thenThrow(new SQLRecoverableException("IO Error: The Network Adapter could not establish the connection (CONNECTION_ID=u/VErjYySfO0HgLtwdCuTQ==)"));
+
         assertThrows(RetriableException.class, () -> {
-            try (OracleConnection connection = new OracleConnection(jdbcConfiguration, connectionFactory)) {
+            try (OracleConnection connection = new OracleConnection(jdbcConfiguration, connectionFactory, true)) {
                 // Force a connection call to the database.
                 connection.getOracleVersion();
             }

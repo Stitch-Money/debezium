@@ -1615,8 +1615,9 @@ index_expr
     ;
 
 index_properties
-    : (global_partitioned_index | local_partitioned_index | index_attributes)+
-    | INDEXTYPE IS (domain_index_clause | xmlindex_clause)
+    : ( (global_partitioned_index | local_partitioned_index | index_attributes)+
+        | INDEXTYPE IS (domain_index_clause | xmlindex_clause)
+    )*
     ;
 
 domain_index_clause
@@ -1844,11 +1845,7 @@ index_partition_description
     ;
 
 modify_index_subpartition
-    : MODIFY SUBPARTITION subpartition_name (
-        UNUSABLE
-        | allocate_extent_clause
-        | deallocate_unused_clause
-    )
+    : MODIFY SUBPARTITION subpartition_name (UNUSABLE | modify_index_partitions_ops)
     ;
 
 partition_name_old
@@ -3621,9 +3618,13 @@ range_partitions
     ;
 
 list_partitions
-    : PARTITION BY LIST '(' column_name ')' '(' PARTITION partition_name? list_values_clause table_partition_description (
-        ',' PARTITION partition_name? list_values_clause table_partition_description
-    )* ')'
+    : PARTITION BY LIST '(' column_name (',' column_name)* ')' (
+        AUTOMATIC (STORE IN '(' tablespace (',' tablespace)* ')')?
+    )? (
+        '(' PARTITION partition_name? list_values_clause table_partition_description (
+            ',' PARTITION partition_name? list_values_clause table_partition_description
+        )* ')'
+    )?
     ;
 
 hash_partitions
@@ -3779,7 +3780,10 @@ range_values_list
     ;
 
 list_values_clause
-    : VALUES '(' (literal (',' literal)* | TIMESTAMP literal (',' TIMESTAMP literal)* | DEFAULT) ')'
+    : VALUES '(' (
+        (literal (',' literal)* | TIMESTAMP literal (',' TIMESTAMP literal)* | DEFAULT)
+        | '(' (literal (',' literal*) | TIMESTAMP literal (',' TIMESTAMP literal)* | DEFAULT) ')'
+    ) ')'
     ;
 
 table_partition_description
@@ -5011,6 +5015,7 @@ alter_table_properties
     | READ ONLY
     | READ WRITE
     | REKEY CHAR_STRING
+    | NO? ROW ARCHIVAL
     | annotations_clause? // todo: not upstream
     ;
 
@@ -5051,7 +5056,8 @@ modify_table_partition
         (PARTITION | SUBPARTITION) partition_name ((ADD | DROP) list_values_clause)? (ADD range_subpartition_desc)? (
             REBUILD? UNUSABLE LOCAL INDEXES
         )? shrink_clause?
-        | range_partitions
+        // modify_to_partitioned: MODIFY table_partitioning_clauses [filter_condition] [ONLINE] [update_index_clauses]
+        | table_partitioning_clauses filter_condition? ONLINE? update_index_clauses?
     )
     ;
 
@@ -5310,7 +5316,11 @@ modify_column_clauses
     ;
 
 modify_col_properties
-    : column_name datatype? (DEFAULT (ON NULL_)? expression)? (ENCRYPT encryption_spec | DECRYPT)? inline_constraint* lob_storage_clause? annotations_clause?
+    : column_name datatype? (
+        DEFAULT (ON NULL_)? expression
+        | identity_clause
+        | DROP IDENTITY
+    )? (ENCRYPT encryption_spec | DECRYPT)? inline_constraint* lob_storage_clause? annotations_clause?
     //TODO alter_xmlschema_clause
     ;
 
@@ -5322,10 +5332,14 @@ modify_col_substitutable
     : COLUMN column_name NOT? SUBSTITUTABLE AT ALL LEVELS FORCE?
     ;
 
+// The documented BNF only permits column definitions here, but the server also accepts
+// out-of-line (ref) constraints mixed into the list, as in CREATE TABLE's relational_properties.
+// Constraints must precede column_definition so that "CONSTRAINT name ..." is not parsed as
+// a column named CONSTRAINT with a type of the constraint's name.
 add_column_clause
     : ADD (
-        '(' (column_definition | virtual_column_definition) (
-            ',' (column_definition | virtual_column_definition)
+        '(' (out_of_line_constraint | out_of_line_ref_constraint | column_definition | virtual_column_definition) (
+            ',' (out_of_line_constraint | out_of_line_ref_constraint | column_definition | virtual_column_definition)
         )* ')'
         | ( column_definition | virtual_column_definition)
     ) column_properties?
@@ -5347,6 +5361,7 @@ varray_storage_clause
 
 lob_segname
     : regular_id
+    | DELIMITED_ID
     ;
 
 lob_item
@@ -9189,6 +9204,7 @@ non_reserved_keywords_pre12c
     | OVERFLOW_NOMOVE
     | OVERLAPS
     | OVER
+    | OVERRIDE
     | OWNER
     | OWNERSHIP
     | OWN

@@ -88,25 +88,21 @@ The following example shows a typical notification that provides the status of a
 {
     "id": "5563ae14-49f8-4579-9641-c1bbc2d76f99",
     "aggregate_type": "Initial Snapshot",
-    "type": "COMPLETED", // <1>
+    "type": "COMPLETED",
     "additional_data" : {
         "connector_name": "myConnector"
     },
     "timestamp": "1695817046353"
 }
 ----
-[cols="1,7a",options="header",subs="+attributes"]
-|===
-|Item |Description
+The following list describes select fields in the preceding initial snapshot notification example:
 
-|1
-|The `type` field can contain one of the following values:
+`type`::
+The `type` field can contain one of the following values:
 
 * `COMPLETED`
 * `ABORTED`
 * `SKIPPED`
-
-|===
 
 
 The following table shows examples of the different payloads that might be present in notifications that report the status of initial snapshots:
@@ -142,7 +138,7 @@ a|[source, json]
    "timestamp": "1695817046353"
 }
 ----
-Field `data_collection` are currently not supported for MongoDB connector
+The field `data_collection` is not supported for the MongoDB connector.
 
 |TABLE_SCAN_COMPLETED
 a|[source, json]
@@ -385,7 +381,7 @@ The notification mechanism is designed to be extensible.
 You can implement channels as needed to deliver notifications in a manner that works best in your environment.
 Adding a notification channel involves several steps:
 
-1. xref:debezium-configuring-custom-notification-channels[Create a Java project for the channel] to implement the channel, and xref:debezium-core-module-dependency[add `{prodname} Core` as a dependency].
+1. xref:debezium-configuring-custom-notification-channels[Create a Java project for the channel] to implement the channel, and xref:debezium-connector-common-module-dependency[add `{prodname} Connector Core` as a dependency].
 2. xref:deploying-a-debezium-custom-notification-channel[Deploy the notification channel].
 3. xref:configuring-connectors-to-use-a-custom-notification-channel[Enable connectors to use the custom notification channel by modifying the connector configuration].
 
@@ -401,37 +397,34 @@ For example:
 ----
 public interface NotificationChannel {
 
-    String name(); // <1>
+    String name();
 
-    void init(CommonConnectorConfig config); // <2>
+    void init(CommonConnectorConfig config);
 
-    void send(Notification notification); // <3>
+    void send(Notification notification);
 
-    void close(); // <4>
+    void close();
 }
 ----
-[cols="1,7a",options="header",subs="+attributes"]
-|===
-|Item |Description
+The following list describes the purpose of select lines in the preceding `NotificationChannel` interface example:
 
-|1
-|The name of the channel.
+`String name()`::
+The name of the channel.
 To enable {prodname} to use the channel, specify this name in the connector's `notification.enabled.channels` property.
 
-|2
-|Initializes specific configuration, variables, or connections that the channel requires.
+`void init(CommonConnectorConfig config)`::
+Initializes specific configuration, variables, or connections that the channel requires.
 
-|3
-|ends the notification on the channel.
+`void send(Notification notification)`::
+ends the notification on the channel.
 {prodname} calls this method to report its status.
 
-|4
-|Closes all allocated resources.
+`void close()`::
+Closes all allocated resources.
 {prodname} calls this method when the connector is stopped.
 
-|===
-
 //   Type: concept
+[id="debezium-connector-common-module-dependency"]
 [id="debezium-core-module-dependency"]
 === {prodname} core module dependencies
 
@@ -442,18 +435,14 @@ You must include these compile dependencies in your project's `pom.xml` file, as
 ----
 <dependency>
     <groupId>io.debezium</groupId>
-    <artifactId>debezium-core</artifactId>
-    <version>${version.debezium}</version> // <1>
+    <artifactId>debezium-connector-common</artifactId>
+    <version>${version.debezium}</version>
 </dependency>
 ----
-[cols="1,7",options="header",subs="+attributes"]
-|===
-|Item |Description
+The following list describes select fields in the preceding `pom.xml` dependency example:
 
-|1
-|`${version.debezium}` represents the version of the {prodname} connector.
-
-|===
+`${version.debezium}`::
+Represents the version of the {prodname} connector.
 
 Declare your implementation in the `META-INF/services/io.debezium.pipeline.notification.channels.NotificationChannel` file.
 
@@ -465,8 +454,8 @@ Declare your implementation in the `META-INF/services/io.debezium.pipeline.notif
 * You have a custom notification channel Java program.
 
 .Procedure
-* To use a notification channel with a {prodname} connector, export the Java project to a JAR file, and copy the file to the directory that contains the JAR file for each {prodname} connector that you want to use it with. +
- +
+* To use a notification channel with a {prodname} connector, export the Java project to a JAR file, and copy the file to the directory that contains the JAR file for each {prodname} connector that you want to use it with.
++
 For example, in a typical deployment, the {prodname} connector files are stored in subdirectories of a Kafka Connect directory (`/kafka/connect`), with each connector JAR in its own subdirectory (`/kafka/connect/debezium-connector-db2`, `/kafka/connect/debezium-connector-mysql`, and so forth).
 To use a signaling channel with a connector, add the converter JAR file to the connector's subdirectory.
 

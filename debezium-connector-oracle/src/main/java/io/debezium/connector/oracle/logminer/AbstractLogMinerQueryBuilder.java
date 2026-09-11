@@ -66,9 +66,7 @@ public abstract class AbstractLogMinerQueryBuilder implements LogMinerQueryBuild
             query.append("/*+ ORDERED USE_NL(R) */ ");
         }
 
-        query.append("SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, ")
-                .append("USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD#, DATA_OBJ#, DATA_OBJV#, DATA_OBJD#, ")
-                .append("CLIENT_ID, START_SCN, COMMIT_SCN, START_TIMESTAMP, COMMIT_TIMESTAMP, SEQUENCE# ")
+        query.append(buildColumnList())
                 .append("FROM ")
                 .append(LOGMNR_CONTENTS_VIEW).append(" ");
 
@@ -77,6 +75,65 @@ public abstract class AbstractLogMinerQueryBuilder implements LogMinerQueryBuild
         }
 
         return query.append(!Strings.isNullOrEmpty(whereClause) ? "WHERE " + whereClause : "").toString();
+    }
+
+    /**
+     * Builds the comma-separated list of columns for the SELECT clause. Optional tracking columns
+     * are included only when their corresponding configuration flag is enabled. When a tracking flag
+     * is disabled, the column is omitted from the query entirely, reducing query bandwidth.
+     *
+     * <p><strong>IMPORTANT:</strong> The column ordering here is the single source of truth for the
+     * LogMiner query projection. {@link LogMinerColumnIndexes#fromConfig(io.debezium.connector.oracle.OracleConnectorConfig)}
+     * mirrors this ordering exactly to pre-compute the 1-based JDBC {@link java.sql.ResultSet} ordinal
+     * for every column. Any change to column order, addition, or removal here <em>must</em> be
+     * reflected in {@link LogMinerColumnIndexes} and its tests.
+     *
+     * @return the column list string, ending with a trailing space
+     */
+    private String buildColumnList() {
+        final List<String> columns = new ArrayList<>();
+
+        // NOTE: Mandatory columns (positions 1-21, always present), and should be placed before optional columns
+        columns.add("SCN");
+        columns.add("SQL_REDO");
+        columns.add("OPERATION_CODE");
+        columns.add("TIMESTAMP");
+        columns.add("XID");
+        columns.add("CSF");
+        columns.add("TABLE_NAME");
+        columns.add("SEG_OWNER");
+        columns.add("OPERATION");
+        columns.add("ROW_ID");
+        columns.add("ROLLBACK");
+        columns.add("STATUS");
+        columns.add("INFO");
+        columns.add("SSN");
+        columns.add("THREAD#");
+        columns.add("DATA_OBJ#");
+        columns.add("DATA_OBJV#");
+        columns.add("DATA_OBJD#");
+        columns.add("START_SCN");
+        columns.add("COMMIT_SCN");
+        columns.add("SEQUENCE#");
+
+        // NOTE: Optional columns should be added here, order must match LogMinerColumnIndexes
+        if (connectorConfig.isLogMiningBufferTrackStartTimestamp()) {
+            columns.add("START_TIMESTAMP");
+        }
+        if (connectorConfig.isLogMiningBufferTrackCommitTimestamp()) {
+            columns.add("COMMIT_TIMESTAMP");
+        }
+        if (connectorConfig.isLogMiningBufferTrackRsId()) {
+            columns.add("RS_ID");
+        }
+        if (connectorConfig.isLogMiningBufferTrackUsername()) {
+            columns.add("USERNAME");
+        }
+        if (connectorConfig.isLogMiningBufferTrackClientId()) {
+            columns.add("CLIENT_ID");
+        }
+
+        return String.join(", ", columns) + " ";
     }
 
     /**
@@ -94,7 +151,11 @@ public abstract class AbstractLogMinerQueryBuilder implements LogMinerQueryBuild
      */
     protected String getMultiTenantPredicate() {
         if (!Strings.isNullOrEmpty(connectorConfig.getPdbName())) {
-            return "SRC_CON_NAME = '" + connectorConfig.getPdbName() + "'";
+            String pdbName = connectorConfig.getPdbName();
+            if (pdbName.startsWith("\"") && pdbName.endsWith("\"") && pdbName.length() > 2) {
+                pdbName = pdbName.substring(1, pdbName.length() - 1);
+            }
+            return "SRC_CON_NAME = '" + pdbName + "'";
         }
         return EMPTY;
     }
@@ -111,7 +172,7 @@ public abstract class AbstractLogMinerQueryBuilder implements LogMinerQueryBuild
             //
             // Oracle always stores usernames as upper-case.
             // This predicate build applies upper-case to the provided value lists from the configuration.
-            return IncludeExcludeInClause.builder()
+            final String predicate = IncludeExcludeInClause.builder()
                     .withField("USERNAME")
                     .withFilterMode(LogMiningQueryFilterMode.IN)
                     .withDefaultIncludeValues(Collections.singletonList(UNKNOWN_USERNAME))
@@ -119,6 +180,10 @@ public abstract class AbstractLogMinerQueryBuilder implements LogMinerQueryBuild
                     .withExcludeValues(connectorConfig.getLogMiningUsernameExcludes())
                     .caseInsensitive()
                     .build();
+            if (!predicate.isEmpty() && !connectorConfig.getLogMiningUsernameExcludes().isEmpty()) {
+                return "(" + predicate + " OR USERNAME IS NULL)";
+            }
+            return predicate;
         }
         return EMPTY;
     }
@@ -132,13 +197,17 @@ public abstract class AbstractLogMinerQueryBuilder implements LogMinerQueryBuild
         if (!LogMiningQueryFilterMode.NONE.equals(connectorConfig.getLogMiningQueryFilterMode())) {
             // Only filter client ids when using IN and REGEX modes
             // Client id filters always use an IN-clause predicate
-            return IncludeExcludeInClause.builder()
+            final String predicate = IncludeExcludeInClause.builder()
                     .withField("CLIENT_ID")
                     .withFilterMode(LogMiningQueryFilterMode.IN)
                     .withIncludeValues(connectorConfig.getLogMiningClientIdIncludes())
                     .withExcludeValues(connectorConfig.getLogMiningClientIdExcludes())
                     .caseInsensitive()
                     .build();
+            if (!predicate.isEmpty() && !connectorConfig.getLogMiningClientIdExcludes().isEmpty()) {
+                return "(" + predicate + " OR CLIENT_ID IS NULL)";
+            }
+            return predicate;
         }
         return EMPTY;
     }

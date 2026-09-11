@@ -139,9 +139,9 @@ public class MariaDbAntlrDdlParser extends AntlrDdlParser<MariaDBLexer, MariaDBP
                 new DataTypeResolver.DataTypeEntry(Types.NVARCHAR, MariaDBParser.NATIONAL, MariaDBParser.CHARACTER, MariaDBParser.VARYING)));
 
         dataTypeResolverBuilder.registerDataTypes(MariaDBParser.DimensionDataTypeContext.class.getCanonicalName(), Arrays.asList(
-                new DataTypeResolver.DataTypeEntry(Types.SMALLINT, MariaDBParser.TINYINT)
+                new DataTypeResolver.DataTypeEntry(Types.TINYINT, MariaDBParser.TINYINT)
                         .setSuffixTokens(MariaDBParser.SIGNED, MariaDBParser.UNSIGNED, MariaDBParser.ZEROFILL),
-                new DataTypeResolver.DataTypeEntry(Types.SMALLINT, MariaDBParser.INT1)
+                new DataTypeResolver.DataTypeEntry(Types.TINYINT, MariaDBParser.INT1)
                         .setSuffixTokens(MariaDBParser.SIGNED, MariaDBParser.UNSIGNED, MariaDBParser.ZEROFILL),
                 new DataTypeResolver.DataTypeEntry(Types.SMALLINT, MariaDBParser.SMALLINT)
                         .setSuffixTokens(MariaDBParser.SIGNED, MariaDBParser.UNSIGNED, MariaDBParser.ZEROFILL),
@@ -436,7 +436,7 @@ public class MariaDbAntlrDdlParser extends AntlrDdlParser<MariaDBLexer, MariaDBP
     }
 
     /**
-     * Extracts the enumeration values properly parsed and escaped.
+     * Extracts the enumeration values properly parsed and unescaped.
      *
      * @param enumValues the raw enumeration values from the parsed column definition
      * @return the list of options allowed for the {@code ENUM} or {@code SET}; never null.
@@ -444,15 +444,14 @@ public class MariaDbAntlrDdlParser extends AntlrDdlParser<MariaDBLexer, MariaDBP
     public static List<String> extractEnumAndSetOptions(List<String> enumValues) {
         return enumValues.stream()
                 .map(MariaDbAntlrDdlParser::withoutQuotes)
-                .map(MariaDbAntlrDdlParser::escapeOption)
+                .map(MariaDbAntlrDdlParser::unescapeOption)
                 .collect(Collectors.toList());
     }
 
-    public static String escapeOption(String option) {
-        // Replace comma to backslash followed by comma (this escape sequence implies comma is part of the option)
-        // Replace backlash+single-quote to a single-quote.
+    public static String unescapeOption(String option) {
+        // Replace backslash+single-quote to a single-quote.
         // Replace double single-quote to a single-quote.
-        return option.replaceAll(",", "\\\\,").replaceAll("\\\\'", "'").replace("''", "'");
+        return option.replace("\\'", "'").replace("''", "'");
     }
 
     public Tables.TableFilter getTableFilter() {

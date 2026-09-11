@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterAll;
@@ -40,6 +41,7 @@ import io.debezium.kafka.KafkaClusterUtils;
 import io.debezium.pipeline.signal.channels.KafkaSignalChannel;
 import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnapshotTest;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.relational.mapping.PropagateSourceMetadataToSchemaParameter;
 import io.strimzi.test.container.StrimziKafkaCluster;
 
 public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<PostgresConnector> {
@@ -226,6 +228,39 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
     }
 
     @Test
+    @FixFor("debezium/dbz#683")
+    public void incrementalSnapshotReportsUnqualifiedUserDefinedTypeNames() throws Exception {
+        // Testing.Print.enable();
+
+        // The JDBC driver reports a UDT whose schema is off the search_path with a schema-qualified
+        // type name (e.g. "s1"."mood") during snapshot, whereas streaming uses the unqualified name.
+        // Incremental snapshot must match streaming so converters keyed on the type name work for both.
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.execute(
+                    "CREATE TYPE s1.mood AS ENUM ('happy', 'sad')",
+                    "CREATE DOMAIN s1.positive_int AS integer CHECK (VALUE > 0)",
+                    "CREATE TABLE s1.udt (pk SERIAL, mood s1.mood, amount s1.positive_int, PRIMARY KEY(pk))",
+                    "INSERT INTO s1.udt (mood, amount) VALUES ('happy', 5)");
+        }
+
+        startConnector(x -> x.with(RelationalDatabaseConnectorConfig.PROPAGATE_COLUMN_SOURCE_TYPE, ".*"));
+
+        sendAdHocSnapshotSignal("s1.udt");
+
+        // SNAPSHOT signal, OPEN WINDOW signal, the read record, CLOSE WINDOW signal
+        final SourceRecord record = consumeRecordsByTopic(4).recordsForTopic("test_server.s1.udt").get(0);
+        final Schema afterSchema = record.valueSchema().field("after").schema();
+
+        assertThat(sourceColumnType(afterSchema, "mood")).isEqualTo("MOOD");
+        assertThat(sourceColumnType(afterSchema, "amount")).isEqualTo("POSITIVE_INT");
+    }
+
+    private static String sourceColumnType(Schema afterSchema, String columnName) {
+        return afterSchema.field(columnName).schema().parameters()
+                .get(PropagateSourceMetadataToSchemaParameter.TYPE_NAME_PARAMETER_KEY);
+    }
+
+    @Test
     void inserts4Pks() throws Exception {
         // Testing.Print.enable();
 
@@ -363,6 +398,61 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
                 null);
         for (int i = 0; i < expectedRecordCount; i++) {
             assertThat(dbChanges).contains(entry(i + 1, i));
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2333")
+    public void insertsNumericPkWithSpecialValues() throws Exception {
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.setAutoCommit(false);
+            for (int i = 1; i <= 18; i++) {
+                connection.executeWithoutCommitting(
+                        String.format("INSERT INTO s1.anumeric (pk, aa) VALUES (%d, %d)", i, i));
+            }
+            connection.executeWithoutCommitting(
+                    "INSERT INTO s1.anumeric (pk, aa) VALUES ('-Infinity'::numeric, 100)",
+                    "INSERT INTO s1.anumeric (pk, aa) VALUES ('Infinity'::numeric, 101)",
+                    "INSERT INTO s1.anumeric (pk, aa) VALUES ('NaN'::numeric, 102)");
+            connection.commit();
+        }
+        // String mode keeps the emitted keys JSON-safe: the test harness round-trips every record
+        // through the JSON converter, which cannot represent NaN or the infinities as float64. The
+        // boundary extraction under test is unaffected: chunk reads produce SpecialValueDecimal
+        // regardless of the emission mode.
+        startConnector(x -> x.with(PostgresConnectorConfig.DECIMAL_HANDLING_MODE, "string"));
+
+        sendAdHocSnapshotSignal("s1.anumeric");
+
+        // 21 rows with chunk size 10: the ascending key order is -Infinity, 1..18, Infinity, NaN, so the
+        // second chunk ends exactly on Infinity (bound as the next chunk's lower bound) and NaN is the
+        // maximum key, bound into every chunk query.
+        final int expectedRecordCount = 21;
+        final Map<Integer, Integer> dbChanges = consumeMixedWithIncrementalSnapshot(
+                expectedRecordCount,
+                x -> true,
+                k -> specialAwareKey(k.getString("pk")),
+                record -> ((Struct) record.value()).getStruct("after").getInt32(valueFieldName()),
+                "test_server.s1.anumeric",
+                null);
+        for (int i = 1; i <= 18; i++) {
+            assertThat(dbChanges).contains(entry(i, i));
+        }
+        assertThat(dbChanges).contains(entry(Integer.MIN_VALUE, 100));
+        assertThat(dbChanges).contains(entry(Integer.MAX_VALUE - 1, 101));
+        assertThat(dbChanges).contains(entry(Integer.MAX_VALUE, 102));
+    }
+
+    private int specialAwareKey(String pk) {
+        switch (pk) {
+            case "NAN":
+                return Integer.MAX_VALUE;
+            case "POSITIVE_INFINITY":
+                return Integer.MAX_VALUE - 1;
+            case "NEGATIVE_INFINITY":
+                return Integer.MIN_VALUE;
+            default:
+                return Integer.parseInt(pk);
         }
     }
 
@@ -508,6 +598,39 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
         final var data = records.recordsForTopic(topicName);
         assertThat(data).hasSize(1);
         assertThat(data.get(0).valueSchema().field("gencol")).isNull();
+    }
+
+    @Test
+    @FixFor("DBZ-1329")
+    public void snapshotNewTableWithoutTableIncludeList() throws Exception {
+        // Testing.Print.enable();
+
+        // Populate the default table
+        populateTable();
+        // Start connector without an explicit table.include.list
+        startConnector();
+        waitForConnectorToStart();
+
+        // Create a completely new table at runtime
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.execute("CREATE TABLE s1.tab2 (pk SERIAL, aa integer, PRIMARY KEY(pk));");
+            connection.execute("INSERT INTO s1.tab2 (aa) VALUES (1);");
+        }
+
+        // Trigger incremental snapshot for the new table
+        sendAdHocSnapshotSignal("s1.tab2");
+
+        // Verify the incremental snapshot message is properly generated without throwing NullPointerException
+        final int expectedRecordCount = 1;
+        final Map<Integer, Integer> dbChanges = consumeMixedWithIncrementalSnapshot(
+                expectedRecordCount,
+                x -> true,
+                k -> k.getInt32("pk"),
+                record -> ((Struct) record.value()).getStruct("after").getInt32("aa"),
+                "test_server.s1.tab2",
+                null);
+
+        assertThat(dbChanges).contains(entry(1, 1));
     }
 
     protected void populate4PkTable() throws SQLException {

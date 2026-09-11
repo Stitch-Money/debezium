@@ -12,7 +12,6 @@ import static io.debezium.openlineage.dataset.DatasetMetadata.DatasetKind.OUTPUT
 
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.stream.Collectors;
 
@@ -38,6 +37,7 @@ import io.debezium.openlineage.ConnectorContext;
 import io.debezium.openlineage.DebeziumOpenLineageEmitter;
 import io.debezium.openlineage.dataset.DatasetMetadata;
 import io.debezium.sink.DebeziumSinkRecord;
+import io.debezium.sink.batch.Batch;
 import io.debezium.sink.spi.ChangeEventSink;
 
 final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
@@ -66,8 +66,8 @@ final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
         }
     }
 
-    public Optional<CollectionId> getCollectionId(String collectionName) {
-        return Optional.of(new CollectionId(collectionName));
+    public CollectionId getCollectionId(String collectionName) {
+        return new CollectionId(collectionName);
     }
 
     public void execute(final Collection<SinkRecord> records) {
@@ -172,4 +172,17 @@ final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
                 .toList();
         return new DatasetMetadata(collectionId, OUTPUT, TABLE_DATASET_TYPE, DATABASE, fieldDefinitions);
     }
+
+    @Override
+    public List<Batch> put(Collection<SinkRecord> records) {
+        // NOP for now
+        return List.of();
+    }
+
+    @Override
+    public List<Batch> forcePoll() {
+        // NOP for now
+        return List.of();
+    }
+
 }

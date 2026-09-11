@@ -12,6 +12,7 @@ import static io.debezium.pipeline.notification.IncrementalSnapshotNotificationS
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -341,7 +342,10 @@ public class MongoDbIncrementalSnapshotChangeEventSource
             emitWindowClose(partition, offsetContext);
         }
         catch (Exception e) {
-            throw new DebeziumException(String.format("Database error while executing incremental snapshot for table '%s'", context.currentDataCollectionId()), e);
+            warnAndSkip(partition, offsetContext,
+                    "Error while executing incremental snapshot for collection '%s', skipping and continuing streaming"
+                            .formatted(context.currentDataCollectionId().getId()),
+                    e);
         }
         finally {
             postReadChunk(context);
@@ -349,6 +353,18 @@ public class MongoDbIncrementalSnapshotChangeEventSource
                 postIncrementalSnapshotCompleted();
             }
         }
+    }
+
+    private void warnAndSkip(MongoDbPartition partition, OffsetContext offsetContext, String formattedReason, Throwable t) {
+        if (t != null) {
+            LOGGER.warn(formattedReason, t);
+        }
+        else {
+            LOGGER.warn(formattedReason);
+        }
+        notificationService.incrementalSnapshotNotificationService()
+                .notifyTableScanCompleted(context, partition, offsetContext, totalRowsScanned, UNKNOWN_SCHEMA);
+        nextDataCollection(partition, offsetContext);
     }
 
     private void nextDataCollection(MongoDbPartition partition, OffsetContext offsetContext) {
@@ -699,21 +715,24 @@ public class MongoDbIncrementalSnapshotChangeEventSource
             case STRING:
                 key = documentId.asString().getValue();
                 break;
+            case DATE_TIME:
+                key = new Date(documentId.asDateTime().getValue());
+                break;
             case BINARY:
                 var subtype = documentId.asBinary().getType();
                 if (!BsonBinarySubType.isUuid(subtype)) {
-                    throw new IllegalStateException("Unsupported type of document id");
+                    throw new IllegalStateException("Unsupported binary subtype of document id: " + subtype);
                 }
 
                 if (BsonBinarySubType.UUID_STANDARD.getValue() == subtype) {
                     key = documentId.asBinary().asUuid(UuidRepresentation.STANDARD);
                 }
                 else {
-                    throw new IllegalStateException("Unsupported subtype of UUID document id");
+                    throw new IllegalStateException("Unsupported subtype of UUID document id: " + subtype);
                 }
                 break;
             default:
-                throw new IllegalStateException("Unsupported type of document id");
+                throw new IllegalStateException("Unsupported type of document id: " + documentId.getBsonType());
         }
 
         return new Object[]{ key };

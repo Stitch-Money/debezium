@@ -10,7 +10,7 @@
 
     <groupId>io.debezium</groupId>
     <artifactId>debezium-build-parent</artifactId>
-    <version>3.5.0-SNAPSHOT</version>
+    <version>3.7.0-SNAPSHOT</version>
     <name>Debezium Build Aggregator</name>
     <description>Debezium is an open source change data capture platform</description>
     <packaging>pom</packaging>
@@ -71,6 +71,10 @@
         <maven.compiler.release>${debezium.java.connector.target}</maven.compiler.release>
         <maven.compiler.testRelease>${debezium.java.connector.target}</maven.compiler.testRelease>
 
+        <!-- 'sort' rewrites the contributor files in order, 'check' fails the build if they are
+             not sorted; mirrors format.imports.goal used by impsort-maven-plugin -->
+        <format.names.goal>sort</format.names.goal>
+
         <!-- Minimum JDK version required for building the project -->
         <jdk.min.version>${debezium.java.source}</jdk.min.version>
 
@@ -81,41 +85,46 @@
         <version.enforcer.plugin>3.6.1</version.enforcer.plugin>
 
         <version.maven>3.9.8</version.maven>
-        <version.jar.plugin>3.0.2</version.jar.plugin>
-        <version.source.plugin>3.1.0</version.source.plugin>
-        <version.assembly.plugin>3.1.1</version.assembly.plugin>
+        <version.jar.plugin>3.5.0</version.jar.plugin>
+        <version.source.plugin>3.4.0</version.source.plugin>
+        <version.assembly.plugin>3.8.0</version.assembly.plugin>
         <version.war.plugin>2.5</version.war.plugin>
         <version.google.formatter.plugin>0.4</version.google.formatter.plugin>
-        <version.docker.maven.plugin>0.43.4</version.docker.maven.plugin>
-        <version.central.publishing.plugin>0.7.0</version.central.publishing.plugin>
+        <version.docker.maven.plugin>0.48.1</version.docker.maven.plugin>
+        <version.central.publishing.plugin>0.11.0</version.central.publishing.plugin>
         <version.protoc.maven.plugin>3.8.0</version.protoc.maven.plugin>
-        <version.javadoc.plugin>3.4.0</version.javadoc.plugin>
+        <version.javadoc.plugin>3.12.0</version.javadoc.plugin>
         <version.code.formatter>2.26.0</version.code.formatter>
-        <version.surefire.plugin>3.1.2</version.surefire.plugin>
-        <version.checkstyle.plugin>3.1.1</version.checkstyle.plugin>
+        <version.surefire.plugin>3.5.5</version.surefire.plugin>
+        <version.checkstyle.plugin>3.6.0</version.checkstyle.plugin>
         <version.release.plugin>2.5.3</version.release.plugin>
         <version.impsort>1.12.0</version.impsort>
+        <version.gmavenplus.plugin>4.1.1</version.gmavenplus.plugin>
+        <!-- Groovy runtime for the gmavenplus build script below; keep aligned with version.groovy in debezium-bom -->
+        <version.groovy.runtime>4.0.17</version.groovy.runtime>
         <version.failsafe.plugin>${version.surefire.plugin}</version.failsafe.plugin>
-        <version.checkstyle>10.1</version.checkstyle>
-        <version.revapi.plugin>0.11.5</version.revapi.plugin>
+        <version.checkstyle>13.2.0</version.checkstyle>
+        <version.revapi.plugin>0.15.1</version.revapi.plugin>
         <!-- Should be aligned with the jandex version used in quarkus version quarkus.version.runtime -->
         <version.jandex>3.4.0</version.jandex>
-        <version.revapi-java.plugin>0.21.0</version.revapi-java.plugin>
+        <version.revapi-java.plugin>0.28.4</version.revapi-java.plugin>
         <version.build-helper.plugin>3.6.1</version.build-helper.plugin>
 
         <!-- Kafka and it's dependencies MUST reflect what the Kafka version uses -->
-        <version.kafka>4.1.1</version.kafka>
-        <version.strimzi-test-container>0.112.0</version.strimzi-test-container>
+        <version.kafka>4.3.1</version.kafka>
+        <!--// NOTE: align strimzi-test-container with version.testcontainers below too -->
+        <version.strimzi-test-container>0.115.0</version.strimzi-test-container>
         <!-- NOTE: These two versions are maintained separately due to decoupling jackson and databind for downstream -->
-        <version.jackson>2.19.0</version.jackson>
-        <version.jackson.databind>2.19.0</version.jackson.databind>
+        <version.jackson>2.21.2</version.jackson>
+        <version.jackson.annotations>2.21</version.jackson.annotations>
+        <version.jackson.databind>2.21.2</version.jackson.databind>
         <version.org.slf4j>1.7.36</version.org.slf4j>
         <version.zstd-jni>1.5.6-10</version.zstd-jni>
 
         <!-- Scala version used to build Kafka -->
         <version.kafka.scala>2.13</version.kafka.scala>
 
-        <!-- Kafka no longer needs ZooKeeper and Neetty but it is kept for testing with older Kafka dependencies -->
+        <!-- Kafka no longer needs ZooKeeper and Netty but it is kept for testing with older Kafka dependencies -->
         <version.zookeeper>3.8.4</version.zookeeper>
         <version.netty>4.1.128.Final</version.netty>
 
@@ -124,41 +133,43 @@
         <version.antlr>4.10.1</version.antlr>
         <version.antlr4test.plugin>1.18</version.antlr4test.plugin>
 
-        <!-- Quarkus -->
-        <!-- Version used for Outbox extension development, changes frequently to align with latest Quarkus -->
-        <quarkus.version.extension>3.28.4</quarkus.version.extension>
-
         <!-- Version used in Debezium Server, Operator, etc., usually a LTS version -->
         <!-- Must be aligned with Apicurio version below -->
         <!-- Debezium Server Pravega must use the same Netty version as the one used by Quarkus -->
-        <quarkus.version.runtime>3.27.1</quarkus.version.runtime>
+        <!-- The properties are intentionally separated as Quarkus testing module is not productized -->
+        <quarkus.version.runtime>3.33.2</quarkus.version.runtime>
+        <quarkus.version.test>3.33.2</quarkus.version.test>
 
         <!-- Apicurio -->
-        <version.apicurio>2.6.13.Final</version.apicurio>
+        <version.apicurio>3.2.5</version.apicurio>
+        <!-- hibernate -->
+        <version.hibernate>7.2.19.Final</version.hibernate>
 
         <!-- Database drivers, should align with databases -->
-        <version.postgresql.driver>42.7.7</version.postgresql.driver>
+        <version.postgresql.driver>42.7.13</version.postgresql.driver>
         <version.mysql.driver>9.1.0</version.mysql.driver>
-        <version.mysql.binlog>0.40.3</version.mysql.binlog>
-        <version.mongo.driver>5.5.1</version.mongo.driver>
+        <version.mysql.binlog>0.41.3</version.mysql.binlog>
+        <version.singlestore.driver>1.2.11</version.singlestore.driver>
+        <version.starrocks.driver>1.1.1</version.starrocks.driver>
+        <version.mongo.driver>5.9.2</version.mongo.driver>
         <version.sqlserver.driver>12.4.2.jre8</version.sqlserver.driver>
         <version.db2.driver>11.5.0.0</version.db2.driver>
-        <version.informix.changestream.client>1.1.3</version.informix.changestream.client>
-        <version.informix.driver>4.50.12</version.informix.driver>
+        <version.informix.driver>15.0.1.4</version.informix.driver>
         <version.cassandra.driver>4.14.0</version.cassandra.driver>
         <version.mariadb.driver>3.5.3</version.mariadb.driver>
+        <version.jt400>11.1</version.jt400> <!-- IBM Toolbox for Java (JT400) for Debezium JDBC connector Db2i dialect -->
         <!-- These two should be aligned by major versions but minor could vary -->
         <!-- Oracle publishes the driver versions more frequently than the instant client -->
-        <version.oracle.driver>21.15.0.0</version.oracle.driver>
-        <version.oracle.instantclient>21.15.0.0</version.oracle.instantclient>
+        <version.oracle.driver>23.26.1.0.0</version.oracle.driver>
+        <version.oracle.instantclient>23.26.1.0.0</version.oracle.instantclient>
 
         <!-- Databases, should align with database drivers -->
         <version.mysql.server>8.2</version.mysql.server>
         <version.mysql.percona.server>8.0</version.mysql.percona.server>
-        <version.mongo.server>6.0</version.mongo.server>
+        <version.mongo.server>8.0</version.mongo.server>
         <version.cassandra3>3.11.12</version.cassandra3>
         <version.cassandra4>4.1.7</version.cassandra4>
-        <version.cassandra5>5.0.2</version.cassandra5>
+        <version.cassandra5>5.0.8</version.cassandra5>
 
         <!-- Required in protoc plug-in config, too; can't be in BOM therefore -->
         <version.com.google.protobuf>3.25.5</version.com.google.protobuf>
@@ -166,8 +177,8 @@
         <version.com.google.protobuf.protoc>3.25.5</version.com.google.protobuf.protoc>
 
         <!-- Infinispan version for Oracle and Debezium Server sink -->
-        <version.infinispan>15.2.1.Final</version.infinispan>
-        <version.infinispan.protostream>5.0.13.Final</version.infinispan.protostream>
+        <version.infinispan>16.2.2</version.infinispan>
+        <version.infinispan.protostream>6.0.9</version.infinispan.protostream>
 
         <!-- EhCache Specific Versions -->
         <version.ehcache>3.11.1</version.ehcache>
@@ -178,7 +189,10 @@
         <version.rocketmq>5.2.0</version.rocketmq>
 
         <!-- OpenTelemetry version to use for the attached test agent-->
-        <version.opentelemetry.testing>2.10.0-alpha</version.opentelemetry.testing>
+        <version.opentelemetry.testing>2.24.0-alpha</version.opentelemetry.testing>
+
+        <!-- Advanced statistics -->
+        <version.datadog.sketches>0.8.2</version.datadog.sketches>
 
         <!-- Testing -->
         <opentelemetry.agent.for.testing.artifact.relative.path>io/opentelemetry/javaagent/opentelemetry-agent-for-testing/${version.opentelemetry.testing}/opentelemetry-agent-for-testing-${version.opentelemetry.testing}.jar</opentelemetry.agent.for.testing.artifact.relative.path>
@@ -194,6 +208,7 @@
         <publish.repository.id>central</publish.repository.id>
 
         <version.mockito>5.19.0</version.mockito>
+        <version.testcontainers>2.0.3</version.testcontainers>
     </properties>
 
     <modules>
@@ -202,10 +217,15 @@
         <module>support/checkstyle</module>
         <module>support/ide-configs</module>
         <module>support/revapi</module>
+        <module>support/archunit</module>
+        <module>debezium-util</module>
         <module>debezium-api</module>
+        <module>debezium-config</module>
         <module>debezium-ddl-parser</module>
         <module>debezium-assembly-descriptors</module>
+        <module>debezium-connector-common</module>
         <module>debezium-core</module>
+        <module>debezium-kafka-adapters</module>
         <module>debezium-embedded</module>
         <module>debezium-connector-mysql</module>
         <module>debezium-connector-postgres</module>
@@ -221,6 +241,7 @@
         <module>debezium-scripting</module>
         <module>debezium-testing</module>
         <module>debezium-schema-generator</module>
+        <module>debezium-connect-plugins</module>
         <module>debezium-storage</module>
         <module>debezium-interceptor</module>
         <module>debezium-sink</module>
@@ -360,6 +381,24 @@
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <junit.jupiter.extensions.autodetection.enabled>true</junit.jupiter.extensions.autodetection.enabled>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <junit.jupiter.extensions.autodetection.enabled>true</junit.jupiter.extensions.autodetection.enabled>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-enforcer-plugin</artifactId>
                 <dependencies>
                     <!-- Source code available at https://github.com/mfvitale/service-provider-enforcer-rule -->
@@ -399,6 +438,7 @@
                                         <serviceInterface>org.apache.kafka.connect.storage.Converter</serviceInterface>
                                         <serviceInterface>org.apache.kafka.connect.storage.HeaderConverter</serviceInterface>
                                         <serviceInterface>io.debezium.spi.snapshot.Snapshotter</serviceInterface>
+                                        <serviceInterface>io.debezium.metadata.ComponentMetadataProvider</serviceInterface>
                                     </serviceInterfaces>
                                     <!-- Enforcement strategy: FAIL or WARN -->
                                     <strategy>FAIL</strategy>
@@ -415,6 +455,55 @@
         </plugins>
     </build>
     <profiles>
+        <profile>
+            <!--
+                Keeps COPYRIGHT.txt, Aliases.txt and FilteredNames.txt sorted. These are
+                append-only lists that every contributor adds their name to. Appended names all
+                land on the last line of the file, so two concurrent pull requests always
+                conflict; sorted, they only conflict when the names are alphabetical neighbours.
+
+                Activated by the presence of COPYRIGHT.txt so that it applies to the aggregator
+                only. A plugin declared in build/plugins is pulled into every module's effective
+                pom even with inherited=false, which this avoids.
+            -->
+            <id>sort-contributor-files</id>
+            <activation>
+                <file>
+                    <exists>${basedir}/COPYRIGHT.txt</exists>
+                </file>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.gmavenplus</groupId>
+                        <artifactId>gmavenplus-plugin</artifactId>
+                        <version>${version.gmavenplus.plugin}</version>
+                        <dependencies>
+                            <dependency>
+                                <groupId>org.apache.groovy</groupId>
+                                <artifactId>groovy</artifactId>
+                                <version>${version.groovy.runtime}</version>
+                                <scope>runtime</scope>
+                            </dependency>
+                        </dependencies>
+                        <executions>
+                            <execution>
+                                <id>sort-contributor-files</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>execute</goal>
+                                </goals>
+                                <configuration>
+                                    <scripts>
+                                        <script>${project.basedir}/support/scripts/sort-contributor-files.groovy</script>
+                                    </scripts>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
         <profile>
             <id>qa</id>
             <activation>

@@ -12,6 +12,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -27,7 +28,9 @@ import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode;
 import io.debezium.config.Configuration;
+import io.debezium.connector.SnapshotType;
 import io.debezium.connector.sqlserver.util.TestHelper;
 import io.debezium.doc.FixFor;
 import io.debezium.jdbc.JdbcValueConverters;
@@ -262,7 +265,8 @@ public class SqlServerConnectionIT {
                     new SqlServerValueConverters(JdbcValueConverters.DecimalMode.PRECISE, TemporalPrecisionMode.ADAPTIVE, null),
                     connection.getDefaultValueConverter(),
                     SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                    FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), true);
+                    FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), true,
+                    EventConvertingFailureHandlingMode.WARN);
 
             assertColumnHasNotDefaultValue(table, "int_no_default_not_null");
             assertColumnHasDefaultValue(table, "int_no_default", null, tableSchemaBuilder);
@@ -471,7 +475,8 @@ public class SqlServerConnectionIT {
                     new SqlServerValueConverters(JdbcValueConverters.DecimalMode.PRECISE, TemporalPrecisionMode.ADAPTIVE, null),
                     connection.getDefaultValueConverter(),
                     SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                    FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), true);
+                    FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), true,
+                    EventConvertingFailureHandlingMode.WARN);
 
             assertColumnHasNotDefaultValue(table, "int_no_default_not_null");
             assertColumnHasDefaultValue(table, "int_no_default", null, tableSchemaBuilder);
@@ -566,6 +571,24 @@ public class SqlServerConnectionIT {
     }
 
     @Test
+    @FixFor("DBZ-9336")
+    public void shouldReturnTrueWhenCdcEnabledOnDatabaseButNoTablesTracked() throws Exception {
+        // Setup: create the database (the @BeforeEach drops it, so we must recreate it)
+        try (SqlServerConnection connection = TestHelper.adminConnection()) {
+            connection.connect();
+            connection.execute("CREATE DATABASE " + TestHelper.TEST_DATABASE_1);
+            connection.execute("USE " + TestHelper.TEST_DATABASE_1);
+
+            // 1. Enable CDC at the DATABASE level only — do NOT enable on any table
+            TestHelper.enableDbCdc(connection, TestHelper.TEST_DATABASE_1);
+
+            // 2. This should return TRUE (CDC schema is accessible, user has access)
+            assertThat(connection.checkIfConnectedUserHasAccessToCDCTable(TestHelper.TEST_DATABASE_1))
+                    .isTrue();
+        }
+    }
+
+    @Test
     @FixFor("DBZ-5496")
     public void shouldConnectToASingleDatabase() throws Exception {
         TestHelper.createTestDatabase();
@@ -597,6 +620,134 @@ public class SqlServerConnectionIT {
                     .isInstanceOf(SQLException.class)
                     .hasMessage("The query has timed out.");
         }
+    }
+
+    @Test
+    @FixFor("DBZ-1877")
+    void reconnectShouldRebuildConnectionWithAutoCommitDisabled() throws SQLException {
+        TestHelper.createTestDatabase();
+        try (SqlServerConnection connection = TestHelper.testConnection()) {
+            assertThat(connection.connection().getAutoCommit()).isFalse();
+
+            connection.reconnect();
+
+            assertThat(connection.connection().getAutoCommit()).isFalse();
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1877")
+    void reconnectShouldRecoverAfterServerKillsSession() throws Exception {
+        TestHelper.createTestDatabase();
+        try (SqlServerConnection connection = TestHelper.testConnection()) {
+            connection.connect();
+
+            Connection before = connection.connection();
+            int spid = currentSpid(connection);
+            try (SqlServerConnection admin = TestHelper.adminConnection()) {
+                admin.connect();
+                admin.execute("KILL " + spid);
+            }
+
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> !connection.isValid());
+
+            connection.reconnect();
+
+            assertThat(connection.isValid()).isTrue();
+            assertThat(connection.connection()).isNotSameAs(before);
+            assertThat(connection.connection().getAutoCommit()).isFalse();
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1877")
+    void isValidShouldDistinguishKilledFromHealthyConnections() throws Exception {
+        TestHelper.createTestDatabase();
+        try (SqlServerConnection data = TestHelper.testConnection();
+                SqlServerConnection metadata = TestHelper.testConnection()) {
+            data.connect();
+            metadata.connect();
+
+            int dataSpid = currentSpid(data);
+            try (SqlServerConnection admin = TestHelper.adminConnection()) {
+                admin.connect();
+                admin.execute("KILL " + dataSpid);
+            }
+
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> !data.isValid());
+            assertThat(metadata.isValid()).isTrue();
+
+            data.reconnect();
+
+            assertThat(data.isValid()).isTrue();
+            assertThat(metadata.isValid()).isTrue();
+        }
+    }
+
+    @Test
+    @FixFor("dbz#1942")
+    void shouldValidateLogPosition() throws Exception {
+        try (SqlServerConnection connection = TestHelper.adminConnection()) {
+            connection.connect();
+            connection.execute("CREATE DATABASE testDB1");
+            try {
+                connection.execute("USE testDB1");
+                // NOTE: you cannot enable CDC on master
+                TestHelper.enableDbCdc(connection, "testDB1");
+
+                // create table if exists
+                String sql = "IF EXISTS (select 1 from sys.objects where name = 'testTable' and type = 'u')\n"
+                        + "DROP TABLE testTable\n"
+                        + "CREATE TABLE testTable (ID int not null identity(1, 1) primary key, NUMBER int, TEXT text)";
+                connection.execute(sql);
+
+                // then enable CDC and wrapper functions
+                TestHelper.enableTableCdc(connection, "testTable");
+                // insert some data
+
+                connection.execute("INSERT INTO testTable (NUMBER, TEXT) values (1, 'aaa')");
+
+                // and issue a test call to a CDC wrapper function
+                Thread.sleep(5_000); // Need to wait to make sure the min_lsn is available
+                // Testing.Print.enable();
+
+                Properties configProps = new Properties();
+                configProps.setProperty(SqlServerConnectorConfig.SNAPSHOT_MODE_PROPERTY_NAME, SqlServerConnectorConfig.SnapshotMode.WHEN_NEEDED.getValue());
+                SqlServerConnectorConfig connectorConfig = new SqlServerConnectorConfig(Configuration.from(configProps));
+                boolean directMode = connectorConfig.getDataQueryMode() == SqlServerConnectorConfig.DataQueryMode.DIRECT;
+
+                // Query min LSN
+                final String[] minLsn = { null };
+                connection.query("select min(start_lsn) from [testDB1].cdc.change_tables",
+                        rs -> {
+                            while (rs.next()) {
+                                minLsn[0] = rs.getString(1);
+                                Testing.print("minLsn: " + minLsn[0]);
+                            }
+                        });
+
+                boolean validated = connection.validateLogPosition(
+                        new SqlServerPartition("server1", "testDB1"),
+                        new SqlServerOffsetContext(connectorConfig, TxLogPosition.valueOf(Lsn.valueOf(minLsn[0]), directMode ? -1 : null), SnapshotType.INITIAL, true),
+                        connectorConfig);
+
+                Testing.print("Valid log position: " + validated);
+
+                // The transaction log position must be valid if it is equal to minLsn,
+                assertThat(validated).isTrue();
+                Testing.Print.disable();
+            }
+            finally {
+                TestHelper.dropTestDatabase(connection, "testDB1");
+            }
+        }
+    }
+
+    private static int currentSpid(SqlServerConnection connection) throws SQLException {
+        return connection.queryAndMap("SELECT @@SPID", rs -> {
+            rs.next();
+            return rs.getInt(1);
+        });
     }
 
     private long toMillis(OffsetDateTime datetime) {

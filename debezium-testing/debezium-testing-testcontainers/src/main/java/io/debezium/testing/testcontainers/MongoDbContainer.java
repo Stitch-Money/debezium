@@ -22,11 +22,12 @@ import org.testcontainers.containers.Container;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.shaded.com.fasterxml.jackson.databind.JsonNode;
-import org.testcontainers.shaded.com.fasterxml.jackson.databind.ObjectMapper;
+import org.testcontainers.images.ImagePullPolicy;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.SyncDockerCmd;
@@ -52,8 +53,8 @@ public class MongoDbContainer extends GenericContainer<MongoDbContainer> {
     /**
      * Default should match {@code version.mongo.server} in parent {@code pom.xml}.
      */
-    public static final String IMAGE_VERSION = System.getProperty("version.mongo.server", "6.0");
-    private static final DockerImageName IMAGE_NAME = DockerImageName.parse("mirror.gcr.io/library/mongo:" + IMAGE_VERSION);
+    public static final String IMAGE_VERSION = System.getProperty("version.mongo.server", "8.0");
+    private static final DockerImageName IMAGE_NAME = DockerImageName.parse("quay.io/debezium/official-mongo").withTag(IMAGE_VERSION);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private static final String CONTAINER_KEYFILE_PATH = "/data/replica.key";
@@ -97,6 +98,7 @@ public class MongoDbContainer extends GenericContainer<MongoDbContainer> {
         private Network network = Network.SHARED;
         private boolean skipDockerDesktopLogWarning = false;
         private boolean authEnabled = false;
+        private ImagePullPolicy imagePullPolicy;
         private String typeFlag = null;
         private String configAddress = null;
         private String process = "mongod";
@@ -159,6 +161,11 @@ public class MongoDbContainer extends GenericContainer<MongoDbContainer> {
             return this;
         }
 
+        public Builder withImagePullPolicy(ImagePullPolicy imagePullPolicy) {
+            this.imagePullPolicy = imagePullPolicy;
+            return this;
+        }
+
         public MongoDbContainer build() {
             return new MongoDbContainer(this);
         }
@@ -167,6 +174,9 @@ public class MongoDbContainer extends GenericContainer<MongoDbContainer> {
 
     private MongoDbContainer(Builder builder) {
         super(builder.imageName);
+        if (null != builder.imagePullPolicy) {
+            this.withImagePullPolicy(builder.imagePullPolicy);
+        }
         this.process = builder.process;
         this.typeFlag = builder.typeFlag;
         this.name = builder.name;

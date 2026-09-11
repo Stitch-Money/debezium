@@ -11,9 +11,11 @@ import static io.debezium.connector.postgresql.TestHelper.topicName;
 import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -28,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
@@ -49,10 +52,12 @@ import io.debezium.doc.FixFor;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.junit.SkipWhenDatabaseVersion;
-import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.RelationalDatabaseConnectorConfig.DecimalHandlingMode;
 import io.debezium.spi.converter.CustomConverter;
 import io.debezium.spi.converter.RelationalColumn;
+import io.debezium.time.MicroTimestamp;
+import io.debezium.time.ZonedTime;
+import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.Collect;
 
 /**
@@ -93,6 +98,39 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
                     totalCount.incrementAndGet(), expectedValuesByTopicName.size(),
                     1, 1);
             assertRecordOffsetAndSnapshotSource(record, expected);
+        });
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2025")
+    public void shouldGenerateSnapshotForVarbit1Datatype() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+
+        TestHelper.execute(INSERT_BIN_TYPES_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig());
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        consumer.process(record -> {
+            assertReadRecord(record, schemaAndValuesByTopicName());
+            assertSourceInfo(record);
+            assertRecordOffsetAndSnapshotSource(record, SnapshotRecord.LAST);
+
+            Struct value = (Struct) record.value();
+            Struct after = value.getStruct(Envelope.FieldName.AFTER);
+
+            // Verify bv1 (varbit(1)) field exists and has the correct value and type
+            Boolean varbit1Value = after.getBoolean("bv1");
+            assertNotNull(varbit1Value, "varbit(1) field 'bv1' should not be NULL in snapshot");
+            assertTrue(varbit1Value, "varbit(1) field 'bv1' should be true");
+
+            // Verify bit(1) field works
+            Boolean bit1Value = after.getBoolean("bol");
+            assertNotNull(bit1Value, "bit(1) field 'bol' should not be NULL in snapshot");
+            assertFalse(bit1Value, "bit(1) field 'bol' should be false");
         });
     }
 
@@ -292,8 +330,6 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
     @Test
     void shouldStreamAfterSnapshot() throws Exception {
-
-        LogInterceptor logInterceptor = new LogInterceptor(PostgresStreamingChangeEventSource.class);
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
 
@@ -316,7 +352,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         consumer.await(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS);
         consumer.clear();
 
-        assertThat(logInterceptor.containsMessage("Processing messages")).isTrue();
+        waitForStreamingToStart();
     }
 
     @Test
@@ -617,6 +653,49 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     }
 
     @Test
+    @FixFor("debezium/dbz#2100")
+    public void shouldGenerateSnapshotForTwentyFourHourTimeWithTimeZone() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.execute("CREATE TABLE timetz_boundary_table (pk SERIAL, ttz0 TIME(0) WITH TIME ZONE, ttz6 TIME(6) WITH TIME ZONE, PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO timetz_boundary_table (ttz0, ttz6) VALUES ('23:59:59.999999+00'::TIMETZ, '24:00:00+00'::TIMETZ);");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.timetz_boundary_table"));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.timetz_boundary_table",
+                Arrays.asList(
+                        new SchemaAndValueField("ttz0", ZonedTime.builder().optional().build(), "24:00:00Z"),
+                        new SchemaAndValueField("ttz6", ZonedTime.builder().optional().build(), "24:00:00Z")));
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2100")
+    public void shouldGenerateSnapshotForTwentyFourHourTimeWithTimeZoneArray() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.execute("CREATE TABLE timetz_boundary_array_table (pk SERIAL, ttz TIMETZ[] NOT NULL, PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO timetz_boundary_array_table (ttz) VALUES ("
+                + "ARRAY['23:59:59.999999+00'::TIMETZ(0), '24:00:00+00'::TIMETZ, '00:00:00+00'::TIMETZ, NULL::TIMETZ]);");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.timetz_boundary_array_table"));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.timetz_boundary_array_table",
+                Collections.singletonList(new SchemaAndValueField("ttz",
+                        SchemaBuilder.array(ZonedTime.builder().optional().build()).build(),
+                        Arrays.asList("24:00:00Z", "24:00:00Z", "00:00:00Z", null))));
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
     @FixFor("DBZ-1345")
     public void shouldNotSnapshotMaterializedViews() throws Exception {
         TestHelper.dropAllSchemas();
@@ -688,6 +767,23 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
         final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.cash_table", schemaAndValuesForNullMoneyTypes());
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2100")
+    public void shouldGenerateSnapshotForLargeNegativeMoneyWithoutPrecisionLoss() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute("INSERT INTO cash_table (csh) VALUES ('-92233720368547758.08'::money)");
+
+        buildNoStreamProducer(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.cash_table"));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final List<SchemaAndValueField> expected = Collections.singletonList(new SchemaAndValueField("csh", Decimal.builder(2).optional().build(),
+                new BigDecimal("-92233720368547758.08")));
+        consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.cash_table", expected)));
     }
 
     @Test
@@ -1168,7 +1264,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsBytes() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true));
@@ -1176,7 +1272,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBytes());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table", schemaAndValueForUnknownColumnBytes());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1186,7 +1282,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsBase64() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
@@ -1195,7 +1291,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBase64());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table", schemaAndValueForUnknownColumnBase64());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1205,7 +1301,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsBase64UrlSafe() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
@@ -1214,7 +1310,8 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBase64UrlSafe());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table",
+                schemaAndValueForUnknownColumnBase64UrlSafe());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1224,7 +1321,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsHex() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
@@ -1233,7 +1330,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnHex());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table", schemaAndValueForUnknownColumnHex());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1321,6 +1418,52 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         buildWithStreamProducer(TestHelper.defaultConfig());
         waitForSnapshotToBeCompleted();
         waitForStreamingToStart();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1916")
+    public void shouldSnapshotPre1582TimestampCorrectly() throws Exception {
+        TestHelper.execute("CREATE TABLE pre1582_ts_table (pk SERIAL, "
+                + "ts TIMESTAMP NOT NULL, "
+                + "tstz TIMESTAMPTZ NOT NULL, "
+                + "PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO pre1582_ts_table (ts, tstz) VALUES ("
+                + "'0001-01-31T00:00:00'::TIMESTAMP, "
+                + "'0001-01-31T00:00:00+00'::TIMESTAMPTZ)");
+        TestHelper.execute("INSERT INTO pre1582_ts_table (ts, tstz) VALUES ("
+                + "'1000-06-15T12:30:45.123456'::TIMESTAMP, "
+                + "'1000-06-15T12:30:45.123456+00'::TIMESTAMPTZ)");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.pre1582_ts_table"));
+
+        final TestConsumer consumer = testConsumer(2, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final long expectedTsMicros1 = java.time.LocalDateTime.of(1, 1, 31, 0, 0, 0)
+                .toInstant(java.time.ZoneOffset.UTC).getEpochSecond() * 1_000_000;
+        final String expectedTstz1 = "0001-01-31T00:00:00.000000Z";
+
+        final long expectedTsMicros2 = java.time.LocalDateTime.of(1000, 6, 15, 12, 30, 45, 123456000)
+                .toInstant(java.time.ZoneOffset.UTC).getEpochSecond() * 1_000_000 + 123456;
+        final String expectedTstz2 = "1000-06-15T12:30:45.123456Z";
+
+        final List<SchemaAndValueField> expected1 = Arrays.asList(
+                new SchemaAndValueField("ts", MicroTimestamp.builder().build(), expectedTsMicros1),
+                new SchemaAndValueField("tstz", ZonedTimestamp.builder().build(), expectedTstz1));
+
+        final List<SchemaAndValueField> expected2 = Arrays.asList(
+                new SchemaAndValueField("ts", MicroTimestamp.builder().build(), expectedTsMicros2),
+                new SchemaAndValueField("tstz", ZonedTimestamp.builder().build(), expectedTstz2));
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(2);
+        VerifyRecord.isValidRead(records.get(0), PK_FIELD, 1);
+        assertRecordSchemaAndValues(expected1, records.get(0), Envelope.FieldName.AFTER);
+        VerifyRecord.isValidRead(records.get(1), PK_FIELD, 2);
+        assertRecordSchemaAndValues(expected2, records.get(1), Envelope.FieldName.AFTER);
     }
 
     private void buildNoStreamProducer(Configuration.Builder config) {

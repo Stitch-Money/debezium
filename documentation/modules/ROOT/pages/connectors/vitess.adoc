@@ -10,6 +10,7 @@
 :icons: font
 :source-highlighter: highlight.js
 :connector-name: Vitess
+:supports-skipping-unchanged-events:
 
 toc::[]
 
@@ -261,6 +262,33 @@ The following example shows a data change event with ordered transaction metadat
   }
 }
 ----
+
+[[vitess-connector-generation]]
+=== Connector Generation
+The {prodname} Vitess connector provides a xref:vitess-property-connector-generation[`connector generation`] property that stores the generation number for transaction ordering semantics.
+
+Certain connector configuration changes can affect the way that the connector computes the `transaction-rank` field.
+After you make such a change, you must increment the value of the xref:vitess-property-connector-generation[`vitess.connector.generation`] property.
+Incrementing the connector generation provides the connector with the information that it needs to stream change events to Kafka from different shards in the correct sequence.
+
+For example, when you set xref:vitess-property-transaction-chunk-size[`vitess.transaction.chunk.size.bytes`] to enable transaction chunking, the connector computes `transaction_rank` from the VGTID of the previous transaction, rather than the VGTID of the current transaction.
+This behavior results, because for chunked transactions, VStream behavior sends the final committed VGTID for a transaction only after it commits the final chunk of the transaction.
+Events produced before and after you enable transaction chunking therefore use different mechanisms to compute rank.
+After you enable transaction chunking, the connector uses a different mechanism to compute rank than it does when chunking is disabled.
+If you do not increment the connector epoch, consumers that process events that result from these different ranking mechanisms can incorrectly sequence events.
+
+.How the connector applies a generation change
+
+When the connector starts, it compares the value of the generation that is stored in the offset to the value that is configured in the xref:vitess-property-connector-generation[`vitess.connector.generation`] property.
+If the generation values differ, whether the value of the configured generation is higher or lower than the stored value, the connector increments the `transaction_epoch` for all shards by one before it begins streaming.
+When you increment the transaction epoch after a configuration change, events that the connector emits afterward are associated with a later epoch than those emitted before the change.
+The epoch acts as a boundary marker that signals a shift in the connector configuration, enabling  downstream event processing frameworks to reliably distinguish between change events that occur across the transition boundary.
+Because epoch is the primary sort key in the xref:vitess-ordered-transaction-metadata[ordered transaction metadata] comparison logic, consumers can correctly identify post-change events as newer regardless of their `transaction_rank` value.
+
+Increment `vitess.connector.generation` whenever you make any of the following configuration changes that affect transaction ordering semantics:
+
+* Enabling or disabling transaction chunking  (`vitess.transaction.chunk.size.bytes`).
+* Any other change that alters how `transaction_rank` is computed.
 
 [[vitess-efficient-transaction-metadata]]
 === Efficient Transaction Metadata
@@ -1108,7 +1136,8 @@ a|_n/a_
 [id="vitess-temporal-types"]
 === Temporal types
 
-Excluding the `TIMESTAMP` data type, Vitess temporal types depend on the value of the xref:vitess-property-time-precision-mode[`time.precision.mode`] connector configuration property.
+Vitess temporal types depend on the value of the xref:vitess-property-time-precision-mode[`time.precision.mode`] connector configuration property.
+The `TIMESTAMP` data type is an exception: it is always represented as `io.debezium.time.ZonedTimestamp`, unless `time.precision.mode` is set to `connect`.
 
 .Temporal values without time zones
 The `DATETIME` type represents a local date and time such as "2018-01-13 09:48:27".
@@ -1191,12 +1220,20 @@ Represents the time value in microseconds since midnight and does not include ti
 a|`org.apache.kafka.connect.data.Timestamp` +
 Represents the number of milliseconds elapsed since the UNIX epoch, and does not include time zone information.
 
+|`TIMESTAMP[(M)]`
+|`INT64`
+a|`org.apache.kafka.connect.data.Timestamp` +
+Represents the number of milliseconds elapsed since the UNIX epoch.
+MySQL converts `TIMESTAMP` values to UTC when they are written.
+
 |===
 
 time.precision.mode=isostring::
-The Vitess connector uses string representations for all temporal types.
+The Vitess connector represents date, time, and datetime values as plain strings.
 +
-.Mappings when `time.precision.mode=connect`
+NOTE: Unlike other connectors, the Vitess connector passes the raw source string through unchanged, without converting to UTC or normalizing to ISO 8601 format. For example, a `DATETIME` value is emitted as `2019-07-09 02:28:57` (space-separated, no `T`, no `Z`). There is no semantic schema name assigned.
++
+.Mappings when `time.precision.mode=isostring`
 [cols="25%a,20%a,55%a",options="header",subs="+attributes"]
 |===
 |Vitess data type |Literal type |Semantic type
@@ -1212,6 +1249,112 @@ The Vitess connector uses string representations for all temporal types.
 |`DATETIME[(M)]`
 |`STRING`
 |n/a
+
+|===
+
+time.precision.mode=microseconds::
+The Vitess connector maps all temporal values to microsecond-precision integers.
+All `DATE` values are represented as the number of days since the epoch, and all `TIME` and `DATETIME` values are represented as the number of microseconds since the epoch or since midnight.
++
+.Mappings when `time.precision.mode=microseconds`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|Vitess data type |Literal type |Semantic type
+
+|`DATE`
+|`INT32`
+a|`io.debezium.time.Date` +
+Represents the number of days since the epoch.
+
+|`TIME[(M)]`
+|`INT64`
+a|`io.debezium.time.MicroTime` +
+Represents the time value in microseconds since midnight and does not include time zone information.
+MySQL allows `M` to be in the range of `0-6`.
+
+|`DATETIME[(M)]`
+|`INT64`
+a|`io.debezium.time.MicroTimestamp` +
+Represents the number of microseconds since the epoch and does not include time zone information.
+
+|`TIMESTAMP[(M)]`
+|`STRING`
+a|`io.debezium.time.ZonedTimestamp` +
+Represents the timestamp with time zone information.
+
+|===
+
+time.precision.mode=nanoseconds::
+The Vitess connector maps all temporal values to nanosecond-precision integers.
+All `DATE` values are represented as the number of days since the epoch, and all `TIME` and `DATETIME` values are represented as the number of nanoseconds since the epoch or since midnight.
++
+NOTE: Vitess `DATETIME` and `TIME` columns are limited to microsecond precision (`DATETIME(0-6)`, `TIME(0-6)`), so `nanoseconds` does not provide additional precision beyond what `microseconds` already offers.
++
+[IMPORTANT]
+====
+Nanoseconds since the Unix epoch are stored in a signed `INT64`, restricting the representable range to approximately *`1677-09-21T00:12:43Z` to `2262-04-11T23:47:16Z`*.
+Values outside this range, for example a `9999-12-31` end-of-time sentinel, cannot be represented and cause the connector to throw an `IllegalArgumentException` from the value converter.
+The exception is handled according to the `event.converting.failure.handling.mode` configuration: with `warn` (the default) or `skip`, the affected column value is emitted as `null` and the failure is logged; with `fail`, the connector stops.
+Use `time.precision.mode=microseconds` (or `isostring`) to avoid the limitation.
+====
++
+.Mappings when `time.precision.mode=nanoseconds`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|Vitess data type |Literal type |Semantic type
+
+|`DATE`
+|`INT32`
+a|`io.debezium.time.Date` +
+Represents the number of days since the epoch.
+
+|`TIME[(M)]`
+|`INT64`
+a|`io.debezium.time.NanoTime` +
+Represents the time value in nanoseconds since midnight and does not include time zone information.
+MySQL allows `M` to be in the range of `0-6`.
+
+|`DATETIME[(M)]`
+|`INT64`
+a|`io.debezium.time.NanoTimestamp` +
+Represents the number of nanoseconds since the epoch and does not include time zone information.
+
+|`TIMESTAMP[(M)]`
+|`STRING`
+a|`io.debezium.time.ZonedTimestamp` +
+Represents the timestamp with time zone information.
+
+|===
+
+time.precision.mode=structured::
+The Vitess connector represents temporal values as Kafka Connect structs with separate calendar and clock components.
+This mode can preserve zero and invalid temporal components without converting them to epoch-based numeric values.
+Structured temporal values that have fractional seconds include an optional `precision` field that records the source column's fractional second precision.
++
+.Mappings when `time.precision.mode=structured`
+[cols="25%a,20%a,55%a",options="header",subs="+attributes"]
+|===
+|Vitess data type |Literal type |Semantic type
+
+|`DATE`
+|`STRUCT`
+a|`io.debezium.time.StructuredDate` +
+Contains `year`, `month`, and `day` fields.
+
+|`TIME[(M)]`
+|`STRUCT`
+a|`io.debezium.time.StructuredTime` +
+Contains `hour`, `minute`, `second`, `nanos`, and optional `precision` fields.
+
+|`DATETIME[(M)]`
+|`STRUCT`
+a|`io.debezium.time.StructuredTimestamp` +
+Contains `year`, `month`, `day`, `hour`, `minute`, `second`, `nanos`, and optional `precision` fields.
+
+|`TIMESTAMP[(M)]`
+|`STRUCT`
+a|`io.debezium.time.StructuredZonedTimestamp` +
+Contains calendar and clock component fields, `offsetSeconds`, optional `zoneId`, and optional `precision`.
 
 |===
 
@@ -1659,9 +1802,6 @@ Set the property to one of the following values:
 `initial`::
 When the connector starts, if it does not detect a value in its offsets topic, it performs a snapshot of the database.
 
-`never`::
-When the connector starts, it skips the snapshot process and immediately begins to stream change events for operations that the database records to the binary logs.
-
 |[[vitess-property-snapshot-include-collection-list]]<<vitess-property-snapshot-include-collection-list,`+snapshot.include.collection.list+`>>
 |none
 |An optional, comma-separated list of regular expressions that match the fully-qualified names of tables to include in the snapshot when using VStream Copy. +
@@ -1775,6 +1915,11 @@ For example, if you set `max.queue.size=1000`, and `max.queue.size.in.bytes=5000
 |[[vitess-property-poll-interval-ms]]<<vitess-property-poll-interval-ms, `+poll.interval.ms+`>>
 |`500`
 |Positive integer value that specifies the number of milliseconds the connector should wait for new change events to appear before it starts processing a batch of events. Defaults to 500 milliseconds, or 0.5 second.
+If a value greater than 5000 milliseconds (5 seconds) is provided, the effective wait time will be capped at 5000 milliseconds.
+
+|[[vitess-property-poll-dispatch-interval-ms]]<<vitess-property-poll-dispatch-interval-ms, `+poll.dispatch.interval.ms+`>>
+|`0`
+|An integer value that specifies the number of milliseconds the connector should accumulate events in the queue before each queue consumption.
 
 |[[vitess-property-skipped-operations]]<<vitess-property-skipped-operations, `+skipped.operations+`>>
 |`t`
@@ -1789,6 +1934,26 @@ You can configure the connector to skip the following types of operations:
 Because the {prodname} Vitess connector never emits `truncate` events to data change topics, setting the default `t` option has the same effect as setting the property to `none`.
 That is, the connector streams all `insert`, `update`, and `delete` operations.
 
+|[[vitess-property-statistics-metrics-enabled]]<<vitess-property-statistics-metrics-enabled, `+statistics.metrics.enabled+`>>
+|`true`
+|Specifies whether the connector collects advanced statistical metrics for streaming metrics, such as quantiles.
+When set to `true`, the connector collects the following statistics:
+
+* Minimum value
+* Maximum value
+* Average value
+* P50 (median) percentile
+* P95 percentile
+* P99 percentile
+
+NOTE: Currently only `MilliSecondsBehindSource` metric supports collecting quantiles.
+
+The statistics are computed using a probabilistic data structure (DDSketch) that provides approximate quantile values with 1% relative accuracy.
+When set to `false`, the connector does not collect quantiles, and the quantile JMX metrics return `null` values.
+The connector continues to collect minimum, maximum, and average values.
+Disabling quantile collection reduces memory overhead slightly.
+For more information, see xref:vitess-streaming-metrics[Streaming metrics].
+
 |[[vitess-property-provide-transaction-metadata]]<<vitess-property-provide-transaction-metadata, `provide.transaction.metadata`>>
 |`false`
 |Determines whether the connector generates events with transaction boundaries and enriches change event envelopes with transaction metadata. Specify `true` if you want the connector to do this. See xref:vitess-transaction-metadata[Transaction metadata] for details.
@@ -1798,6 +1963,15 @@ That is, the connector streams all `insert`, `update`, and `delete` operations.
 |Determines the class that the connector uses to track transaction context and build the data structures and schemas to represent transactions.
 `io.debezium.connector.vitess.pipeline.txmetadata.VitessOrderedTransactionMetadataFactory` provides additional transaction metadata that can help consumers to interpret the correct order of two events, regardless of the order in which they are consumed.
 For more information, see xref:vitess-ordered-transaction-metadata[Ordered transaction metadata].
+
+|[[vitess-property-connector-generation]]<<vitess-property-connector-generation, `+vitess.connector.generation+`>>
+|`0`
+|The generation number for transaction ordering semantics.
+When the connector starts, it compares this value against the generation stored in the Kafka Connect offset.
+If the values differ, the connector increments the `transaction_epoch` for all shards before streaming begins.
+Increment this value after you make configuration changes that affect how `transaction_rank` is computed, such as enabling or disabling transaction chunking.
+This property takes effect only when `transaction.metadata.factory` is set to `io.debezium.connector.vitess.pipeline.txmetadata.VitessOrderedTransactionMetadataFactory`.
+For more information, see xref:vitess-connector-generation[Connector Generation].
 
 |[[vitess-property-keepalive-interval-ms]]<<vitess-property-keepalive-interval-ms, `+vitess.keepalive.interval.ms+`>>
 |`Long.MAX_VALUE`
@@ -1870,6 +2044,27 @@ For example, if the topic prefix is `fulfillment`, the default topic name is `fu
 |[[vitess-property-custom-metric-tags]]<<vitess-property-custom-metric-tags, `custom.metric.tags`>>
 |`No default`
 |The custom metric tags will accept key-value pairs to customize the MBean object name which should be appended the end of regular name, each key would represent a tag for the MBean object name, and the corresponding value would be the value of that tag the key is. For example: `k1=v1,k2=v2`.
+
+|[[vitess-property-custom-sanitize-pattern]]<<vitess-property-custom-sanitize-pattern, `custom.sanitize.pattern`>>
+|`.*secret$\|.*password$\|.*sasl\.jaas\.config$\|.*basic\.auth\.user\.info$\|.*registry\.auth\.client-secret`
+|An optional regular expression that specifies a custom pattern for masking sensitive configuration keys.
+
+By default, {prodname} masks the value of configuration keys that match a predefined pattern for commonly known sensitive properties such as passwords and authentication tokens.
+To customize the way that the connector masks configuration key values, set this property to a regular expression that matches specific configuration key values that you want to mask.
+
+For example, to mask keys the contain the strings `api.key` or `token`, set this property to the following value:
+
+----
+"custom.sanitize.pattern": ".*api\\.key.*\\|.*token.*"
+----
+
+If you set this property for the connector, {prodname} masks any matching instances of configuration key values that it returns for display, logging, or in response to API calls.
+A string of asterisks replaces the original values, for example,  `pass:[********]`.
+
+[IMPORTANT]
+====
+The pattern that you specify for the `custom.sanitize.pattern` property overrides the default {prodname} masking pattern; the specified value does not extend or augment the default pattern.
+====
 
 |[[vitess-property-errors-max-retires]]<<vitess-property-errors-max-retires, `errors.max.retries`>>
 |`-1`

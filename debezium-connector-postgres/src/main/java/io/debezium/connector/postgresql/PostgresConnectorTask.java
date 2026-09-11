@@ -9,11 +9,14 @@ package io.debezium.connector.postgresql;
 import java.nio.charset.Charset;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.clients.producer.RecordMetadata;
@@ -24,12 +27,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.bean.StandardBeanNames;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
-import io.debezium.connector.base.DefaultQueueProvider;
+import io.debezium.connector.base.QueueProviderService;
 import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.common.DebeziumHeaderProducer;
@@ -106,12 +110,19 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
         final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
 
         final Charset databaseCharset;
+        final Set<String> typeRegistrySchemaFilter;
         try (PostgresConnection tempConnection = new PostgresConnection(connectorConfig.getJdbcConfig(), PostgresConnection.CONNECTION_GENERAL)) {
             databaseCharset = tempConnection.getDatabaseCharset();
+            typeRegistrySchemaFilter = buildTypeRegistrySchemaFilter(connectorConfig, tempConnection);
         }
         catch (DebeziumException e) {
+            if (PostgresErrorHandler.isPermanentError(e)) {
+                throw new ConnectException("Non-retriable failure obtaining database encoding; failing task.", e);
+            }
             throw new RetriableException("Couldn't obtain encoding for database", e);
         }
+
+        final TypeRegistry sharedTypeRegistry = PostgresConnection.createTypeRegistry(connectorConfig.getJdbcConfig(), typeRegistrySchemaFilter);
 
         final PostgresValueConverterBuilder valueConverterBuilder = (typeRegistry) -> PostgresValueConverter.of(
                 connectorConfig,
@@ -119,7 +130,7 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
                 typeRegistry);
 
         MainConnectionProvidingConnectionFactory<PostgresConnection> connectionFactory = new DefaultMainConnectionProvidingConnectionFactory<>(
-                () -> new PostgresConnection(connectorConfig.getJdbcConfig(), valueConverterBuilder, PostgresConnection.CONNECTION_GENERAL));
+                () -> new PostgresConnection(connectorConfig.getJdbcConfig(), sharedTypeRegistry, valueConverterBuilder, PostgresConnection.CONNECTION_GENERAL));
         // Global JDBC connection used both for snapshotting and streaming.
         // Must be able to resolve datatypes.
         jdbcConnection = connectionFactory.mainConnection();
@@ -142,10 +153,9 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
         schema = new PostgresSchema(taskContext, defaultValueConverter, topicNamingStrategy, valueConverter, customConverterRegistry);
         this.partitionProvider = new PostgresPartition.Provider(connectorConfig, config);
         this.offsetContextLoader = new PostgresOffsetContext.Loader(connectorConfig);
-        final Offsets<PostgresPartition, PostgresOffsetContext> previousOffsets = getPreviousOffsets(
+        final Offsets<PostgresPartition, PostgresOffsetContext> previousOffsets = getSinglePartitionPreviousOffsets(
                 this.partitionProvider, this.offsetContextLoader);
         final Clock clock = Clock.system();
-        final PostgresOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
 
         // Manual Bean Registration
         beanRegistryJdbcConnection = connectionFactory.newConnection();
@@ -181,13 +191,6 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
 
         LoggingContext.PreviousContext previousContext = taskContext.configureLoggingContext(CONTEXT_NAME);
 
-        if (previousOffset == null) {
-            LOGGER.info("No previous offset found");
-        }
-        else {
-            LOGGER.info("Found previous offset {}", previousOffset);
-        }
-
         try {
             SlotState slotInfo = getSlotState(connectorConfig);
 
@@ -202,10 +205,11 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
 
             this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                     .pollInterval(connectorConfig.getPollInterval())
+                    .pollDispatchInterval(connectorConfig.getPollDispatchInterval())
                     .maxBatchSize(connectorConfig.getMaxBatchSize())
                     .maxQueueSize(connectorConfig.getMaxQueueSize())
                     .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
-                    .queueProvider(new DefaultQueueProvider<>(connectorConfig.getMaxQueueSize()))
+                    .queueProvider(connectorConfig.getServiceRegistry().tryGetService(QueueProviderService.class).getQueueProvider())
                     .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                     .build();
 
@@ -233,6 +237,13 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
                             () -> new PostgresConnection(connectorConfig.getJdbcConfig(), PostgresConnection.CONNECTION_GENERAL),
                             exception -> {
                                 String sqlErrorId = exception.getSQLState();
+                                if (sqlErrorId == null) {
+                                    // The driver reported no SQL state, which typically indicates a
+                                    // connection-level failure rather than an error response from the
+                                    // server. There is nothing to classify; leave it to the caller to
+                                    // log the exception.
+                                    return;
+                                }
                                 switch (sqlErrorId) {
                                     case "57P01":
                                         // Postgres error admin_shutdown, see https://www.postgresql.org/docs/12/errcodes-appendix.html
@@ -331,7 +342,7 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
             slotInfo = jdbcConnection.getReplicationSlotState(connectorConfig.slotName(), connectorConfig.plugin().getPostgresPluginName());
         }
         catch (SQLException e) {
-            LOGGER.warn("unable to load info of replication slot, Debezium will try to create the slot");
+            LOGGER.warn("unable to load info of replication slot, Debezium will try to create the slot", e);
         }
         return slotInfo;
     }
@@ -394,11 +405,7 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
 
     @Override
     public List<SourceRecord> doPoll() throws InterruptedException {
-        final List<DataChangeEvent> records = queue.poll();
-
-        return records.stream()
-                .map(DataChangeEvent::getRecord)
-                .collect(Collectors.toList());
+        return pollRecords(queue);
     }
 
     @Override
@@ -436,6 +443,10 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
 
         if (schema != null) {
             schema.close();
+        }
+
+        if (queue != null) {
+            queue.close();
         }
     }
 
@@ -519,5 +530,64 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
                 LOGGER.warn("WAL_LEVEL check failed but this is ignored as CDC was not requested");
             }
         }
+    }
+
+    /**
+     * Builds the set of schema names to pre-load into {@link TypeRegistry} by querying
+     * {@code pg_catalog.pg_namespace} and applying the connector's
+     * {@code schema.include.list} / {@code schema.exclude.list} predicate.
+     * System schemas are excluded because {@link TypeRegistry} always includes them unconditionally.
+     * <p>
+     * When neither list is configured the method returns an empty set immediately, which causes
+     * {@link TypeRegistry} to use its cheaper unfiltered SQL path.
+     *
+     * @param config     the connector configuration (provides the schema filter predicate)
+     * @param connection an open {@link PostgresConnection} used to query {@code pg_catalog.pg_namespace}
+     * @return a possibly-empty set of schema names to pre-load types from; empty means "all schemas"
+     */
+    @VisibleForTesting
+    static Set<String> buildTypeRegistrySchemaFilter(PostgresConnectorConfig config, PostgresConnection connection) {
+        final String includeList = config.schemaIncludeList();
+        final String excludeList = config.schemaExcludeList();
+        if ((includeList == null || includeList.isBlank()) && (excludeList == null || excludeList.isBlank())) {
+            // No filter configured — TypeRegistry will load all schemas via the cheaper unfiltered SQL path.
+            return Collections.emptySet();
+        }
+
+        final Set<String> allSchemas = new HashSet<>();
+        try {
+            connection.query(
+                    "SELECT nspname FROM pg_catalog.pg_namespace" +
+                            " WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema'",
+                    rs -> {
+                        while (rs.next()) {
+                            allSchemas.add(rs.getString(1));
+                        }
+                    });
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Could not query pg_namespace to build TypeRegistry schema filter; " +
+                    "falling back to loading all schemas", e);
+            return Collections.emptySet();
+        }
+        return buildTypeRegistrySchemaFilter(config.getTableFilters().schemaFilter(), allSchemas);
+    }
+
+    /**
+     * Filters {@code candidateSchemas} through {@code schemaFilter} and returns the matching names.
+     *
+     * @param schemaFilter     predicate built from {@code schema.include.list} / {@code schema.exclude.list}
+     * @param candidateSchemas non-system schema names retrieved from {@code pg_catalog.pg_namespace}
+     * @return an unmodifiable set of schema names accepted by the predicate
+     */
+    @VisibleForTesting
+    static Set<String> buildTypeRegistrySchemaFilter(Predicate<String> schemaFilter, Set<String> candidateSchemas) {
+        final Set<String> result = candidateSchemas.stream()
+                .filter(schemaFilter)
+                .collect(Collectors.toSet());
+        if (!result.isEmpty()) {
+            LOGGER.info("TypeRegistry will pre-load types from schemas: {}", result);
+        }
+        return Collections.unmodifiableSet(result);
     }
 }

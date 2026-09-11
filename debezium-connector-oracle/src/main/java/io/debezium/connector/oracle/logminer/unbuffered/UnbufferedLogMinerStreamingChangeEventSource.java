@@ -22,11 +22,11 @@ import io.debezium.DebeziumException;
 import io.debezium.common.annotation.Incubating;
 import io.debezium.config.Configuration;
 import io.debezium.connector.oracle.CommitScn;
-import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
 import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.Scn;
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogMinerChangeRecordEmitter;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
@@ -36,7 +36,6 @@ import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.logminer.events.RedoSqlDmlEvent;
-import io.debezium.connector.oracle.logminer.events.TruncateEvent;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntry;
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.ErrorHandler;
@@ -71,14 +70,14 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
     private Scn lastCommitScn = Scn.NULL;
 
     public UnbufferedLogMinerStreamingChangeEventSource(OracleConnectorConfig connectorConfig,
-                                                        OracleConnection jdbcConnection,
+                                                        OracleConnectionFactory connectionFactory,
                                                         EventDispatcher<OraclePartition, TableId> dispatcher,
                                                         ErrorHandler errorHandler,
                                                         Clock clock,
                                                         OracleDatabaseSchema schema,
                                                         Configuration jdbcConfig,
                                                         LogMinerStreamingChangeEventSourceMetrics metrics) {
-        super(connectorConfig, jdbcConnection, dispatcher, errorHandler, clock, schema, jdbcConfig, metrics);
+        super(connectorConfig, connectionFactory, dispatcher, errorHandler, clock, schema, jdbcConfig, metrics);
         this.miningQuery = new UnbufferedLogMinerQueryBuilder(connectorConfig).getQuery();
         this.includeSql = connectorConfig.isLogMiningIncludeRedoSql();
         this.accumulator = new TransactionCommitConsumer(this::dispatchEvent, connectorConfig, schema);
@@ -100,7 +99,10 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
         Stopwatch watch = Stopwatch.accumulating().start();
         int miningStartAttempts = 1;
 
-        prepareLogsForMining(false, minLogScn);
+        boolean needsNewSession = true; // first session always starts a new session
+        boolean dictionaryWritten = false; // tracks if data dictionary is written to logs
+        boolean sessionActive = false;
+        boolean needsConnectionRestart = false;
 
         while (getContext().isRunning()) {
 
@@ -112,40 +114,57 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
             }
 
             final Instant batchStartTime = Instant.now();
-
             updateDatabaseTimeDifference();
 
             // This avoids the AtomicReference for each event as this value isn't updated
             // except once per iteration.
             databaseOffset = getMetrics().getDatabaseOffset();
 
-            minLogScn = computeResumeScnAndUpdateOffsets(minLogScn, minCommitScn);
+            if (sessionActive && !needsNewSession) {
+                boolean timeout = isMiningSessionRestartRequired(watch);
+                boolean logSwitch = !timeout && checkLogSwitchOccurredAndUpdate();
+                if (timeout || logSwitch) {
+                    endMiningSession();
+                    sessionActive = false;
+                    needsNewSession = true;
+                    dictionaryWritten = false;
+                    needsConnectionRestart = getConfig().isLogMiningRestartConnection();
+                    watch = Stopwatch.accumulating().start();
+                }
+            }
 
-            getMetrics().setOffsetScn(minLogScn);
+            if (needsNewSession && isUsingCatalogInRedoStrategy() && !dictionaryWritten) {
+                getLogMinerContext().writeDataDictionaryToRedoLogs();
+                dictionaryWritten = true;
+            }
 
             Scn currentScn = getCurrentScn();
             getMetrics().setCurrentScn(currentScn);
 
-            upperBoundsScn = calculateUpperBounds(minLogScn, upperBoundsScn, currentScn);
+            upperBoundsScn = calculateUpperBounds(minLogScn, currentScn);
             if (upperBoundsScn.isNull()) {
                 LOGGER.debug("Delaying mining transaction logs by one iteration");
                 pauseBetweenMiningSessions();
                 continue;
             }
 
-            if (isMiningSessionRestartRequired(watch) || checkLogSwitchOccurredAndUpdate()) {
-                // Mining session is active, so end the current session and restart if necessary
+            upperBoundsScn = collectLogsAndFinalUpperBoundary(minLogScn, upperBoundsScn);
+            if (!needsNewSession && hasSessionLogFilesChanged()) {
                 endMiningSession();
+                needsNewSession = true;
+            }
 
-                // Mining session reached max time or the log switch occurred
-                if (getConfig().isLogMiningRestartConnection()) {
+            minLogScn = computeResumeScnAndUpdateOffsets(minLogScn, minCommitScn);
+            getMetrics().setOffsetScn(minLogScn);
+
+            if (needsNewSession) {
+                if (needsConnectionRestart) {
                     prepareJdbcConnection(true);
+                    needsConnectionRestart = false;
                 }
-
-                prepareLogsForMining(true, minLogScn);
-
-                // Recreate the stop watch
-                watch = Stopwatch.accumulating().start();
+                applyLogsToSession();
+                needsNewSession = false;
+                sessionActive = true;
             }
 
             if (startMiningSession(minLogScn, Scn.NULL, miningStartAttempts)) {
@@ -194,7 +213,7 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
     @Override
     protected void enqueueEvent(LogMinerEventRow event, LogMinerEvent dispatchedEvent) throws InterruptedException {
         getMetrics().calculateLagFromSource(event.getChangeTime());
-        accumulator.accept(dispatchedEvent);
+        accumulator.accept(dispatchedEvent, false, event.getTransactionId(), event.getTransactionSequence());
     }
 
     @Override
@@ -233,12 +252,12 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
     }
 
     private PreparedStatement createQueryStatement() throws SQLException {
-        final PreparedStatement statement = getConnection().connection()
+        final PreparedStatement statement = getStreamingConnection().connection()
                 .prepareStatement(miningQuery,
                         ResultSet.TYPE_FORWARD_ONLY,
                         ResultSet.CONCUR_READ_ONLY,
                         ResultSet.HOLD_CURSORS_OVER_COMMIT);
-        statement.setQueryTimeout((int) getConnection().config().getQueryTimeout().toSeconds());
+        statement.setQueryTimeout((int) getStreamingConnection().config().getQueryTimeout().toSeconds());
         return statement;
     }
 
@@ -299,6 +318,9 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
 
     @Override
     protected boolean isEventSkipped(LogMinerEventRow event) {
+        if (super.isEventSkipped(event)) {
+            return true;
+        }
         return skipCurrentTransaction || isEventIncludedInSnapshot(event) || isNonSchemaChangeEventSkipped(event);
     }
 
@@ -503,58 +525,31 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
      *
      * @param event the event to be dispatched, never {@code null}
      * @param eventIndex the event's index in the transaction
+     * @param eventTrxId the event's transaction identifier
+     * @param eventTrxSeq the event's transaction sequence
      * @param eventsProcessed the number of events dispatched thus far
      * @throws InterruptedException if the thread is interrupted
      */
-    protected void dispatchEvent(LogMinerEvent event, long eventIndex, long eventsProcessed) throws InterruptedException {
+    protected void dispatchEvent(LogMinerEvent event, long eventIndex, String eventTrxId, long eventTrxSeq, long eventsProcessed) throws InterruptedException {
         // NOTE:
         // When using the unbuffered mode, we rely on the LogMinerEvent's TransactionSequence value, which is
         // guaranteed to have the right value rather than using the synthetic eventIndex Debezium generates.
         // This makes sure that if the connector configuration is changed, such as a table added or removed
         // from the include list, the sequence is unaffected and the restart position is always the same.
 
-        if (event instanceof TruncateEvent truncateEvent) {
-            final int databaseOffsetSeconds = databaseOffset.getTotalSeconds();
-
-            getMetrics().calculateLagFromSource(truncateEvent.getChangeTime());
-
-            // Set per-event details
-            getOffsetContext().setEventScn(truncateEvent.getScn());
-            getOffsetContext().setTransactionId(truncateEvent.getTransactionId());
-            getOffsetContext().setTransactionSequence(truncateEvent.getTransactionSequence());
-            getOffsetContext().setSourceTime(truncateEvent.getChangeTime().minusSeconds(databaseOffsetSeconds));
-            getOffsetContext().setTableId(truncateEvent.getTableId());
-            getOffsetContext().setRsId(truncateEvent.getRsId());
-            getOffsetContext().setRowId(truncateEvent.getRowId());
-
-            getEventDispatcher().dispatchDataChangeEvent(
-                    getPartition(),
-                    truncateEvent.getTableId(),
-                    new LogMinerChangeRecordEmitter(
-                            getConfig(),
-                            getPartition(),
-                            getOffsetContext(),
-                            Envelope.Operation.TRUNCATE,
-                            truncateEvent.getDmlEntry().getOldValues(),
-                            truncateEvent.getDmlEntry().getNewValues(),
-                            getSchema().tableFor(truncateEvent.getTableId()),
-                            getSchema(),
-                            Clock.system()));
-
-        }
-        else if (event instanceof DmlEvent dmlEvent) {
+        if (event instanceof DmlEvent dmlEvent) {
             final int databaseOffsetSeconds = databaseOffset.getTotalSeconds();
 
             getMetrics().calculateLagFromSource(dmlEvent.getChangeTime());
 
             // Set per-event details
             getOffsetContext().setEventScn(dmlEvent.getScn());
-            getOffsetContext().setTransactionId(dmlEvent.getTransactionId());
-            getOffsetContext().setTransactionSequence(dmlEvent.getTransactionSequence());
+            getOffsetContext().setTransactionId(eventTrxId);
+            getOffsetContext().setTransactionSequence(eventTrxSeq);
             getOffsetContext().setSourceTime(dmlEvent.getChangeTime().minusSeconds(databaseOffsetSeconds));
             getOffsetContext().setTableId(dmlEvent.getTableId());
             getOffsetContext().setRsId(dmlEvent.getRsId());
-            getOffsetContext().setRowId(dmlEvent.getRowId());
+            getOffsetContext().setRowId(dmlEvent.getRowIdAsString());
 
             if (event instanceof RedoSqlDmlEvent redoDmlEvent) {
                 getOffsetContext().setRedoSql(redoDmlEvent.getRedoSql());
@@ -567,9 +562,9 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
                             getConfig(),
                             getPartition(),
                             getOffsetContext(),
-                            dmlEvent.getDmlEntry().getEventType(),
-                            dmlEvent.getDmlEntry().getOldValues(),
-                            dmlEvent.getDmlEntry().getNewValues(),
+                            dmlEvent.getEventType(),
+                            dmlEvent.getOldValues(),
+                            dmlEvent.getNewValues(),
                             getSchema().tableFor(dmlEvent.getTableId()),
                             getSchema(),
                             Clock.system()));

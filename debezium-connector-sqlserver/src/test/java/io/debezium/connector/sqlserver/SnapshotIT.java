@@ -219,11 +219,12 @@ public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset()).hasSize(3);
+            assertThat(record1.sourceOffset()).hasSize(4);
 
             assertTrue(record1.sourceOffset().containsKey("change_lsn"));
             assertTrue(record1.sourceOffset().containsKey("commit_lsn"));
             assertTrue(record1.sourceOffset().containsKey("event_serial_no"));
+            assertTrue(record1.sourceOffset().containsKey("command_id"));
             assertNull(value1.get("before"));
         }
     }
@@ -346,29 +347,29 @@ public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
     @FixFor("DBZ-1067")
     public void testColumnExcludeList() throws Exception {
         connection.execute(
-                "CREATE TABLE blacklist_column_table_a (id int, name varchar(30), amount integer primary key(id))",
-                "CREATE TABLE blacklist_column_table_b (id int, name varchar(30), amount integer primary key(id))");
-        connection.execute("INSERT INTO blacklist_column_table_a VALUES(10, 'some_name', 120)");
-        connection.execute("INSERT INTO blacklist_column_table_b VALUES(11, 'some_name', 447)");
-        TestHelper.enableTableCdc(connection, "blacklist_column_table_a");
-        TestHelper.enableTableCdc(connection, "blacklist_column_table_b");
+                "CREATE TABLE column_exclude_table_a (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE column_exclude_table_b (id int, name varchar(30), amount integer primary key(id))");
+        connection.execute("INSERT INTO column_exclude_table_a VALUES(10, 'some_name', 120)");
+        connection.execute("INSERT INTO column_exclude_table_b VALUES(11, 'some_name', 447)");
+        TestHelper.enableTableCdc(connection, "column_exclude_table_a");
+        TestHelper.enableTableCdc(connection, "column_exclude_table_b");
 
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
-                .with(SqlServerConnectorConfig.COLUMN_EXCLUDE_LIST, "dbo.blacklist_column_table_a.amount")
-                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.blacklist_column_table_a,dbo.blacklist_column_table_b")
+                .with(SqlServerConnectorConfig.COLUMN_EXCLUDE_LIST, "dbo.column_exclude_table_a.amount")
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.column_exclude_table_a,dbo.column_exclude_table_b")
                 .build();
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
 
         final SourceRecords records = consumeRecordsByTopic(2);
-        final List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.blacklist_column_table_a");
-        final List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.blacklist_column_table_b");
+        final List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.column_exclude_table_a");
+        final List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.column_exclude_table_b");
 
         Schema expectedSchemaA = SchemaBuilder.struct()
                 .optional()
-                .name("server1.testDB1.dbo.blacklist_column_table_a.Value")
+                .name("server1.testDB1.dbo.column_exclude_table_a.Value")
                 .field("id", Schema.INT32_SCHEMA)
                 .field("name", Schema.OPTIONAL_STRING_SCHEMA)
                 .build();
@@ -378,7 +379,7 @@ public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
 
         Schema expectedSchemaB = SchemaBuilder.struct()
                 .optional()
-                .name("server1.testDB1.dbo.blacklist_column_table_b.Value")
+                .name("server1.testDB1.dbo.column_exclude_table_b.Value")
                 .field("id", Schema.INT32_SCHEMA)
                 .field("name", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("amount", Schema.OPTIONAL_INT32_SCHEMA)
@@ -397,7 +398,6 @@ public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
         SourceRecordAssert.assertThat(tableB.get(0))
                 .valueAfterFieldIsEqualTo(expectedValueB)
                 .valueAfterFieldSchemaIsEqualTo(expectedSchemaB);
-
         stopConnector();
     }
 
@@ -434,7 +434,7 @@ public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    void reoderCapturedTablesWithOverlappingTableWhitelist() throws Exception {
+    void reoderCapturedTablesWithOverlappingTableIncludeList() throws Exception {
         connection.execute(
                 "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",
                 "CREATE TABLE table_ac (id int, name varchar(30), amount integer primary key(id))",
@@ -476,7 +476,7 @@ public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    void reoderCapturedTablesWithoutTableWhitelist() throws Exception {
+    void reoderCapturedTablesWithoutTableIncludeList() throws Exception {
         connection.execute(
                 "CREATE TABLE table_ac (id int, name varchar(30), amount integer primary key(id))",
                 "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",

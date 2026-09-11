@@ -3,7 +3,7 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-parent</artifactId>
-        <version>3.5.0-SNAPSHOT</version>
+        <version>3.7.0-SNAPSHOT</version>
         <relativePath>../debezium-parent/pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -14,7 +14,11 @@
     <dependencies>
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-core</artifactId>
+            <artifactId>debezium-connector-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connect-plugins</artifactId>
         </dependency>
         <dependency>
             <groupId>io.debezium</groupId>
@@ -41,6 +45,7 @@
         <dependency>
             <groupId>com.oracle.database.jdbc</groupId>
             <artifactId>ojdbc11</artifactId>
+            <version>${version.oracle.driver}</version>
         </dependency>
         <dependency>
             <groupId>org.antlr</groupId>
@@ -127,7 +132,13 @@
         <!-- Testing -->
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-core</artifactId>
+            <artifactId>debezium-connector-common</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-util</artifactId>
             <type>test-jar</type>
             <scope>test</scope>
         </dependency>
@@ -140,6 +151,12 @@
         <dependency>
             <groupId>io.debezium</groupId>
             <artifactId>debezium-embedded</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connect-plugins</artifactId>
+            <type>test-jar</type>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -171,6 +188,11 @@
         <dependency>
             <groupId>io.debezium</groupId>
             <artifactId>debezium-testing-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-archunit</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -251,9 +273,6 @@
         <docker.skip>false</docker.skip>
         <docker.showLogs>true</docker.showLogs>
         <connector.assembly.ref>connector-distribution</connector.assembly.ref>
-        <!-- Apicurion container properties -->
-        <apicurio.port>8080</apicurio.port>
-        <apicurio.init.timeout>60000</apicurio.init.timeout> <!-- 60 seconds -->
     </properties>
 
     <build>
@@ -351,19 +370,11 @@
             <plugin>
                 <groupId>io.debezium</groupId>
                 <artifactId>debezium-schema-generator</artifactId>
-                <version>${project.version}</version>
-                <executions>
-                    <execution>
-                        <id>generate-connector-metadata</id>
-                        <goals>
-                            <goal>generate-api-spec</goal>
-                        </goals>
-                        <phase>prepare-package</phase>
-                        <configuration>
-                            <outputDirectory>${project.build.outputDirectory}/META-INF/resources/</outputDirectory>
-                        </configuration>
-                    </execution>
-                </executions>
+                <configuration>
+                    <jvmArgs>
+                        <arg>-Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl</arg>
+                    </jvmArgs>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
@@ -444,6 +455,7 @@
                 <dependency>
                     <groupId>com.oracle.instantclient</groupId>
                     <artifactId>xstreams</artifactId>
+                    <version>${version.oracle.instantclient}</version>
                     <scope>provided</scope>
                 </dependency>
             </dependencies>
@@ -846,8 +858,11 @@
                             <images>
                                 <!-- A container for the data server replica set -->
                                 <image>
-                                    <name>quay.io/apicurio/apicurio-registry-mem:${version.apicurio}</name>
+                                    <name>${apicurio.image}:${version.apicurio}</name>
                                     <run>
+                                        <env>
+                                            <QUARKUS_LOG_CATEGORY__IO_APICURIO_REGISTRY_LOGGING_AUDIT__LEVEL>${apicurio.image.audit.level}</QUARKUS_LOG_CATEGORY__IO_APICURIO_REGISTRY_LOGGING_AUDIT__LEVEL>
+                                        </env>
                                         <namingStrategy>none</namingStrategy>
                                         <ports>
                                             <port>${apicurio.port}:8080</port>
@@ -858,7 +873,7 @@
                                             <color>blue</color>
                                         </log>
                                         <wait>
-                                            <log>.*apicurio-registry-app.*started in.*</log>
+                                            <log>${apicurio.image.log}</log>
                                             <time>${apicurio.init.timeout}</time>
                                         </wait>
                                     </run>
@@ -900,14 +915,84 @@
             </properties>
         </profile>
         <profile>
-            <id>oracle-23</id>
+            <id>oracle-free</id>
             <activation>
                 <activeByDefault>false</activeByDefault>
             </activation>
             <properties>
-                <version.oracle.driver>23.3.0.23.09</version.oracle.driver>
-                <version.oracle.instantclient>23.3.0.0</version.oracle.instantclient>
+                <oracle.image.name>container-registry.oracle.com/database/free</oracle.image.name>
+                <oracle.image.version>23.26.0.0</oracle.image.version>
             </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>io.fabric8</groupId>
+                        <artifactId>docker-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>start-oracle</id>
+                                <phase>pre-integration-test</phase>
+                                <goals>
+                                    <goal>start</goal>
+                                </goals>
+                            </execution>
+                            <execution>
+                                <id>stop-oracle</id>
+                                <phase>post-integration-test</phase>
+                                <goals>
+                                    <goal>stop</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <watchInterval>500</watchInterval>
+                            <logDate>default</logDate>
+                            <verbose>true</verbose>
+                            <imagePullPolicy>IfNotPresent</imagePullPolicy>
+                            <images>
+                                <image>
+                                    <name>${oracle.image.name}:${oracle.image.version}</name>
+                                    <alias>oracle</alias>
+                                    <run>
+                                        <ports>
+                                            <port>1521:1521</port>
+                                        </ports>
+                                        <env>
+                                            <ORACLE_PWD>top_secret</ORACLE_PWD>
+                                            <ENABLE_ARCHIVELOG>true</ENABLE_ARCHIVELOG>
+                                        </env>
+                                        <log>
+                                            <prefix>oracle</prefix>
+                                            <enabled>true</enabled>
+                                            <color>blue</color>
+                                        </log>
+                                        <wait>
+                                            <log>.*DONE: Executing user defined scripts.*</log>
+                                            <time>60000</time>
+                                        </wait>
+                                        <volumes>
+                                            <bind>
+                                                <volume>${project.basedir}/src/test/docker/${oracle.image.version}:/opt/oracle/scripts/startup</volume>
+                                            </bind>
+                                        </volumes>
+                                    </run>
+                                </image>
+                            </images>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>${version.failsafe.plugin}</version>
+                        <configuration combine.self="append">
+                            <systemPropertyVariables>
+                                <database.dbname>FREEPDB1</database.dbname>
+                                <database.pdb.name>FREEPDB1</database.pdb.name>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
     </profiles>
 </project>

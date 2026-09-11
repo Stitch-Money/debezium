@@ -5,14 +5,19 @@
  */
 package io.debezium.connector.jdbc;
 
+import static io.debezium.sink.filter.FieldFilterFactory.FieldNameFilter;
+
+import java.time.Duration;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.connect.errors.ConnectException;
-import org.hibernate.c3p0.internal.C3P0ConnectionProvider;
+import org.hibernate.agroal.internal.AgroalConnectionProvider;
+import org.hibernate.cfg.AgroalSettings;
 import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.cfg.DialectSpecificSettings;
 import org.hibernate.tool.schema.Action;
@@ -24,12 +29,12 @@ import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.config.Field.ValidationOutput;
+import io.debezium.connector.jdbc.dialect.starrocks.StarRocksDialectResolver;
 import io.debezium.connector.jdbc.naming.ColumnNamingStrategy;
 import io.debezium.connector.jdbc.naming.DefaultColumnNamingStrategy;
 import io.debezium.connector.jdbc.naming.TemporaryBackwardCompatibleCollectionNamingStrategyProxy;
 import io.debezium.sink.SinkConnectorConfig;
 import io.debezium.sink.filter.FieldFilterFactory;
-import io.debezium.sink.filter.FieldFilterFactory.FieldNameFilter;
 import io.debezium.sink.naming.CollectionNamingStrategy;
 import io.debezium.util.Strings;
 
@@ -50,38 +55,42 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final String CONNECTION_PASSWORD = "connection.password";
     public static final String CONNECTION_POOL_MIN_SIZE = "connection.pool.min_size";
     public static final String CONNECTION_POOL_MAX_SIZE = "connection.pool.max_size";
-    public static final String CONNECTION_POOL_ACQUIRE_INCREMENT = "connection.pool.acquire_increment";
     public static final String CONNECTION_POOL_TIMEOUT = "connection.pool.timeout";
     public static final String INSERT_MODE = "insert.mode";
     public static final String TRUNCATE_ENABLED = "truncate.enabled";
-    public static final String PRIMARY_KEY_FIELDS = "primary.key.fields";
     public static final String SCHEMA_EVOLUTION = "schema.evolution";
     public static final String QUOTE_IDENTIFIERS = "quote.identifiers";
     public static final String COLUMN_NAMING_STRATEGY = "column.naming.strategy";
     public static final String COLLECTION_TABLE_FORMAT = "collection.table.format";
 
     public static final String POSTGRES_POSTGIS_SCHEMA = "dialect.postgres.postgis.schema";
+    public static final String POSTGRES_UNNEST_INSERT = "dialect.postgres.unnest.insert.enabled";
     public static final String SQLSERVER_IDENTITY_INSERT = "dialect.sqlserver.identity.insert";
+    public static final String STARROCKS_CATALOG_NAME = "dialect.starrocks.catalog.name";
+    // StarRocks identifiers may contain only letters, digits, and underscores, and must not start with a digit.
+    // The catalog name is concatenated into a 'SET CATALOG' statement, so it is validated to avoid SQL injection.
+    private static final Pattern STARROCKS_CATALOG_NAME_PATTERN = Pattern.compile("[a-zA-Z_][a-zA-Z0-9_]*");
     public static final String USE_REDUCTION_BUFFER = "use.reduction.buffer";
     public static final String FLUSH_MAX_RETRIES = "flush.max.retries";
     public static final String FLUSH_RETRY_DELAY_MS = "flush.retry.delay.ms";
     public static final String CONNECTION_RESTART_ON_ERRORS = "connection.restart.on.errors";
+    public static final String TIMESTAMP_CLAMP_OUT_OF_RANGE_VALUES = "timestamp.clamp.out.of.range.values";
 
     // todo add support for the ValueConverter contract
 
     public static final Field CONNECTION_PROVIDER_FIELD = Field.create(CONNECTION_PROVIDER)
             .withDisplayName("Connection provider")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.LOW)
-            .withDefault(C3P0ConnectionProvider.class.getName())
-            .withDescription("Fully qualified class name of the connection provider, defaults to " + C3P0ConnectionProvider.class.getName());
+            .withDefault(AgroalConnectionProvider.class.getName())
+            .withDescription("Fully qualified class name of the connection provider, defaults to " + AgroalConnectionProvider.class.getName());
 
     public static final Field CONNECTION_URL_FIELD = Field.create(CONNECTION_URL)
             .withDisplayName("Hostname")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.HIGH)
             .required()
@@ -90,7 +99,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field CONNECTION_USER_FIELD = Field.create(CONNECTION_USER)
             .withDisplayName("User")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.HIGH)
             .required()
@@ -99,7 +108,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field CONNECTION_PASSWORD_FIELD = Field.create(CONNECTION_PASSWORD)
             .withDisplayName("Password")
             .withType(Type.PASSWORD)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.HIGH)
             .withDescription("Password of the database user to be used when connecting to the connection.");
@@ -107,7 +116,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field CONNECTION_POOL_MIN_SIZE_FIELD = Field.create(CONNECTION_POOL_MIN_SIZE)
             .withDisplayName("Connection pool minimum size")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(5)
@@ -116,25 +125,16 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field CONNECTION_POOL_MAX_SIZE_FIELD = Field.create(CONNECTION_POOL_MAX_SIZE)
             .withDisplayName("Connection pool maximum size")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(32)
             .withDescription("Maximum number of connection in the connection pool");
 
-    public static final Field CONNECTION_POOL_ACQUIRE_INCREMENT_FIELD = Field.create(CONNECTION_POOL_ACQUIRE_INCREMENT)
-            .withDisplayName("Connection pool acquire increment")
-            .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 6))
-            .withWidth(ConfigDef.Width.SHORT)
-            .withImportance(ConfigDef.Importance.LOW)
-            .withDefault(32)
-            .withDescription("Connection pool acquire increment");
-
     public static final Field CONNECTION_POOL_TIMEOUT_FIELD = Field.create(CONNECTION_POOL_TIMEOUT)
             .withDisplayName("Connection pool timeout")
             .withType(Type.LONG)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 7))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(1800)
@@ -143,7 +143,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field INSERT_MODE_FIELD = Field.create(INSERT_MODE)
             .withDisplayName("The insertion mode to use")
             .withEnum(InsertMode.class, InsertMode.INSERT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withValidation(JdbcSinkConnectorConfig::validateInsertMode)
@@ -155,19 +155,10 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field DELETE_ENABLED_FIELD = SinkConnectorConfig.DELETE_ENABLED_FIELD
             .withValidation(JdbcSinkConnectorConfig::validateDeleteEnabled);
 
-    public static final Field PRIMARY_KEY_FIELDS_FIELD = Field.create(PRIMARY_KEY_FIELDS)
-            .withDisplayName("Comma-separated list of primary key field names")
-            .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 5))
-            .withWidth(ConfigDef.Width.MEDIUM)
-            .withImportance(ConfigDef.Importance.LOW)
-            .withDescription("A comma-separated list of primary key field names. " +
-                    "This is interpreted differently depending on " + PRIMARY_KEY_MODE + ".");
-
     public static final Field SCHEMA_EVOLUTION_FIELD = Field.create(SCHEMA_EVOLUTION)
             .withDisplayName("Controls how schema evolution is handled by the sink connector")
             .withEnum(SchemaEvolutionMode.class, SchemaEvolutionMode.NONE)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 7))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDescription("Controls how schema evolution is handled by the sink connector");
@@ -176,16 +167,28 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
             .withDisplayName("Controls whether table, column, or other identifiers are quoted")
             .withType(Type.BOOLEAN)
             .withDefault(false)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 8))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDescription("When enabled, table, column, and other identifiers are quoted based on the database dialect. " +
                     "When disabled, only explicit cases where the dialect requires quoting will be used, such as names starting with an underscore.");
 
+    public static final String DEFAULT_TIME_ZONE = "UTC";
+    public static final String USE_TIME_ZONE = "use.time.zone";
+    public static final String DEPRECATED_DATABASE_TIME_ZONE = "database.time_zone";
+    public static final Field USE_TIME_ZONE_FIELD = Field.create(USE_TIME_ZONE)
+            .withDisplayName("The timezone used when inserting temporal values.")
+            .withDefault(DEFAULT_TIME_ZONE)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.MEDIUM)
+            .withDescription("The timezone used when inserting temporal values. Defaults to UTC.")
+            .withDeprecatedAliases(DEPRECATED_DATABASE_TIME_ZONE);
+
     public static final Field COLUMN_NAMING_STRATEGY_FIELD = Field.create(COLUMN_NAMING_STRATEGY)
             .withDisplayName("Name of the strategy class that implements the ColumnNamingStrategy interface")
             .withType(Type.CLASS)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(DefaultColumnNamingStrategy.class.getName())
@@ -194,25 +197,51 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field POSTGRES_POSTGIS_SCHEMA_FIELD = Field.create(POSTGRES_POSTGIS_SCHEMA)
             .withDisplayName("Name of the schema where postgis extension is installed")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault("public")
             .withDescription("Name of the schema where postgis extension is installed. Default is public");
 
+    public static final Field POSTGRES_UNNEST_INSERT_FIELD = Field.create(POSTGRES_UNNEST_INSERT)
+            .withDisplayName("Enable UNNEST-based batch inserts for PostgreSQL")
+            .withType(Type.BOOLEAN)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.MEDIUM)
+            .withDefault(false)
+            .withDescription(
+                    "When enabled, uses PostgreSQL UNNEST() for batch inserts which can significantly improve performance by reducing the number of SQL statements executed. "
+                            +
+                            "This optimization is compatible with INSERT and UPSERT modes. " +
+                            "Instead of executing multiple INSERT statements with JDBC batching, a single INSERT statement with UNNEST is used to insert all records at once. "
+                            +
+                            "This can provide 5-10x performance improvement for high-throughput scenarios. Default is false.");
+
     public static final Field SQLSERVER_IDENTITY_INSERT_FIELD = Field.create(SQLSERVER_IDENTITY_INSERT)
             .withDisplayName("Allowing to insert explicit value for identity column in table for SQLSERVER.")
             .withType(Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(false)
             .withDescription("Allowing to insert explicit value for identity column in table for SQLSERVER.");
 
+    public static final Field STARROCKS_CATALOG_NAME_FIELD = Field.create(STARROCKS_CATALOG_NAME)
+            .withDisplayName("Name of the StarRocks catalog the connector writes into")
+            .withType(Type.STRING)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withWidth(ConfigDef.Width.LONG)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withValidation(JdbcSinkConnectorConfig::validateStarRocksCatalogName)
+            .withDescription("Name of the StarRocks catalog the connector writes into. When set, 'SET CATALOG <name>' " +
+                    "is executed on every new connection before any session work. The StarRocks JDBC driver also " +
+                    "supports specifying the catalog directly in the connection URL.");
+
     public static final Field FLUSH_MAX_RETRIES_FIELD = Field.create(FLUSH_MAX_RETRIES)
             .withDisplayName("Max retry count")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(5)
@@ -222,7 +251,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field FLUSH_RETRY_DELAY_MS_FIELD = Field.create(FLUSH_RETRY_DELAY_MS)
             .withDisplayName("Delay to retry flush")
             .withType(Type.LONG)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 6))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(1000L)
@@ -231,7 +260,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field USE_REDUCTION_BUFFER_FIELD = Field.create(USE_REDUCTION_BUFFER)
             .withDisplayName("Specifies whether to use the reduction buffer.")
             .withType(Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault(false)
@@ -241,7 +270,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     public static final Field CONNECTION_RESTART_ON_ERRORS_FIELD = Field.create(CONNECTION_RESTART_ON_ERRORS)
             .withDisplayName("Restart connection on errors")
             .withType(Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 7))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(false)
@@ -250,24 +279,37 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
                     "In environments where the sink database uses asynchronous replication, enabling this option may risk data loss or inconsistencies " +
                     "during failover if the replica has not fully caught up with the primary.");
 
+    public static final Field TIMESTAMP_CLAMP_OUT_OF_RANGE_VALUES_FIELD = Field.create(TIMESTAMP_CLAMP_OUT_OF_RANGE_VALUES)
+            .withDisplayName("Clamp out-of-range timestamp values")
+            .withType(Type.BOOLEAN)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDefault(false)
+            .withDescription("Specifies whether temporal values that cannot be represented by the target database, " +
+                    "for example BC-era timestamps emitted by an Oracle source, are clamped to the target database's " +
+                    "minimum or maximum supported timestamp, mirroring how explicit infinity markers are handled. " +
+                    "When set to false (the default), out-of-range values are passed to the target database unchanged " +
+                    "and may cause the write to fail.");
+
     public static final Field COLLECTION_TABLE_FORMAT_FIELD = Field.create(COLLECTION_TABLE_FORMAT)
             .withDisplayName("Format string using table name")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault("${table}")
             .withDescription("Alternative format that uses table name instead of topic name. Use ${schema} for schema name and ${table} for table name.");
 
     protected static final ConfigDefinition CONFIG_DEFINITION = ConfigDefinition.editor()
-            .connector(
+            .group(Field.Group.CONNECTION,
                     CONNECTION_URL_FIELD,
                     CONNECTION_USER_FIELD,
                     CONNECTION_PASSWORD_FIELD,
                     CONNECTION_POOL_MIN_SIZE_FIELD,
                     CONNECTION_POOL_MAX_SIZE_FIELD,
-                    CONNECTION_POOL_ACQUIRE_INCREMENT_FIELD,
-                    CONNECTION_POOL_TIMEOUT_FIELD,
+                    CONNECTION_POOL_TIMEOUT_FIELD)
+            .group(Field.Group.CONNECTOR,
                     INSERT_MODE_FIELD,
                     DELETE_ENABLED_FIELD,
                     TRUNCATE_ENABLED_FIELD,
@@ -281,13 +323,17 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
                     COLLECTION_TABLE_FORMAT_FIELD,
                     USE_TIME_ZONE_FIELD,
                     POSTGRES_POSTGIS_SCHEMA_FIELD,
+                    POSTGRES_UNNEST_INSERT_FIELD,
                     SQLSERVER_IDENTITY_INSERT_FIELD,
+                    STARROCKS_CATALOG_NAME_FIELD,
                     BATCH_SIZE_FIELD,
+                    KEYED_MESSAGE_BATCH_MODE_FIELD,
                     FIELD_INCLUDE_LIST_FIELD,
                     FIELD_EXCLUDE_LIST_FIELD,
                     FLUSH_MAX_RETRIES_FIELD,
                     FLUSH_RETRY_DELAY_MS_FIELD,
                     CONNECTION_RESTART_ON_ERRORS_FIELD,
+                    TIMESTAMP_CLAMP_OUT_OF_RANGE_VALUES_FIELD,
                     CLOUDEVENTS_SCHEMA_NAME_PATTERN_FIELD)
             .create();
 
@@ -344,25 +390,34 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         /**
          * No schema evolution occurs, assumed that the destination table's structure matches the event.
          */
-        NONE("none"),
+        NONE("none", false, false),
+
+        /**
+         * No schema evolution occurs, but statically resolvable destination tables are validated at startup.
+         */
+        VALIDATE_ONLY("validate-only", true, false),
 
         /**
          * When an event is received, the table will be created if it does not exist, and any new fields
          * found in the event will be amended to the existing tables.  Any columns omitted from the event
          * will simply be skipped during inserts and updates.
          */
-        BASIC("basic");
+        BASIC("basic", false, true);
 
         // /**
         // * When an event is received, the table will be created if it does not exist, and any new fields
         // * found in the event will be added to the existing table's schema. Any columns from the table
         // * schema not found in the event will be dropped.
         // */
-        // ADVANCED("advanced");
+        // ADVANCED("advanced", false, true);
         private final String mode;
+        private final boolean validateOnStartup;
+        private final boolean schemaEvolutionEnabled;
 
-        SchemaEvolutionMode(String mode) {
+        SchemaEvolutionMode(String mode, boolean validateOnStartup, boolean schemaEvolutionEnabled) {
             this.mode = mode;
+            this.validateOnStartup = validateOnStartup;
+            this.schemaEvolutionEnabled = schemaEvolutionEnabled;
         }
 
         public static SchemaEvolutionMode parse(String value) {
@@ -379,6 +434,14 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
             return mode;
         }
 
+        public boolean validateOnStartup() {
+            return validateOnStartup;
+        }
+
+        public boolean isSchemaEvolutionEnabled() {
+            return schemaEvolutionEnabled;
+        }
+
     }
 
     private final Configuration config;
@@ -387,22 +450,27 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     private final boolean deleteEnabled;
     private final boolean truncateEnabled;
     private final String collectionNameFormat;
-    private final PrimaryKeyMode primaryKeyMode;
-    private final Set<String> primaryKeyFields;
     private final SchemaEvolutionMode schemaEvolutionMode;
     private final boolean quoteIdentifiers;
     private final CollectionNamingStrategy collectionNamingStrategy;
     private final ColumnNamingStrategy columnNamingStrategy;
     private final String databaseTimezone;
     private final String postgresPostgisSchema;
+    private final boolean postgresUnnestInsert;
     private final boolean sqlServerIdentityInsert;
+    private final String starRocksCatalogName;
     private final int flushMaxRetries;
     private final long flushRetryDelayMs;
-    private final FieldNameFilter fieldsFilter;
     private final int batchSize;
     private final boolean useReductionBuffer;
+    private final KeyedMessageBatchMode keyedMessageBatchMode;
     private final boolean connectionRestartOnErrors;
+    private final boolean timestampClampOutOfRangeValues;
     private final String cloudEventsSchemaNamePattern;
+    private final PrimaryKeyMode primaryKeyMode;
+    private final Set<String> primaryKeyFields;
+    private final FieldNameFilter fieldsFilter;
+    private final boolean isSharedChangeEventSinkEnabled;
 
     public JdbcSinkConnectorConfig(Map<String, String> props) {
         config = Configuration.from(props);
@@ -410,26 +478,29 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         this.deleteEnabled = config.getBoolean(DELETE_ENABLED_FIELD);
         this.truncateEnabled = config.getBoolean(TRUNCATE_ENABLED_FIELD);
         this.collectionNameFormat = config.getString(COLLECTION_NAME_FORMAT_FIELD);
-        this.primaryKeyMode = PrimaryKeyMode.parse(config.getString(PRIMARY_KEY_MODE_FIELD));
-        this.primaryKeyFields = Strings.setOf(config.getString(PRIMARY_KEY_FIELDS_FIELD), String::new);
         this.schemaEvolutionMode = SchemaEvolutionMode.parse(config.getString(SCHEMA_EVOLUTION));
         this.quoteIdentifiers = config.getBoolean(QUOTE_IDENTIFIERS_FIELD);
-        this.collectionNamingStrategy = resolveCollectionNamingStrategy(config, props);
-        this.columnNamingStrategy = resolveColumnNamingStrategy(config, props);
-
         this.databaseTimezone = config.getString(USE_TIME_ZONE_FIELD);
         this.postgresPostgisSchema = config.getString(POSTGRES_POSTGIS_SCHEMA_FIELD);
+        this.postgresUnnestInsert = config.getBoolean(POSTGRES_UNNEST_INSERT_FIELD);
         this.sqlServerIdentityInsert = config.getBoolean(SQLSERVER_IDENTITY_INSERT_FIELD);
+        this.starRocksCatalogName = config.getString(STARROCKS_CATALOG_NAME_FIELD);
         this.batchSize = config.getInteger(BATCH_SIZE_FIELD);
         this.useReductionBuffer = config.getBoolean(USE_REDUCTION_BUFFER_FIELD);
+        this.keyedMessageBatchMode = KeyedMessageBatchMode.parse(config.getString(KEYED_MESSAGE_BATCH_MODE_FIELD));
         this.flushMaxRetries = config.getInteger(FLUSH_MAX_RETRIES_FIELD);
         this.flushRetryDelayMs = config.getLong(FLUSH_RETRY_DELAY_MS_FIELD);
         this.connectionRestartOnErrors = config.getBoolean(CONNECTION_RESTART_ON_ERRORS_FIELD);
+        this.timestampClampOutOfRangeValues = config.getBoolean(TIMESTAMP_CLAMP_OUT_OF_RANGE_VALUES_FIELD);
         this.cloudEventsSchemaNamePattern = config.getString(CLOUDEVENTS_SCHEMA_NAME_PATTERN_FIELD);
-
-        String fieldIncludeList = config.getString(FIELD_INCLUDE_LIST_FIELD);
-        String fieldExcludeList = config.getString(FIELD_EXCLUDE_LIST_FIELD);
+        this.collectionNamingStrategy = resolveCollectionNamingStrategy(config, props);
+        this.columnNamingStrategy = resolveColumnNamingStrategy(config, props);
+        this.primaryKeyMode = PrimaryKeyMode.parse(config.getString(PRIMARY_KEY_MODE_FIELD));
+        this.primaryKeyFields = Strings.setOf(config.getString(PRIMARY_KEY_FIELDS_FIELD), String::new);
+        String fieldIncludeList = config.getString(SinkConnectorConfig.FIELD_INCLUDE_LIST_FIELD);
+        String fieldExcludeList = config.getString(SinkConnectorConfig.FIELD_EXCLUDE_LIST_FIELD);
         this.fieldsFilter = FieldFilterFactory.createFieldFilter(fieldIncludeList, fieldExcludeList);
+        this.isSharedChangeEventSinkEnabled = config.getBoolean(ENABLE_SHARED_CHANGE_EVENT_SINK_FIELD);
     }
 
     public void validate() {
@@ -450,24 +521,10 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         if (!Strings.isNullOrEmpty(columnExcludeList) && !Strings.isNullOrEmpty(columnIncludeList)) {
             throw new ConnectException("Cannot define both column.exclude.list and column.include.list. Please specify only one.");
         }
-
     }
 
     public boolean validateAndRecord(Iterable<Field> fields, Consumer<String> problems) {
         return config.validateAndRecord(fields, problems);
-    }
-
-    private static int validateColumnNamingStyle(Configuration config, Field field, ValidationOutput problems) {
-        String namingStyle = config.getString(field);
-        Set<String> validStyles = Set.of("snake_case", "camel_case", "kebab_case", "upper_case", "lower_case", "default");
-
-        if (!validStyles.contains(namingStyle)) {
-            problems.accept(field, namingStyle, "Invalid column naming style: " + namingStyle +
-                    ". Valid options are: " + validStyles);
-            return 1; // Validation fail
-        }
-
-        return 0; // Validation success
     }
 
     protected static ConfigDef configDef() {
@@ -498,6 +555,7 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         return primaryKeyMode;
     }
 
+    @Override
     public Set<String> getPrimaryKeyFields() {
         return primaryKeyFields;
     }
@@ -524,12 +582,17 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
     }
 
     @Override
+    public KeyedMessageBatchMode getKeyedMessageBatchMode() {
+        return keyedMessageBatchMode;
+    }
+
+    @Override
     public CollectionNamingStrategy getCollectionNamingStrategy() {
         return collectionNamingStrategy;
     }
 
     @Override
-    public FieldNameFilter getFieldFilter() {
+    public FieldNameFilter fieldFilter() {
         return fieldsFilter;
     }
 
@@ -546,6 +609,14 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         return postgresPostgisSchema;
     }
 
+    public boolean isPostgresUnnestInsertEnabled() {
+        return postgresUnnestInsert;
+    }
+
+    public String getStarRocksCatalogName() {
+        return starRocksCatalogName;
+    }
+
     public int getFlushMaxRetries() {
         return flushMaxRetries;
     }
@@ -556,6 +627,10 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
 
     public boolean isConnectionRestartOnErrors() {
         return connectionRestartOnErrors;
+    }
+
+    public boolean isTimestampClampForOutOfRangeValuesEnabled() {
+        return timestampClampOutOfRangeValues;
     }
 
     @Override
@@ -569,16 +644,30 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
      */
     public org.hibernate.cfg.Configuration getHibernateConfiguration() {
         org.hibernate.cfg.Configuration hibernateConfig = new org.hibernate.cfg.Configuration();
-        hibernateConfig.setProperty(AvailableSettings.CONNECTION_PROVIDER, config.getString(CONNECTION_PROVIDER_FIELD));
+
         hibernateConfig.setProperty(AvailableSettings.JAKARTA_JDBC_URL, config.getString(CONNECTION_URL_FIELD));
         hibernateConfig.setProperty(AvailableSettings.JAKARTA_JDBC_USER, config.getString(CONNECTION_USER_FIELD));
         String password = config.getString(CONNECTION_PASSWORD_FIELD);
         if (password != null && !password.isEmpty()) {
             hibernateConfig.setProperty(AvailableSettings.JAKARTA_JDBC_PASSWORD, password);
         }
-        hibernateConfig.setProperty(AvailableSettings.C3P0_MIN_SIZE, config.getString(CONNECTION_POOL_MIN_SIZE_FIELD));
-        hibernateConfig.setProperty(AvailableSettings.C3P0_MAX_SIZE, config.getString(CONNECTION_POOL_MAX_SIZE_FIELD));
-        hibernateConfig.setProperty(AvailableSettings.C3P0_ACQUIRE_INCREMENT, config.getString(CONNECTION_POOL_ACQUIRE_INCREMENT_FIELD));
+
+        // Connection Pool Settings
+        final String connectionProvider = config.getString(CONNECTION_PROVIDER_FIELD);
+        hibernateConfig.setProperty(AvailableSettings.CONNECTION_PROVIDER, connectionProvider);
+        // With some connection pool systems, the initial size starts at the min size; however Agroal does not
+        // use this pattern. So to make the behavior consistent with C3P0, we initially set the pool size to
+        // be equal to the min size.
+        hibernateConfig.setProperty(AvailableSettings.AGROAL_INITIAL_SIZE, config.getString(CONNECTION_POOL_MIN_SIZE_FIELD));
+        hibernateConfig.setProperty(AvailableSettings.AGROAL_MIN_SIZE, config.getString(CONNECTION_POOL_MIN_SIZE_FIELD));
+        hibernateConfig.setProperty(AvailableSettings.AGROAL_MAX_SIZE, config.getString(CONNECTION_POOL_MAX_SIZE_FIELD));
+        hibernateConfig.setProperty(AvailableSettings.AGROAL_IDLE_TIMEOUT, Duration.ofMillis(config.getInteger(CONNECTION_POOL_TIMEOUT_FIELD)).toString());
+
+        // Unless we explicitly set the connectionValidator as default, which checks if the connection is valid
+        // the validation on borrow from the pool is not triggered.
+        hibernateConfig.setProperty(AvailableSettings.AGROAL_VALIDATE_ON_BORROW, Boolean.TRUE);
+        hibernateConfig.setProperty(AgroalSettings.AGROAL_CONFIG_PREFIX + ".connectionValidator", "default");
+
         hibernateConfig.setProperty(AvailableSettings.GLOBALLY_QUOTED_IDENTIFIERS, Boolean.toString(config.getBoolean(QUOTE_IDENTIFIERS_FIELD)));
         hibernateConfig.setProperty(AvailableSettings.JDBC_TIME_ZONE, useTimeZone());
 
@@ -590,6 +679,17 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         if (LOGGER.isDebugEnabled()) {
             hibernateConfig.setProperty(AvailableSettings.SHOW_SQL, Boolean.toString(true));
         }
+
+        if (!Strings.isNullOrBlank(starRocksCatalogName)) {
+            // The MySQL wire protocol has no notion of StarRocks catalogs, so the catalog is selected
+            // through an initial statement executed on every new pooled connection.
+            hibernateConfig.setProperty(AgroalSettings.AGROAL_CONFIG_PREFIX + ".initialSQL", "SET CATALOG " + starRocksCatalogName);
+        }
+
+        // The resolver is registered through configuration rather than META-INF/services so that the
+        // registration stays scoped to this session factory; a global service registration fails with
+        // a ServiceConfigurationError in runtimes that isolate classloaders, such as Quarkus.
+        hibernateConfig.setProperty(AvailableSettings.DIALECT_RESOLVERS, StarRocksDialectResolver.class.getName());
 
         // Allows users to pass additional configuration options to the sink connector using the "hibernate.*" namespace
         config.subset(HIBERNATE_PREFIX, false).forEach(hibernateConfig::setProperty);
@@ -616,6 +716,10 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         return namingStrategy;
     }
 
+    public boolean isSharedChangeEventSinkEnabled() {
+        return isSharedChangeEventSinkEnabled;
+    }
+
     private static int validateInsertMode(Configuration config, Field field, ValidationOutput problems) {
         final InsertMode insertMode = InsertMode.parse(config.getString(field));
         if (InsertMode.UPSERT.equals(insertMode)) {
@@ -631,16 +735,35 @@ public class JdbcSinkConnectorConfig implements SinkConnectorConfig {
         return 0;
     }
 
+    private static int validateStarRocksCatalogName(Configuration config, Field field, ValidationOutput problems) {
+        final String catalogName = config.getString(field);
+        if (!Strings.isNullOrBlank(catalogName) && !STARROCKS_CATALOG_NAME_PATTERN.matcher(catalogName).matches()) {
+            LOGGER.error("The '{}' value '{}' is invalid: a StarRocks catalog name may contain only letters, digits, and "
+                    + "underscores, and must not start with a digit.", field.name(), catalogName);
+            problems.accept(field, catalogName, "A StarRocks catalog name may contain only letters, digits, and "
+                    + "underscores, and must not start with a digit");
+            return 1;
+        }
+        return 0;
+    }
+
     private static int validateDeleteEnabled(Configuration config, Field field, ValidationOutput problems) {
         if (config.getBoolean(field)) {
             final PrimaryKeyMode primaryKeyMode = PrimaryKeyMode.parse(config.getString(PRIMARY_KEY_MODE));
-            if (!PrimaryKeyMode.RECORD_KEY.equals(primaryKeyMode)) {
-                LOGGER.error("When '{}' is set to 'true', the '{}' option must be set to '{}'.",
-                        DELETE_ENABLED, PRIMARY_KEY_MODE, PrimaryKeyMode.RECORD_KEY.getValue());
+
+            // Allow RECORD_KEY, RECORD_VALUE, and RECORD_HEADER
+            if (!PrimaryKeyMode.RECORD_KEY.equals(primaryKeyMode)
+                    && !PrimaryKeyMode.RECORD_VALUE.equals(primaryKeyMode)
+                    && !PrimaryKeyMode.RECORD_HEADER.equals(primaryKeyMode)) {
+
+                LOGGER.error("When '{}' is set to 'true', the '{}' option must be set to '{}', '{}', or '{}'.",
+                        DELETE_ENABLED, PRIMARY_KEY_MODE,
+                        PrimaryKeyMode.RECORD_KEY.getValue(),
+                        PrimaryKeyMode.RECORD_VALUE.getValue(),
+                        PrimaryKeyMode.RECORD_HEADER.getValue());
                 return 1;
             }
         }
         return 0;
     }
-
 }

@@ -5,7 +5,7 @@
  */
 package io.debezium.connector.jdbc.integration;
 
-import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -13,12 +13,15 @@ import java.util.Map;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.sink.SinkTask;
 import org.assertj.db.api.TableAssert;
 import org.assertj.db.type.ValueType;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
-import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
+import io.debezium.DebeziumException;
+import io.debezium.connector.jdbc.JdbcKafkaSinkRecord;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig.SchemaEvolutionMode;
 import io.debezium.connector.jdbc.junit.TestHelper;
@@ -53,54 +56,117 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         return null;
     }
 
+    @Test
+    public void testStartShouldFailIfValidateOnlyAndTargetTableIsMissing() {
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+        final Map<String, String> properties = getValidateOnlySinkConfig(topicName);
+
+        assertThatThrownBy(() -> startSinkConnector(properties))
+                .hasCauseInstanceOf(DebeziumException.class)
+                .hasMessageContaining("Target table")
+                .hasMessageContaining("does not exist")
+                .hasMessageContaining(SchemaEvolutionMode.VALIDATE_ONLY.getValue());
+    }
+
+    @Test
+    public void testStartShouldSucceedIfValidateOnlyAndTargetTableExists() throws Exception {
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+        final Map<String, String> properties = getValidateOnlySinkConfig(topicName);
+        final String destinationTableName = destinationTableName(topicName, properties);
+
+        getSink().execute(String.format("CREATE TABLE %s (id integer not null)", destinationTableName));
+
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+    }
+
+    @Test
+    public void testOpenShouldFailIfValidateOnlyWithTopicsRegexAndTargetTableIsMissing() {
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+        final Map<String, String> properties = getValidateOnlyRegexSinkConfig();
+
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+
+        assertThatThrownBy(() -> openSinkConnector(topicName))
+                .isInstanceOf(DebeziumException.class)
+                .hasMessageContaining("Target table")
+                .hasMessageContaining("does not exist")
+                .hasMessageContaining(SchemaEvolutionMode.VALIDATE_ONLY.getValue());
+    }
+
+    @Test
+    public void testOpenShouldSucceedIfValidateOnlyWithTopicsRegexAndTargetTableExists() throws Exception {
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+        final Map<String, String> properties = getValidateOnlyRegexSinkConfig();
+        final String destinationTableName = destinationTableName(topicName, properties);
+
+        getSink().execute(String.format("CREATE TABLE %s (id integer not null)", destinationTableName));
+
+        startSinkConnector(properties);
+        openSinkConnector(topicName);
+        assertSinkConnectorIsRunning();
+    }
+
     @ParameterizedTest
     @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
     public void testCreateShouldFailIfSchemaEvolutionIsDisabled(SinkRecordFactory factory) {
-        startSinkConnector(getDefaultSinkConfig());
+        Map<String, String> defaultSinkConfig = getDefaultSinkConfig();
+        startSinkConnector(defaultSinkConfig);
         assertSinkConnectorIsRunning();
 
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
+
+        JdbcSinkConnectorConfig config = getConfig(defaultSinkConfig);
         try {
-            consume(factory.createRecordNoKey(topicName));
+            consume(factory.createRecordNoKey(topicName, config));
             stopSinkConnector();
         }
         catch (Throwable t) {
-            assertThat(t.getCause().getCause().getMessage()).startsWith("Could not find table: ");
+            assertExceptionCauseMessage(t, "Could not find table: .*");
         }
     }
 
     @ParameterizedTest
     @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
     public void testUpdateShouldFailOnUnknownTableIfSchemaEvolutionIsDisabled(SinkRecordFactory factory) {
-        startSinkConnector(getDefaultSinkConfig());
+        Map<String, String> defaultSinkConfig = getDefaultSinkConfig();
+        startSinkConnector(defaultSinkConfig);
         assertSinkConnectorIsRunning();
 
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
+        JdbcSinkConnectorConfig config = getConfig(defaultSinkConfig);
         try {
-            consume(factory.updateRecord(topicName));
+            consume(factory.updateRecord(topicName, config));
             stopSinkConnector();
         }
         catch (Throwable t) {
-            assertThat(t.getCause().getCause().getMessage()).startsWith("Could not find table: ");
+            assertExceptionCauseMessage(t, "Could not find table: .*");
         }
     }
 
     @ParameterizedTest
     @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
     public void testDeleteShouldFailOnUnknownTableIfSchemaEvolutionIsDisabled(SinkRecordFactory factory) {
-        startSinkConnector(getDefaultSinkConfig());
+        Map<String, String> defaultSinkConfig = getDefaultSinkConfig();
+        startSinkConnector(defaultSinkConfig);
         assertSinkConnectorIsRunning();
 
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
+        JdbcSinkConnectorConfig config = getConfig(defaultSinkConfig);
         try {
-            consume(factory.deleteRecord(topicName));
+            consume(factory.deleteRecord(topicName, config));
             stopSinkConnector();
         }
         catch (Throwable t) {
-            assertThat(t.getCause().getCause().getMessage()).startsWith("Could not find table: ");
+            assertExceptionCauseMessage(t, "Could not find table: .*");
         }
     }
 
@@ -115,7 +181,8 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecordNoKey(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecordNoKey(topicName, config);
         consume(createRecord);
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
@@ -137,7 +204,8 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord updateRecord = factory.updateRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord updateRecord = factory.updateRecord(topicName, config);
         consume(updateRecord);
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(updateRecord));
@@ -160,7 +228,8 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord deleteRecord = factory.deleteRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord deleteRecord = factory.deleteRecord(topicName, config);
         consume(deleteRecord);
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(deleteRecord));
@@ -182,10 +251,11 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
 
-        final KafkaDebeziumSinkRecord updateRecord = factory.updateBuilder()
+        final JdbcKafkaSinkRecord updateRecord = factory.updateBuilder(config)
                 .name("prefix")
                 .topic(topicName)
                 .keySchema(factory.basicKeySchema())
@@ -227,10 +297,11 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
 
-        final KafkaDebeziumSinkRecord updateRecord = factory.updateBuilder()
+        final JdbcKafkaSinkRecord updateRecord = factory.updateBuilder(config)
                 .name("prefix")
                 .topic(topicName)
                 .keySchema(factory.basicKeySchema())
@@ -263,8 +334,9 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
+        JdbcSinkConnectorConfig config = getConfig(properties);
         // Create record, optionals provided.
-        final KafkaDebeziumSinkRecord createRecord = factory.createBuilder()
+        final JdbcKafkaSinkRecord createRecord = factory.createBuilder(config)
                 .name("prefix")
                 .topic(topicName)
                 .keySchema(factory.basicKeySchema())
@@ -336,8 +408,9 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
+        JdbcSinkConnectorConfig config = getConfig(properties);
         // Create record, optionals provided.
-        final KafkaDebeziumSinkRecord createRecord = factory.createBuilder()
+        final JdbcKafkaSinkRecord createRecord = factory.createBuilder(config)
                 .name("prefix")
                 .topic(topicName)
                 .keySchema(factory.basicKeySchema())
@@ -422,8 +495,9 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
+        JdbcSinkConnectorConfig config = getConfig(properties);
         // Create record, optionals provided.
-        final KafkaDebeziumSinkRecord createRecord = factory.createBuilder()
+        final JdbcKafkaSinkRecord createRecord = factory.createBuilder(config)
                 .name("prefix")
                 .topic(topicName)
                 .keySchema(factory.basicKeySchema())
@@ -472,6 +546,26 @@ public abstract class AbstractJdbcSinkSchemaEvolutionTest extends AbstractJdbcSi
             getSink().assertColumnType(tableAssert, "col_bool", ValueType.BOOLEAN, true);
             getSink().assertColumnType(tableAssert, "col_bool_optional", ValueType.BOOLEAN, true);
         }
+    }
+
+    private Map<String, String> getValidateOnlySinkConfig(String topicName) {
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.VALIDATE_ONLY.getValue());
+        properties.put(SinkTask.TOPICS_CONFIG, topicName);
+        return properties;
+    }
+
+    private Map<String, String> getValidateOnlyRegexSinkConfig() {
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.VALIDATE_ONLY.getValue());
+        properties.put(SinkTask.TOPICS_REGEX_CONFIG, "server1\\.schema\\..*");
+        return properties;
+    }
+
+    private String destinationTableName(String topicName, Map<String, String> properties) {
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final String tableName = config.getCollectionNameFormat().replace("${topic}", topicName.replace(".", "_"));
+        return getSink().formatTableName(tableName);
     }
 
 }

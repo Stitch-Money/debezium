@@ -73,6 +73,12 @@ import io.debezium.connector.jdbc.type.debezium.MicroTimeType;
 import io.debezium.connector.jdbc.type.debezium.MicroTimestampType;
 import io.debezium.connector.jdbc.type.debezium.NanoTimeType;
 import io.debezium.connector.jdbc.type.debezium.NanoTimestampType;
+import io.debezium.connector.jdbc.type.debezium.StructuredDateType;
+import io.debezium.connector.jdbc.type.debezium.StructuredDurationType;
+import io.debezium.connector.jdbc.type.debezium.StructuredTimeType;
+import io.debezium.connector.jdbc.type.debezium.StructuredTimestampType;
+import io.debezium.connector.jdbc.type.debezium.StructuredZonedTimeType;
+import io.debezium.connector.jdbc.type.debezium.StructuredZonedTimestampType;
 import io.debezium.connector.jdbc.type.debezium.TimeType;
 import io.debezium.connector.jdbc.type.debezium.TimestampType;
 import io.debezium.connector.jdbc.type.debezium.VariableScaleDecimalType;
@@ -355,13 +361,23 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
 
         builder.appendLists(", ", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> columnNameFromField(name, record));
 
-        builder.append(") VALUES (");
+        builder.append(")");
+        builder.append(getOverrideClause(table));
+        builder.append(" VALUES (");
 
         builder.appendLists(", ", record.keyFieldNames(), record.nonKeyFieldNames(), (name) -> columnQueryBindingFromField(name, table, record));
 
         builder.append(")");
 
         return builder.build();
+    }
+
+    /**
+     * Returns the SQL standard override clause to place after an INSERT column list, carrying its own
+     * leading space, or an empty string when the dialect needs none.
+     */
+    protected String getOverrideClause(TableDescriptor table) {
+        return "";
     }
 
     @Override
@@ -400,10 +416,10 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
     }
 
     @Override
-    public String getTruncateStatement(TableDescriptor table) {
+    public String getTruncateStatement(CollectionId collectionId) {
         final SqlStatementBuilder builder = new SqlStatementBuilder();
         builder.append("TRUNCATE TABLE ");
-        builder.append(getQualifiedTableName(table.getId()));
+        builder.append(getQualifiedTableName(collectionId));
 
         return builder.build();
     }
@@ -415,8 +431,9 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
 
     @Override
     public List<ValueBindDescriptor> bindValue(JdbcFieldDescriptor field, int startIndex, Object value) {
-        LOGGER.trace("Bind field '{}' at position {} with type {}: {}", field.getName(), startIndex, getSchemaType(field.getSchema()).getClass().getName(), value);
-        return field.bind(startIndex, value);
+        var schemaType = getSchemaType(field.getSchema());
+        LOGGER.trace("Bind field '{}' at position {} with type {}: {}", field.getName(), startIndex, schemaType.getClass().getName(), value);
+        return field.bind(startIndex, value, schemaType);
     }
 
     @Override
@@ -447,6 +464,10 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
 
     @Override
     public JdbcType getSchemaType(Schema schema) {
+        if (schema == null) {
+            throw new DebeziumException("Schema is null");
+        }
+
         if (!Objects.isNull(schema.name())) {
             final JdbcType type = typeRegistry.get(schema.name());
             if (!Objects.isNull(type)) {
@@ -478,6 +499,14 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
         if (!Objects.isNull(type)) {
             LOGGER.trace("Schema type '{}' resolved by name from registry to type '{}'", schema.type().name(), type);
             return type;
+        }
+
+        if (schema.name() == null) {
+            throw new ConnectException(
+                    String.format(
+                            "Failed to resolve column type for schema: %s (%s)",
+                            schema.type(),
+                            schema.name()));
         }
 
         switch (schema.name()) {
@@ -658,6 +687,12 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
         registerType(NanoTimestampType.INSTANCE);
         registerType(ZonedTimeType.INSTANCE);
         registerType(DebeziumZonedTimestampType.INSTANCE);
+        registerType(StructuredDateType.INSTANCE);
+        registerType(StructuredTimeType.INSTANCE);
+        registerType(StructuredTimestampType.INSTANCE);
+        registerType(StructuredZonedTimeType.INSTANCE);
+        registerType(StructuredZonedTimestampType.INSTANCE);
+        registerType(StructuredDurationType.INSTANCE);
         registerType(VariableScaleDecimalType.INSTANCE);
 
         // Supported connect data types
@@ -723,7 +758,8 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
         else {
             value = getColumnValueFromKeyField(fieldName, record, columnName);
         }
-        return record.jdbcFields().get(fieldName).getQueryBinding(column, value);
+        JdbcFieldDescriptor jdbcField = record.jdbcFields().get(fieldName);
+        return jdbcField.getQueryBinding(column, value, getSchemaType(jdbcField.getSchema()));
     }
 
     private Object getColumnValueFromKeyField(String fieldName, JdbcSinkRecord record, String columnName) {
@@ -804,7 +840,7 @@ public class GeneralDatabaseDialect implements DatabaseDialect {
         final JdbcFieldDescriptor field = record.jdbcFields().get(fieldName);
         final String columnName = resolveColumnName(field);
         final ColumnDescriptor column = table.getColumnByName(columnName);
-        return toIdentifier(columnName) + "=" + field.getQueryBinding(column, record.getPayload());
+        return toIdentifier(columnName) + "=" + field.getQueryBinding(column, record.getPayload(), getSchemaType(field.getSchema()));
     }
 
     private static boolean isColumnNullable(String columnName, Collection<String> primaryKeyColumnNames, int nullability) {

@@ -15,14 +15,15 @@ import java.util.stream.StreamSupport;
 
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.apache.kafka.connect.storage.Converter;
-import org.apache.kafka.connect.storage.ConverterConfig;
-import org.apache.kafka.connect.storage.HeaderConverter;
 
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.converter.kafka.KafkaConnectConverterAdapter;
+import io.debezium.converter.kafka.KafkaConnectHeaderConverterAdapter;
 import io.debezium.engine.Header;
+import io.debezium.engine.converter.Converter;
+import io.debezium.engine.converter.HeaderConverter;
 import io.debezium.engine.format.Avro;
 import io.debezium.engine.format.Binary;
 import io.debezium.engine.format.CloudEvents;
@@ -104,13 +105,15 @@ public class ConverterBuilder<R> {
 
                 if (headerConverter != null) {
                     for (org.apache.kafka.connect.header.Header header : record.headers()) {
-                        byte[] rawHeader = headerConverter.fromConnectHeader(topicName, header.key(), header.schema(), header.value());
-                        recordHeaders.add(header.key(), rawHeader);
+                        byte[] rawHeader = headerConverter.fromHeader(topicName, header.key(), header.schema(), header.value());
+                        if (rawHeader != null) {
+                            recordHeaders.add(header.key(), rawHeader);
+                        }
                     }
                 }
 
-                final byte[] key = keyConverter.fromConnectData(topicName, recordHeaders, record.keySchema(), record.key());
-                final byte[] value = valueConverter.fromConnectData(topicName, recordHeaders, record.valueSchema(), record.value());
+                final byte[] key = keyConverter.fromDebeziumData(topicName, recordHeaders, record.keySchema(), record.key());
+                final byte[] value = valueConverter.fromDebeziumData(topicName, recordHeaders, record.valueSchema(), record.value());
 
                 List<Header<byte[]>> byteArrayHeaders = convertHeaders(recordHeaders);
                 List<Header<?>> headers = (List) byteArrayHeaders;
@@ -138,20 +141,27 @@ public class ConverterBuilder<R> {
         return (record) -> ((EmbeddedEngineChangeEvent<?, ?, ?>) record).sourceRecord();
     }
 
-    private static boolean isFormat(Class<? extends SerializationFormat<?>> format1, Class<? extends SerializationFormat<?>> format2) {
-        return format1 == format2;
+    @SafeVarargs
+    private static boolean isFormat(Class<? extends SerializationFormat<?>> format,
+                                    Class<? extends SerializationFormat<?>>... candidates) {
+        for (final var candidate : candidates) {
+            if (format == candidate) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean shouldConvertKeyToString() {
-        return isFormat(formatKey, Json.class) || isFormat(formatKey, SimpleString.class);
+        return isFormat(formatKey, Json.class, SimpleString.class);
     }
 
     private boolean shouldConvertValueToString() {
-        return isFormat(formatValue, Json.class) || isFormat(formatValue, SimpleString.class) || isFormat(formatValue, CloudEvents.class);
+        return isFormat(formatValue, Json.class, SimpleString.class, CloudEvents.class);
     }
 
     private boolean shouldConvertHeadersToString() {
-        return isFormat(formatHeader, Json.class);
+        return isFormat(formatHeader, Json.class, SimpleString.class);
     }
 
     private List<Header<byte[]>> convertHeaders(org.apache.kafka.common.header.Headers recordHeaders) {
@@ -168,11 +178,14 @@ public class ConverterBuilder<R> {
         Configuration converterConfig = config.subset(HEADER_CONVERTER_PREFIX, true);
         final Configuration commonConverterConfig = config.subset(CONVERTER_PREFIX, true);
         converterConfig = commonConverterConfig.edit().with(converterConfig)
-                .with(ConverterConfig.TYPE_CONFIG, "header")
+                .with("converter.type", "header")
                 .build();
 
-        if (isFormat(format, Json.class) || isFormat(format, JsonByteArray.class)) {
+        if (isFormat(format, Json.class, JsonByteArray.class)) {
             converterConfig = converterConfig.edit().withDefault(FIELD_CLASS, "org.apache.kafka.connect.json.JsonConverter").build();
+        }
+        else if (isFormat(format, SimpleString.class)) {
+            converterConfig = converterConfig.edit().withDefault(FIELD_CLASS, "org.apache.kafka.connect.storage.StringConverter").build();
         }
         else if (isFormat(format, ClientProvided.class)) {
             if (converterConfig.getString(FIELD_CLASS) == null) {
@@ -183,9 +196,7 @@ public class ConverterBuilder<R> {
         else {
             throw new DebeziumException("Header Converter '" + format.getSimpleName() + "' is not supported");
         }
-        final HeaderConverter converter = converterConfig.getInstance(FIELD_CLASS, HeaderConverter.class);
-        converter.configure(converterConfig.asMap());
-        return converter;
+        return new KafkaConnectHeaderConverterAdapter(converterConfig, FIELD_CLASS);
     }
 
     private Converter createConverter(Class<? extends SerializationFormat<?>> format, boolean key) {
@@ -196,7 +207,7 @@ public class ConverterBuilder<R> {
         final Configuration commonConverterConfig = config.subset(CONVERTER_PREFIX, true);
         converterConfig = commonConverterConfig.edit().with(converterConfig).build();
 
-        if (isFormat(format, Json.class) || isFormat(format, JsonByteArray.class)) {
+        if (isFormat(format, Json.class, JsonByteArray.class)) {
             if (converterConfig.hasKey(APICURIO_SCHEMA_REGISTRY_URL_CONFIG)) {
                 converterConfig = converterConfig.edit().withDefault(FIELD_CLASS, "io.apicurio.registry.utils.converter.ExtJsonConverter").build();
             }
@@ -237,8 +248,6 @@ public class ConverterBuilder<R> {
         else {
             throw new DebeziumException("Converter '" + format.getSimpleName() + "' is not supported");
         }
-        final Converter converter = converterConfig.getInstance(FIELD_CLASS, Converter.class);
-        converter.configure(converterConfig.asMap(), key);
-        return converter;
+        return new KafkaConnectConverterAdapter(converterConfig, FIELD_CLASS, key);
     }
 }

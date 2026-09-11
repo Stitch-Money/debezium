@@ -12,11 +12,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.connector.binlog.jdbc.BinlogSystemVariables;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.relational.CustomConverterRegistry;
 import io.debezium.relational.DefaultValueConverter;
@@ -28,6 +30,7 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
 import io.debezium.relational.TableSchemaBuilder;
+import io.debezium.relational.Tables;
 import io.debezium.relational.ValueConverterProvider;
 import io.debezium.relational.ddl.DdlChanges;
 import io.debezium.relational.ddl.DdlParser;
@@ -53,6 +56,7 @@ public abstract class BinlogDatabaseSchema<P extends BinlogPartition, O extends 
         extends HistorizedRelationalDatabaseSchema {
 
     private final static Logger LOGGER = LoggerFactory.getLogger(BinlogDatabaseSchema.class);
+    private static final Pattern TRUNCATE_STATEMENT_PATTERN = Pattern.compile("(SET STATEMENT .*)?TRUNCATE TABLE .*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
     private final Set<String> ignoredQueryStatements = Collect.unmodifiableSet("BEGIN", "END", "FLUSH PRIVILEGES");
     private final DdlParser ddlParser;
@@ -60,6 +64,8 @@ public abstract class BinlogDatabaseSchema<P extends BinlogPartition, O extends 
     private final Map<Long, TableId> tableIdsByTableNumber = new ConcurrentHashMap<>();
     private final Map<Long, TableId> excludeTableIdsByTableNumber = new ConcurrentHashMap<>();
     private final BinlogConnectorConfig connectorConfig;
+    private final V valueConverter;
+    private final boolean tableIdCaseInsensitive;
 
     /**
      * Creates a binlog-connector based relational schema based on the supplied configuration. The DDL
@@ -98,6 +104,27 @@ public abstract class BinlogDatabaseSchema<P extends BinlogPartition, O extends 
         this.ddlParser = createDdlParser(connectorConfig, valueConverter);
         this.connectorConfig = connectorConfig;
         this.filters = connectorConfig.getTableFilters();
+        this.valueConverter = valueConverter;
+        this.tableIdCaseInsensitive = tableIdCaseInsensitive;
+    }
+
+    /**
+     * Parses a table definition, as returned by {@code SHOW CREATE TABLE}, into a {@link Table} without
+     * mutating the live schema state. A short-lived parser instance is used so that the shared parser
+     * used for the streaming phase is not affected by this call (debezium/dbz#1550).
+     *
+     * @param tableId the fully-qualified identifier of the table the definition belongs to; should not be null
+     * @param createTableDdl the {@code CREATE TABLE} statement text; should not be null
+     * @param systemVariables the system variables for the connection that returned the table definition; should not be null
+     * @return the parsed table definition, or {@code null} if the statement did not produce the requested table
+     */
+    Table parseTableDefinition(TableId tableId, String createTableDdl, Map<String, String> systemVariables) {
+        final DdlParser parser = createDdlParser(connectorConfig, valueConverter);
+        final Tables parsedTables = new Tables(tableIdCaseInsensitive);
+        systemVariables.forEach((name, value) -> parser.systemVariables().setVariable(BinlogSystemVariables.BinlogScope.SESSION, name, value));
+        parser.setCurrentDatabase(tableId.catalog());
+        parser.parse(createTableDdl, parsedTables);
+        return parsedTables.forTable(tableId);
     }
 
     @Override
@@ -323,6 +350,13 @@ public abstract class BinlogDatabaseSchema<P extends BinlogPartition, O extends 
         }
 
         // No need to send schema events or store DDL if no table has changed
+        // Also skip if DDL matches the filter (e.g., CREATE FUNCTION, PROCEDURE, VIEW, TRIGGER)
+        // BUT do NOT filter TRUNCATE statements as they need special handling based on skipped.operations config
+        if (!TRUNCATE_STATEMENT_PATTERN.matcher(ddlStatements).matches() && ddlFilter().test(ddlStatements)) {
+            LOGGER.debug("Changes for DDL '{}' were filtered and not recorded in database schema history", ddlStatements);
+            return schemaChangeEvents;
+        }
+
         if (!storeOnlyCapturedTables() || isGlobalSetVariableStatement(ddlStatements, databaseName) || ddlChanges.anyMatch(filters)) {
             // We are supposed to _also_ record the schema changes as SourceRecords, but these need to be filtered
             // by database. Unfortunately, the databaseName on the event might not be the same database as that

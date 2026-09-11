@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 
 import io.debezium.antlr.AntlrDdlParser;
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
+import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode;
 import io.debezium.connector.binlog.jdbc.BinlogDefaultValueConverter;
 import io.debezium.connector.binlog.jdbc.BinlogValueConverters;
 import io.debezium.doc.FixFor;
@@ -63,7 +64,8 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
                 converters,
                 getDefaultValueConverter(converters),
                 SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false);
+                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false,
+                EventConvertingFailureHandlingMode.WARN);
 
     }
 
@@ -202,7 +204,8 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
                 converters,
                 getDefaultValueConverter(converters),
                 SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false);
+                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false,
+                EventConvertingFailureHandlingMode.WARN);
 
         String sql = "CREATE TABLE UNSIGNED_BIGINT_TABLE (\n" +
                 "  A BIGINT UNSIGNED NULL DEFAULT 0,\n" +
@@ -228,13 +231,13 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
     }
 
     @Test
-    void parseStringDefaultValue() {
+    public void parseStringDefaultValue() {
         String sql = "CREATE TABLE UNSIGNED_STRING_TABLE (\n" +
                 "  A CHAR NULL DEFAULT 'A',\n" +
                 "  B CHAR CHARACTER SET utf8 NULL DEFAULT 'b',\n" +
                 "  C VARCHAR(10) NULL DEFAULT 'CC',\n" +
                 "  D NCHAR(10) NULL DEFAULT '10',\n" +
-                "  E NVARCHAR NULL DEFAULT '0',\n" +
+                "  E NVARCHAR(100) NULL DEFAULT '0',\n" +
                 "  F CHAR DEFAULT NULL,\n" +
                 "  G VARCHAR(10) DEFAULT NULL,\n" +
                 "  H NCHAR(10) DEFAULT NULL\n" +
@@ -313,7 +316,7 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
         parser.parse(sql, tables);
         Table table = tables.forTable(new TableId(null, null, "NUMBER_TABLE"));
 
-        assertThat(getColumnSchema(table, "A").defaultValue()).isEqualTo((short) 10);
+        assertThat(getColumnSchema(table, "A").defaultValue()).isEqualTo((byte) 10);
         assertThat(getColumnSchema(table, "B").defaultValue()).isEqualTo((short) 5);
         assertThat(getColumnSchema(table, "C").defaultValue()).isEqualTo(0);
         assertThat(getColumnSchema(table, "D").defaultValue()).isEqualTo(20L);
@@ -360,7 +363,8 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
                 converters,
                 getDefaultValueConverter(converters),
                 SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false);
+                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false,
+                EventConvertingFailureHandlingMode.WARN);
         String sql = "CREATE TABLE NUMERIC_DECIMAL_TABLE (\n" +
                 "  A NUMERIC NOT NULL DEFAULT 1.23,\n" +
                 "  B DECIMAL(5,3) NOT NULL DEFAULT 2.321,\n" +
@@ -494,10 +498,10 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
         Table table = tables.forTable(new TableId(null, null, "data"));
 
         assertThat((Boolean) getColumnSchema(table, "bval").defaultValue()).isTrue();
-        assertThat((Short) getColumnSchema(table, "tival1").defaultValue()).isZero();
-        assertThat((Short) getColumnSchema(table, "tival2").defaultValue()).isEqualTo((short) 3);
-        assertThat((Short) getColumnSchema(table, "tival3").defaultValue()).isEqualTo((short) 1);
-        assertThat((Short) getColumnSchema(table, "tival4").defaultValue()).isEqualTo((short) 18);
+        assertThat((Byte) getColumnSchema(table, "tival1").defaultValue()).isZero();
+        assertThat((Byte) getColumnSchema(table, "tival2").defaultValue()).isEqualTo((byte) 3);
+        assertThat((Byte) getColumnSchema(table, "tival3").defaultValue()).isEqualTo((byte) 1);
+        assertThat((Byte) getColumnSchema(table, "tival4").defaultValue()).isEqualTo((byte) 18);
     }
 
     @Test
@@ -595,7 +599,8 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
                 converters,
                 getDefaultValueConverter(converters),
                 SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false);
+                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false,
+                EventConvertingFailureHandlingMode.WARN);
         String ddl = "CREATE TABLE `tbl_default` (  \n"
                 + "`id` int(11) NOT NULL AUTO_INCREMENT,\n"
                 + "c0 tinyint not null default '10.01',\n"
@@ -613,7 +618,7 @@ public abstract class BinlogDefaultValueTest<V extends BinlogValueConverters, P 
         assertThat(tables.size()).isEqualTo(1);
 
         TableSchema schema = tableSchemaBuilder.create(defaultTopicNamingStrategy(), table, null, null, null);
-        assertThat(getColumnSchema(schema, "c0").defaultValue()).isEqualTo((short) 10);
+        assertThat(getColumnSchema(schema, "c0").defaultValue()).isEqualTo((byte) 10);
         assertThat(getColumnSchema(schema, "c1").defaultValue()).isEqualTo(5);
         assertThat(getColumnSchema(schema, "c2").defaultValue()).isEqualTo(0L);
         assertThat(getColumnSchema(schema, "c3").defaultValue()).isEqualTo(0L);

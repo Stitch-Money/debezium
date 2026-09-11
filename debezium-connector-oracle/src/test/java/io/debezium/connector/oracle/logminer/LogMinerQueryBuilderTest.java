@@ -52,11 +52,6 @@ import io.debezium.util.Strings;
 @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER)
 public class LogMinerQueryBuilderTest {
 
-    private static final String LOG_MINER_QUERY_BASE = "SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, " +
-            "XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, " +
-            "THREAD#, DATA_OBJ#, DATA_OBJV#, DATA_OBJD#, CLIENT_ID, START_SCN, COMMIT_SCN, " +
-            "START_TIMESTAMP, COMMIT_TIMESTAMP, SEQUENCE# FROM V$LOGMNR_CONTENTS WHERE ";
-
     @Test
     void testLogMinerQueryFilterNone() {
         testLogMinerQueryFilterMode(LogMiningQueryFilterMode.NONE);
@@ -113,9 +108,50 @@ public class LogMinerQueryBuilderTest {
     }
 
     @Test
-    @FixFor("DBZ-8884")
-    public void testLegacyTransactionStartBufferingBehavior() {
-        assertQuery(TestHelper.defaultConfig().with(OracleConnectorConfig.LOG_MINING_BUFFER_MEMORY_LEGACY_TRANSACTION_START, false).build());
+    @FixFor("debezium/dbz#1663")
+    public void testDeferredTransactionStartBufferingBehavior() {
+        assertQuery(TestHelper.defaultConfig().with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, false).build());
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1663")
+    public void testLogMinerQueryWithUsernameNotTracked() {
+        assertQuery(new ConfigBuilder().with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, "false"));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1663")
+    public void testLogMinerQueryWithRsIdNotTracked() {
+        assertQuery(new ConfigBuilder().with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_RS_ID, "false"));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1663")
+    public void testLogMinerQueryWithClientIdNotTracked() {
+        assertQuery(new ConfigBuilder().with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID, "false"));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1663")
+    public void testLogMinerQueryWithStartTimestampNotTracked() {
+        assertQuery(new ConfigBuilder().with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_START_TIMESTAMP, "false"));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1663")
+    public void testLogMinerQueryWithCommitTimestampNotTracked() {
+        assertQuery(new ConfigBuilder().with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_COMMIT_TIMESTAMP, "false"));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1663")
+    public void testLogMinerQueryWithAllOptionalColumnsNotTracked() {
+        assertQuery(new ConfigBuilder()
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, "false")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_RS_ID, "false")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID, "false")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_START_TIMESTAMP, "false")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_COMMIT_TIMESTAMP, "false"));
     }
 
     private void testLogMinerQueryFilterMode(LogMiningQueryFilterMode mode) {
@@ -136,6 +172,11 @@ public class LogMinerQueryBuilderTest {
         final String users = "U1,U2, U3, U4";
         assertQuery(getBuilderForMode(mode).with(LOG_MINING_USERNAME_INCLUDE_LIST, users));
         assertQuery(getBuilderForMode(mode).with(LOG_MINING_USERNAME_EXCLUDE_LIST, users));
+
+        // Client Id Include/Excludes
+        final String clientIds = "abc,xyz";
+        assertQuery(getBuilderForMode(mode).with(OracleConnectorConfig.LOG_MINING_CLIENTID_INCLUDE_LIST, clientIds));
+        assertQuery(getBuilderForMode(mode).with(OracleConnectorConfig.LOG_MINING_CLIENTID_EXCLUDE_LIST, clientIds));
 
         // Table Includes/Exclude without Signal Collection Table + Signal Data Collection Specified
         final String signalTable = TestHelper.getDatabaseName() + ".DEBEZIUM1.SIGNAL_TABLE";
@@ -176,10 +217,55 @@ public class LogMinerQueryBuilderTest {
         assertThat(new BufferedLogMinerQueryBuilder(config).getQuery()).isEqualTo(getBufferedQuery(config));
     }
 
+    private String buildSelectColumns(OracleConnectorConfig config) {
+        final List<String> columns = new ArrayList<>();
+        // Mandatory first
+        columns.add("SCN");
+        columns.add("SQL_REDO");
+        columns.add("OPERATION_CODE");
+        columns.add("TIMESTAMP");
+        columns.add("XID");
+        columns.add("CSF");
+        columns.add("TABLE_NAME");
+        columns.add("SEG_OWNER");
+        columns.add("OPERATION");
+        columns.add("ROW_ID");
+        columns.add("ROLLBACK");
+        columns.add("STATUS");
+        columns.add("INFO");
+        columns.add("SSN");
+        columns.add("THREAD#");
+        columns.add("DATA_OBJ#");
+        columns.add("DATA_OBJV#");
+        columns.add("DATA_OBJD#");
+        columns.add("START_SCN");
+        columns.add("COMMIT_SCN");
+        columns.add("SEQUENCE#");
+
+        // Optional added at the end, order must match AbstractLogMinerQueryBuilder.buildColumnList()
+        if (config.isLogMiningBufferTrackStartTimestamp()) {
+            columns.add("START_TIMESTAMP");
+        }
+        if (config.isLogMiningBufferTrackCommitTimestamp()) {
+            columns.add("COMMIT_TIMESTAMP");
+        }
+        if (config.isLogMiningBufferTrackRsId()) {
+            columns.add("RS_ID");
+        }
+        if (config.isLogMiningBufferTrackUsername()) {
+            columns.add("USERNAME");
+        }
+        if (config.isLogMiningBufferTrackClientId()) {
+            columns.add("CLIENT_ID");
+        }
+
+        return String.join(", ", columns) + " ";
+    }
+
     private String getBufferedQuery(OracleConnectorConfig config) {
         final String operationDdlPredicate = " OR (OPERATION_CODE = 5 AND INFO NOT LIKE 'INTERNAL DDL%')";
 
-        String query = LOG_MINER_QUERY_BASE;
+        String query = "SELECT " + buildSelectColumns(config) + "FROM V$LOGMNR_CONTENTS WHERE ";
 
         query += "SCN > ? AND SCN <= ?";
         query += getPdbPredicate(config);
@@ -191,9 +277,7 @@ public class LogMinerQueryBuilderTest {
 
         final String codes = config.isLobEnabled()
                 ? "1,2,3,6,7,9,10,11,27,29,34,36,68,70,71,91,92,93,255"
-                : config.isLegacyLogMinerHeapTransactionStartBehaviorEnabled()
-                        ? "1,2,3,7,27,34,36,255"
-                        : "1,2,3,6,7,27,34,36,255";
+                : "1,2,3,6,7,27,34,36,255";
 
         query += "(";
         query += "OPERATION_CODE IN (" + codes + ")";
@@ -229,7 +313,8 @@ public class LogMinerQueryBuilderTest {
                     + applyTransactionMarkerExclusions("UPPER(USERNAME) IN ('UNKNOWN'," + includes.stream().map(this::quote).collect(Collectors.joining(",")) + ")");
         }
         else if (!excludes.isEmpty() && !queryFilterMode.equals(LogMiningQueryFilterMode.NONE)) {
-            return " AND " + applyTransactionMarkerExclusions("UPPER(USERNAME) NOT IN (" + excludes.stream().map(this::quote).collect(Collectors.joining(",")) + ")");
+            return " AND " + applyTransactionMarkerExclusions(
+                    "(UPPER(USERNAME) NOT IN (" + excludes.stream().map(this::quote).collect(Collectors.joining(",")) + ") OR USERNAME IS NULL)");
         }
         else {
             return "";
@@ -242,10 +327,11 @@ public class LogMinerQueryBuilderTest {
         final Set<String> excludes = config.getLogMiningClientIdExcludes();
 
         if (!includes.isEmpty() && !queryFilterMode.equals(LogMiningQueryFilterMode.NONE)) {
-            return " AND " + applyTransactionMarkerExclusions("UPPER(CLIENT_ID) IN (" + includes.stream().map(this::quote).collect(Collectors.joining(",")) + ")");
+            return " AND " + applyTransactionMarkerExclusions("UPPER(CLIENT_ID) IN (" + includes.stream().map(this::quoteUpper).collect(Collectors.joining(",")) + ")");
         }
         else if (!excludes.isEmpty() && !queryFilterMode.equals(LogMiningQueryFilterMode.NONE)) {
-            return " AND " + applyTransactionMarkerExclusions("UPPER(CLIENT_ID) NOT IN (" + excludes.stream().map(this::quote).collect(Collectors.joining(",")) + ")");
+            return " AND " + applyTransactionMarkerExclusions(
+                    "(UPPER(CLIENT_ID) NOT IN (" + excludes.stream().map(this::quoteUpper).collect(Collectors.joining(",")) + ") OR CLIENT_ID IS NULL)");
         }
         else {
             return "";
@@ -494,6 +580,10 @@ public class LogMinerQueryBuilderTest {
 
     private String quote(String value) {
         return "'" + value + "'";
+    }
+
+    private String quoteUpper(String value) {
+        return "'" + value.trim().toUpperCase() + "'";
     }
 
     private class ConfigBuilder {

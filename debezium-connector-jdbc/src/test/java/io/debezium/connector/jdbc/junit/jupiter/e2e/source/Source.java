@@ -15,11 +15,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.awaitility.Awaitility;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 import org.testcontainers.containers.output.FrameConsumerResultCallback;
 import org.testcontainers.containers.output.OutputFrame;
 import org.testcontainers.containers.output.WaitingConsumer;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
 
 import com.github.dockerjava.api.command.LogContainerCmd;
 
@@ -132,7 +132,8 @@ public class Source extends JdbcConnectionProvider {
                     }
                 }
                 try {
-                    wait.waitUntil(f -> f.getUtf8String().contains(message), 20, TimeUnit.SECONDS);
+                    int timeoutSeconds = (type == SourceType.SQLSERVER) ? 120 : 20;
+                    wait.waitUntil(f -> f.getUtf8String().contains(message), timeoutSeconds, TimeUnit.SECONDS);
                 }
                 catch (TimeoutException e) {
                     throw new IllegalStateException("Failed to wait for '" + message + "'", e);

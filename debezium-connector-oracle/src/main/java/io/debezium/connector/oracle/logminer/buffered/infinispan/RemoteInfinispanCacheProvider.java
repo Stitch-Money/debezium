@@ -7,6 +7,7 @@ package io.debezium.connector.oracle.logminer.buffered.infinispan;
 
 import static io.debezium.connector.oracle.OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_EVENTS;
 import static io.debezium.connector.oracle.OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_PROCESSED_TRANSACTIONS;
+import static io.debezium.connector.oracle.OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_ROLLBACKS;
 import static io.debezium.connector.oracle.OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_SCHEMA_CHANGES;
 import static io.debezium.connector.oracle.OracleConnectorConfig.LOG_MINING_BUFFER_INFINISPAN_CACHE_TRANSACTIONS;
 
@@ -84,20 +85,29 @@ public class RemoteInfinispanCacheProvider extends AbstractCacheProvider<Infinis
 
     @Override
     public void close() throws Exception {
-        if (dropBufferOnStop) {
-            LOGGER.info("Clearing infinispan caches");
-            transactionCache.clear();
-            schemaChangesCache.clear();
-            processedTransactionsCache.clear();
+        final boolean wasInterrupted = Thread.interrupted();
+        try {
+            if (dropBufferOnStop) {
+                LOGGER.info("Clearing infinispan caches");
+                transactionCache.clear();
+                schemaChangesCache.clear();
+                processedTransactionsCache.clear();
 
-            // this block should only be used by tests, should we wrap this in case admin rights aren't given?
-            cacheManager.administration().removeCache(TRANSACTIONS_CACHE_NAME);
-            cacheManager.administration().removeCache(PROCESSED_TRANSACTIONS_CACHE_NAME);
-            cacheManager.administration().removeCache(SCHEMA_CHANGES_CACHE_NAME);
-            cacheManager.administration().removeCache(EVENTS_CACHE_NAME);
+                // this block should only be used by tests, should we wrap this in case admin rights aren't given?
+                cacheManager.administration().removeCache(TRANSACTIONS_CACHE_NAME);
+                cacheManager.administration().removeCache(PROCESSED_TRANSACTIONS_CACHE_NAME);
+                cacheManager.administration().removeCache(SCHEMA_CHANGES_CACHE_NAME);
+                cacheManager.administration().removeCache(EVENTS_CACHE_NAME);
+                cacheManager.administration().removeCache(ROLLBACKS_CACHE_NAME);
+            }
+            LOGGER.info("Shutting down infinispan remote caches");
+            cacheManager.close();
         }
-        LOGGER.info("Shutting down infinispan remote caches");
-        cacheManager.close();
+        finally {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private <C, V> RemoteCache<C, V> createCache(String cacheName, OracleConnectorConfig connectorConfig, Field field) {
@@ -125,7 +135,8 @@ public class RemoteInfinispanCacheProvider extends AbstractCacheProvider<Infinis
     private InfinispanLogMinerTransactionCache createTransactionCache(OracleConnectorConfig connectorConfig) {
         return new InfinispanLogMinerTransactionCache(
                 createCache(TRANSACTIONS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_TRANSACTIONS),
-                createCache(EVENTS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_EVENTS));
+                createCache(EVENTS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_EVENTS),
+                createCache(ROLLBACKS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_ROLLBACKS));
     }
 
     private InfinispanLogMinerCache<String, String> createProcessedTransactionCache(OracleConnectorConfig connectorConfig) {

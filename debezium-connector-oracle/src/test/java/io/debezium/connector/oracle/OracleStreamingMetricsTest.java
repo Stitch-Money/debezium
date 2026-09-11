@@ -7,6 +7,7 @@ package io.debezium.connector.oracle;
 
 import static io.debezium.config.CommonConnectorConfig.DEFAULT_MAX_BATCH_SIZE;
 import static io.debezium.config.CommonConnectorConfig.DEFAULT_MAX_QUEUE_SIZE;
+import static io.debezium.config.CommonConnectorConfig.DEFAULT_POLL_DISPATCH_INTERVAL_MILLIS;
 import static org.mockito.Mockito.mock;
 
 import java.time.Clock;
@@ -44,14 +45,16 @@ public abstract class OracleStreamingMetricsTest<T extends AbstractOracleStreami
 
         final ChangeEventQueue<DataChangeEvent> queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                 .pollInterval(Duration.of(DEFAULT_MAX_QUEUE_SIZE, ChronoUnit.MILLIS))
+                .pollDispatchInterval(Duration.of(DEFAULT_POLL_DISPATCH_INTERVAL_MILLIS, ChronoUnit.MILLIS))
                 .maxBatchSize(DEFAULT_MAX_BATCH_SIZE)
                 .maxQueueSize(DEFAULT_MAX_QUEUE_SIZE)
-                .queueProvider(new DefaultQueueProvider<>(DEFAULT_MAX_QUEUE_SIZE))
+                .queueProvider(createDefaultQueueProvider(DEFAULT_MAX_QUEUE_SIZE))
                 .build();
 
         final OracleTaskContext taskContext = mock(OracleTaskContext.class);
         Mockito.when(taskContext.getConnectorLogicalName()).thenReturn("connector name");
         Mockito.when(taskContext.getConnectorType()).thenReturn("connector type");
+        Mockito.when(taskContext.getConfig()).thenReturn(this.connectorConfig);
 
         final OracleEventMetadataProvider metadataProvider = new OracleEventMetadataProvider();
         fixedClock = Clock.fixed(Instant.parse("2021-05-15T12:30:00.00Z"), ZoneOffset.UTC);
@@ -64,4 +67,10 @@ public abstract class OracleStreamingMetricsTest<T extends AbstractOracleStreami
                                        EventMetadataProvider metadataProvider,
                                        OracleConnectorConfig connectorConfig,
                                        Clock clock);
+
+    private static DefaultQueueProvider<DataChangeEvent> createDefaultQueueProvider(int maxQueueSize) {
+        DefaultQueueProvider<DataChangeEvent> provider = new DefaultQueueProvider<>();
+        provider.configure(java.util.Map.of("max.queue.size", String.valueOf(maxQueueSize)));
+        return provider;
+    }
 }

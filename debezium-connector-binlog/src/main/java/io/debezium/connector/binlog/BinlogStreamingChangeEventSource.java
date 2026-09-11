@@ -8,6 +8,7 @@ package io.debezium.connector.binlog;
 import static io.debezium.util.Strings.isNullOrEmpty;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -18,16 +19,21 @@ import java.security.cert.X509Certificate;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import javax.net.ssl.KeyManager;
@@ -78,17 +84,21 @@ import io.debezium.connector.binlog.event.StopEventDataDeserializer;
 import io.debezium.connector.binlog.event.TransactionPayloadDeserializer;
 import io.debezium.connector.binlog.gtid.GtidSet;
 import io.debezium.connector.binlog.jdbc.BinlogConnectorConnection;
+import io.debezium.connector.binlog.jdbc.BinlogValueConverters;
 import io.debezium.connector.binlog.metrics.BinlogStreamingChangeEventSourceMetrics;
+import io.debezium.connector.binlog.util.RowImageUtils;
 import io.debezium.data.Envelope;
 import io.debezium.function.BlockingConsumer;
+import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
+import io.debezium.pipeline.monitor.OffsetActivityMonitor;
+import io.debezium.pipeline.monitor.OffsetActivityMonitorService;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.snapshot.SnapshotterService;
-import io.debezium.snapshot.mode.NeverSnapshotter;
 import io.debezium.time.Conversions;
 import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
@@ -109,6 +119,24 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     private static final String SET_STATEMENT_REGEX = "SET STATEMENT .* FOR";
     private static final Pattern TRUNCATE_STATEMENT_PATTERN = Pattern.compile("(SET STATEMENT .*)?TRUNCATE TABLE .*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
+    // DML statement prefixes used to filter out DML from DDL processing (DBZ-9428)
+    private static final String DML_INSERT_PREFIX = "INSERT ";
+    private static final String DML_UPDATE_PREFIX = "UPDATE ";
+    private static final String DML_DELETE_PREFIX = "DELETE ";
+    private static final String DML_REPLACE_PREFIX = "REPLACE ";
+
+    /**
+     * Regex to detect Create TABLE ... LIKE statements and extract both the new table and the
+     * reference (template) table.
+     */
+    private static final Pattern CREATE_TABLE_LIKE_PATTERN = Pattern.compile("""
+            (?i)CREATE\\s+TABLE\\s+\
+            (?:IF\\s+NOT\\s+EXISTS\\s+)?\
+            (?:(`[^`]+`|[^.`\\s]+)\\.)?(`[^`]+`|[^.`\\s]+)\
+            \\s+LIKE\\s+\
+            (?:(`[^`]+`|[^.`\\s;]+)\\.)?(`[^`]+`|[^.\\s;]+)\
+            """);
+
     private final BinaryLogClient client;
     private final BinlogStreamingChangeEventSourceMetrics<?, P> metrics;
     // todo: can we go back to accessing schema via task context? issue is all the generics :/
@@ -121,13 +149,16 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     private final ErrorHandler errorHandler;
     private final EventProcessingFailureHandlingMode eventDeserializationFailureHandlingMode;
     private final EventProcessingFailureHandlingMode inconsistentSchemaHandlingMode;
+    private final boolean resolveLikeTableSchema;
     private final SnapshotterService snapshotterService;
     private final Predicate<String> gtidDmlSourceFilter;
     private final boolean isGtidModeEnabled;
+    private final boolean isBinlogRowImageNoblob;
     private final AtomicLong totalRecordCounter = new AtomicLong();
     private final Map<String, Thread> binaryLogClientThreads = new ConcurrentHashMap<>(4);
     private final EnumMap<EventType, BlockingConsumer<Event>> eventHandlers = new EnumMap<>(EventType.class);
     private final float heartbeatIntervalFactor = 0.8f;
+    private final OffsetActivityMonitorService offsetActivityMonitorService;
 
     private int startingRowNumber = 0;
     private long initialEventsToSkip = 0L;
@@ -135,6 +166,7 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     private boolean ignoreDmlEventByGtidSource = false;
     private volatile Map<String, ?> lastOffset = null;
     private O effectiveOffsetContext;
+    private OffsetActivityMonitor<P, O> offsetActivityMonitor;
 
     @SingleThreadAccess("binlog client thread")
     protected Instant eventTimestamp;
@@ -159,18 +191,20 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
         this.metrics = metrics;
         this.eventDeserializationFailureHandlingMode = connectorConfig.getEventProcessingFailureHandlingMode();
         this.inconsistentSchemaHandlingMode = connectorConfig.getInconsistentSchemaFailureHandlingMode();
+        this.resolveLikeTableSchema = connectorConfig.isResolveLikeTableSchema();
         this.snapshotterService = snapshotterService;
         this.client = client;
         configureBinaryLogClient(client, connectorConfig, binaryLogClientThreads, connection);
         this.gtidDmlSourceFilter = getGtidDmlSourceFilter();
         this.isGtidModeEnabled = connection.isGtidModeEnabled();
+        this.isBinlogRowImageNoblob = connection.isBinlogRowImageNoblob();
+        this.offsetActivityMonitorService = OffsetActivityMonitorService.lookup(connectorConfig.getServiceRegistry());
     }
 
     @Override
     public void execute(ChangeEventSourceContext context, P partition, O offsetContext) throws InterruptedException {
-        if (!(snapshotterService.getSnapshotter() instanceof NeverSnapshotter)) {
-            schema.assureNonEmptySchema();
-        }
+        schema.assureNonEmptySchema();
+
         final Set<Envelope.Operation> skippedOperations = connectorConfig.getSkippedOperations();
 
         // Register our event handlers ...
@@ -226,10 +260,12 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
         metrics.setIsGtidModeEnabled(isGtidModeEnabled);
 
         // Get the current GtidSet from MySQL so we can get a filtered/merged GtidSet based off of the last Debezium checkpoint.
-        if (isGtidModeEnabled) {
+        if (isGtidModeEnabled && shouldRecoverUsingGtid()) {
             // The server is using GTIDs, so enable the handler ...
-            eventHandlers.put(getGtidEventType(),
-                    (event) -> handleGtidEvent(partition, effectiveOffsetContext, event, gtidDmlSourceFilter));
+            for (EventType eventType : getGtidEventTypes()) {
+                eventHandlers.put(eventType,
+                        (event) -> handleGtidEvent(partition, effectiveOffsetContext, event, gtidDmlSourceFilter));
+            }
 
             // Now look at the GTID set from the server and what we've previously seen ...
             GtidSet availableServerGtidSet = connection.knownGtidSet();
@@ -264,9 +300,14 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
                 else {
                     LOGGER.info("No GTID stored in the offset, but there is non-empty purged GTID set. Registering binlog reader with purged GTID set: '{}'",
                             purgedServerGtidSet.toString());
-                    client.setGtidSet(purgedServerGtidSet.toString());
-                    // We don't have stored any GTID in the offset, so start from empty GTID set.
-                    initializeGtidSet("");
+                    final String purgedServerGtidSetStr = purgedServerGtidSet.toString();
+                    client.setGtidSet(purgedServerGtidSetStr);
+                    // The purged GTID set is the effective starting floor for a no-snapshot start: the connector
+                    // intentionally skips everything at or below it. Record it in the offset and seed the accumulator
+                    // with it (mirroring the stored-offset branch above and the snapshot path's setCompletedGtidSet),
+                    // so the committed offset carries this floor and subsequent restarts validate it correctly.
+                    effectiveOffsetContext.setCompletedGtidSet(purgedServerGtidSetStr);
+                    initializeGtidSet(purgedServerGtidSetStr);
                 }
             }
         }
@@ -274,6 +315,10 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
             // The server is not using GTIDs, so start reading the binlog based upon where we last left off ...
             client.setBinlogFilename(effectiveOffsetContext.getSource().binlogFilename());
             client.setBinlogPosition(effectiveOffsetContext.getSource().binlogPosition());
+            if (isGtidModeEnabled) {
+                initializeGtidSet("");
+                prepareOffsetContextForBinlogRecovery(effectiveOffsetContext);
+            }
         }
 
         // We may be restarting in the middle of a transaction, so see how far into the transaction we have already processed...
@@ -358,6 +403,14 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
         return effectiveOffsetContext;
     }
 
+    @Override
+    public Optional<OffsetActivityMonitor<P, O>> getOffsetActivityMonitor() {
+        if (offsetActivityMonitor == null) {
+            offsetActivityMonitor = new BinlogOffsetActivityMonitor<>(connectorConfig.getOffsetActivityMonitorInterval());
+        }
+        return Optional.of(offsetActivityMonitor);
+    }
+
     protected void setEffectiveOffsetContext(O offsetContext) {
         this.effectiveOffsetContext = offsetContext;
     }
@@ -372,6 +425,14 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
 
     protected boolean isGtidModeEnabled() {
         return isGtidModeEnabled;
+    }
+
+    protected boolean shouldRecoverUsingGtid() {
+        return !connectorConfig.shouldIgnoreGtidOnRecovery();
+    }
+
+    protected void prepareOffsetContextForBinlogRecovery(O offsetContext) {
+        offsetContext.resetGtidSet();
     }
 
     /**
@@ -415,11 +476,31 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
         client.setKeepAlive(configuration.getBoolean(BinlogConnectorConfig.KEEP_ALIVE));
         client.setKeepAliveInterval(keepAliveInterval);
 
+        final int keepAliveMaxReconnectAttempts = connectorConfig.getKeepAliveMaxReconnectAttempts();
+        client.setKeepAliveMaxReconnectAttempts(keepAliveMaxReconnectAttempts);
+        if (keepAliveMaxReconnectAttempts > 0) {
+            LOGGER.info("Binlog client will fail the connector after {} consecutive failed reconnect attempts",
+                    keepAliveMaxReconnectAttempts);
+        }
+
         // Considering heartbeatInterval should be less than keepAliveInterval, use the heartbeatIntervalFactor
         // multiply by keepAliveInterval and set the result value to heartbeatInterval. The default value of
         // heartbeatIntervalFactor is 0.0, and we believe the left time (0.2 * keepAliveInterval) is enough
         // to process the packet received from the database server.
         client.setHeartbeatInterval((long) (keepAliveInterval * heartbeatIntervalFactor));
+
+        final long netWriteTimeout = connectorConfig.getBinlogNetWriteTimeout();
+        if (netWriteTimeout > 0) {
+            client.setNetWriteTimeout(netWriteTimeout);
+            LOGGER.info("Applied net_write_timeout {} seconds to binlog client", netWriteTimeout);
+        }
+
+        final long netReadTimeout = connectorConfig.getBinlogNetReadTimeout();
+        if (netReadTimeout > 0) {
+            client.setNetReadTimeout(netReadTimeout);
+            LOGGER.info("Applied net_read_timeout {} seconds to binlog client", netReadTimeout);
+        }
+
         client.setEventDeserializer(createEventDeserializer());
     }
 
@@ -496,23 +577,24 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
 
         eventDeserializer.setEventDataDeserializer(EventType.STOP, new StopEventDataDeserializer());
         eventDeserializer.setEventDataDeserializer(EventType.GTID, new GtidEventDataDeserializer());
+        final boolean preserveInvalidTemporalValues = connectorConfig.getTemporalPrecisionMode() == TemporalPrecisionMode.STRUCTURED;
         eventDeserializer.setEventDataDeserializer(EventType.WRITE_ROWS,
-                new RowDeserializers.WriteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.WriteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
         eventDeserializer.setEventDataDeserializer(EventType.UPDATE_ROWS,
-                new RowDeserializers.UpdateRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.UpdateRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
         eventDeserializer.setEventDataDeserializer(EventType.DELETE_ROWS,
-                new RowDeserializers.DeleteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.DeleteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
         eventDeserializer.setEventDataDeserializer(EventType.EXT_WRITE_ROWS,
                 new RowDeserializers.WriteRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues).setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(EventType.EXT_UPDATE_ROWS,
                 new RowDeserializers.UpdateRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues).setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(EventType.EXT_DELETE_ROWS,
                 new RowDeserializers.DeleteRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues).setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(EventType.TRANSACTION_PAYLOAD,
-                new TransactionPayloadDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new TransactionPayloadDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
 
         return eventDeserializer;
     }
@@ -595,6 +677,10 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
             // update last offset used for logging
             lastOffset = offsetContext.getOffset();
 
+            // Invoked on the binlog client thread; the monitor is registered on the coordinator
+            // thread before the client is connected, so it is safely published by the thread start
+            offsetActivityMonitorService.pulse(partition, offsetContext);
+
             if (skipEvent) {
                 // We're in the mode of skipping events and we just skipped this one, so decrement our skip count ...
                 --initialEventsToSkip;
@@ -650,7 +736,7 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     }
 
     /**
-     * Handle the supplied event that signals that an out of the ordinary event that occurred on the master.
+     * Handle the supplied event that signals that an out of the ordinary event that occurred on the source
      * It notifies the replica that something happened on the primary that might cause data to be in an
      * inconsistent state.
      *
@@ -742,9 +828,9 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
             return;
         }
         // Check and exclude DML statements from DDL statements handling logic.
-        Set<String> DML_STATEMENTS = Set.of("INSERT ", "UPDATE ", "DELETE ", "REPLACE ");
-        if (DML_STATEMENTS.contains(upperCasedStatementBegin)) {
-            LOGGER.warn("Received DML '" + sql + "' for processing, binlog probably contains events generated with statement or mixed based replication format");
+        // Use startsWith to properly detect DML statements like "REPLACE INTO ..." from pt-table-checksum
+        if (isDmlStatement(upperCasedStatementBegin)) {
+            LOGGER.warn("Received DML '{}' for processing, binlog probably contains events generated with statement or mixed based replication format", sql);
             return;
         }
         if (sql.equalsIgnoreCase("ROLLBACK")) {
@@ -753,8 +839,17 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
                     BinlogConnectorConfig.BUFFER_SIZE_FOR_BINLOG_READER.name());
         }
 
-        final List<SchemaChangeEvent> schemaChangeEvents = schema.parseStreamingDdl(partition, sql,
+        List<SchemaChangeEvent> schemaChangeEvents = schema.parseStreamingDdl(partition, sql,
                 command.getDatabase(), offsetContext, eventTime);
+
+        // DBZ-248: Resolve-and-retry for CREATE TABLE ... LIKE statements.
+        // If parsing produced no schema change events and the DDL is a LIKE statement,
+        // try to resolve the reference table's schema via JDBC and try parsing.
+        if (schemaChangeEvents.isEmpty() && resolveLikeTableSchema) {
+            schemaChangeEvents = resolveCreateTableLikeAndRetry(partition, offsetContext, sql,
+                    command.getDatabase(), eventTime);
+        }
+
         try {
             for (SchemaChangeEvent schemaChangeEvent : schemaChangeEvents) {
                 if (schema.skipSchemaChangeEvent(schemaChangeEvent)) {
@@ -787,6 +882,102 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
 
     private String removeSetStatement(String sql) {
         return sql.replaceAll(SET_STATEMENT_REGEX, "").trim();
+    }
+
+    private List<SchemaChangeEvent> resolveCreateTableLikeAndRetry(P partition, O offsetContext,
+                                                                   String sql, String database, Instant eventTime) {
+        final TableId[] likeTables = extractLikeTables(sql, database);
+        if (likeTables == null || likeTables.length == 0) {
+            return List.of();
+        }
+        final TableId newTableId = likeTables[0];
+        final TableId refTableId = likeTables[1];
+
+        // An empty parse result can have several causes;only resolve when the reference schema is
+        // genuinely missing from the cache and the new table is one we are configured to capture.
+        // Otherwise(e.g. the new table is itself filtered out) there is nothing useful to do, and
+        // we avoid an unnecessary SHOW CREATE TABLE round-trip on the streaming thread.
+        if (schema.tableFor(refTableId) != null) {
+            return List.of();
+        }
+        if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(newTableId)) {
+            return List.of();
+        }
+
+        LOGGER.info("Detected CREATE TABLE ... LIKE: new table {} referencing {}; attempting to resolve schema",
+                newTableId, refTableId);
+
+        final String refCreateDdl = fetchShowCreateTable(refTableId);
+        if (refCreateDdl == null) {
+            LOGGER.warn("Failed to resolve reference table schema for {}; " +
+                    "the new table {} will not be tracked until its schema is resolved", refTableId, newTableId);
+            return List.of();
+        }
+
+        final String syntheticDdl = refCreateDdl.replaceFirst(
+                "(?i)CREATE\\s+TABLE\\s+`?%s`?".formatted(Pattern.quote(refTableId.table())),
+                Matcher.quoteReplacement("CREATE TABLE `%s`".formatted(newTableId.table())));
+
+        LOGGER.info("Resolved schema for {} via SHOW CREATE TABLE on {}; parsing synthetic DDL", newTableId, refTableId);
+
+        // Parse the synthetic DDL to register the new table's schema
+        return schema.parseStreamingDdl(partition, syntheticDdl, newTableId.catalog(), offsetContext, eventTime);
+    }
+
+    /**
+     * Extract the new table and reference (template) table from a {@code CREATE TABLE ... LIKE}
+     * statement
+     */
+    static TableId[] extractLikeTables(String sql, String currentDatabase) {
+        final String stripped = sql.replaceFirst("(?s)^\\s*/\\*.*?\\*/\\s*", "");
+        final Matcher matcher = CREATE_TABLE_LIKE_PATTERN.matcher(stripped);
+        if (!matcher.find()) {
+            return null;
+        }
+
+        final TableId newTableId = new TableId(unquote(matcher.group(1), currentDatabase), null, unquote(matcher.group(2), null));
+        final TableId refTableId = new TableId(unquote(matcher.group(3), currentDatabase), null, unquote(matcher.group(4), null));
+        return new TableId[]{ newTableId, refTableId };
+    }
+
+    private static String unquote(String identifier, String fallback) {
+        return identifier == null ? fallback : identifier.replace("`", "");
+    }
+
+    private String fetchShowCreateTable(TableId tableId) {
+        String quotedRef = (tableId.catalog() != null)
+                ? "`%s`.`%s`".formatted(tableId.catalog(), tableId.table())
+                : "`%s`".formatted(tableId.table());
+
+        try {
+            return connection.queryAndMap(
+                    "SHOW CREATE TABLE " + quotedRef,
+                    rs -> {
+                        if (rs.next()) {
+                            return rs.getString(2);
+                        }
+                        return null;
+                    });
+        }
+        catch (SQLException e) {
+            LOGGER.warn("SHOW CREATE TABLE {} FAILED, {}", tableId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Checks if the given SQL statement is a DML statement (INSERT, UPDATE, DELETE, REPLACE).
+     * This is used to filter out DML statements that may arrive via STATEMENT-based binlog format,
+     * such as those generated by pt-table-checksum.
+     *
+     * @param upperCasedStatementBegin the upper-cased SQL statement to check
+     * @return true if the statement is a DML statement, false otherwise
+     */
+    private boolean isDmlStatement(String upperCasedStatementBegin) {
+        return upperCasedStatementBegin.startsWith(DML_INSERT_PREFIX) ||
+                upperCasedStatementBegin.startsWith(DML_UPDATE_PREFIX) ||
+                upperCasedStatementBegin.startsWith(DML_DELETE_PREFIX) ||
+                upperCasedStatementBegin.startsWith(DML_REPLACE_PREFIX);
     }
 
     /**
@@ -850,7 +1041,14 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     protected void handleInsert(P partition, O offsetContext, Event event) throws InterruptedException {
         handleChange(partition, offsetContext, event, Envelope.Operation.CREATE, WriteRowsEventData.class,
                 x -> schema.getTableId(x.getTableId()),
-                WriteRowsEventData::getRows,
+                x -> {
+                    final Table table = tableForEvent(x.getTableId());
+                    final List<Serializable[]> rows = new ArrayList<>(x.getRows().size());
+                    for (Serializable[] row : x.getRows()) {
+                        rows.add(alignRowToTable(table, x.getIncludedColumns(), row));
+                    }
+                    return rows;
+                },
                 (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(partition, tableId,
                         new BinlogChangeRecordEmitter<>(partition, offsetContext, clock, Envelope.Operation.CREATE, null, row, connectorConfig)),
                 (tableId, row) -> validateChangeEventWithTable(schema.tableFor(tableId), null, row));
@@ -866,7 +1064,16 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     protected void handleUpdate(P partition, O offsetContext, Event event) throws InterruptedException {
         handleChange(partition, offsetContext, event, Envelope.Operation.UPDATE, UpdateRowsEventData.class,
                 x -> schema.getTableId(x.getTableId()),
-                UpdateRowsEventData::getRows,
+                x -> {
+                    final Table table = tableForEvent(x.getTableId());
+                    final List<Map.Entry<Serializable[], Serializable[]>> rows = new ArrayList<>(x.getRows().size());
+                    for (Map.Entry<Serializable[], Serializable[]> row : x.getRows()) {
+                        rows.add(new AbstractMap.SimpleEntry<>(
+                                alignRowToTable(table, x.getIncludedColumnsBeforeUpdate(), row.getKey()),
+                                alignRowToTable(table, x.getIncludedColumns(), row.getValue())));
+                    }
+                    return rows;
+                },
                 (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(partition, tableId,
                         new BinlogChangeRecordEmitter<>(partition, offsetContext, clock, Envelope.Operation.UPDATE, row.getKey(), row.getValue(),
                                 connectorConfig)),
@@ -883,7 +1090,14 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     protected void handleDelete(P partition, O offsetContext, Event event) throws InterruptedException {
         handleChange(partition, offsetContext, event, Envelope.Operation.DELETE, DeleteRowsEventData.class,
                 x -> schema.getTableId(x.getTableId()),
-                DeleteRowsEventData::getRows,
+                x -> {
+                    final Table table = tableForEvent(x.getTableId());
+                    final List<Serializable[]> rows = new ArrayList<>(x.getRows().size());
+                    for (Serializable[] row : x.getRows()) {
+                        rows.add(alignRowToTable(table, x.getIncludedColumns(), row));
+                    }
+                    return rows;
+                },
                 (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(partition, tableId,
                         new BinlogChangeRecordEmitter<>(partition, offsetContext, clock, Envelope.Operation.DELETE, row, null, connectorConfig)),
                 (tableId, row) -> validateChangeEventWithTable(schema.tableFor(tableId), row, null));
@@ -961,6 +1175,13 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
      * @return the event type for the global transaction identifier events
      */
     protected abstract EventType getGtidEventType();
+
+    /**
+     * @return the event types for global transaction identifier events
+     */
+    protected List<EventType> getGtidEventTypes() {
+        return List.of(getGtidEventType());
+    }
 
     /**
      * Initialize the connector's global transaction identifier set.
@@ -1065,6 +1286,47 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     private void informAboutUnknownTableIfRequired(P partition, O offsetContext, Event event, TableId tableId)
             throws InterruptedException {
         informAboutUnknownTableIfRequired(partition, offsetContext, event, tableId, null);
+    }
+
+    /**
+     * Resolves the relational table for a binlog table number, or {@code null} when the table is
+     * unknown or filtered.
+     *
+     * @param tableNumber the binlog table number from the row event
+     * @return the table, or {@code null} if not known
+     */
+    private Table tableForEvent(long tableNumber) {
+        final TableId tableId = schema.getTableId(tableNumber);
+        return tableId != null ? schema.tableFor(tableId) : null;
+    }
+
+    /**
+     * Expands a row image that omits columns, e.g. when the database runs with
+     * {@code binlog_row_image=NOBLOB}, to the full table width using the event's included-columns
+     * bitmap. Missing BLOB/TEXT columns are filled with the configured unavailable-value
+     * placeholder so that downstream consumers receive a consistent record shape; other missing
+     * columns are left null. Rows that already match the table width are returned unchanged.
+     *
+     * @param table the table the row belongs to; may be null
+     * @param includedColumns the bitmap of columns present in the row image; may be null
+     * @param row the row image values, containing only the included columns; may be null
+     * @return the row expanded to the full table width, or the original row if no expansion applies
+     */
+    private Serializable[] alignRowToTable(Table table, BitSet includedColumns, Serializable[] row) {
+        if (!isBinlogRowImageNoblob || table == null || row == null || includedColumns == null || row.length >= table.columns().size()) {
+            return row;
+        }
+        final Serializable[] aligned = new Serializable[table.columns().size()];
+        int sourceIndex = 0;
+        for (int i = 0; i < aligned.length; i++) {
+            if (includedColumns.get(i) && sourceIndex < row.length) {
+                aligned[i] = row[sourceIndex++];
+            }
+            else if (RowImageUtils.isBlobOrTextColumn(table.columns().get(i))) {
+                aligned[i] = BinlogValueConverters.UNAVAILABLE_VALUE;
+            }
+        }
+        return aligned;
     }
 
     private void validateChangeEventWithTable(Table table, Object[] before, Object[] after) {
@@ -1265,6 +1527,16 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
                 LOGGER.debug("Exception while closing client", e);
             }
             errorHandler.setProducerThrowable(wrap(ex));
+        }
+
+        @Override
+        public void onReconnectAbandoned(BinaryLogClient client, Throwable cause, int failedAttempts) {
+            // The keep alive thread has stopped, so nothing will restore the connection any more. Unlike a
+            // communication failure this arrives after onDisconnect and on the keep alive thread itself, so the
+            // client is already torn down and must not be disconnected again from here.
+            LOGGER.error("Binlog client gave up restoring the connection after {} failed attempt(s)", failedAttempts, cause);
+            logStreamingSourceState();
+            errorHandler.setProducerThrowable(wrap(cause));
         }
 
         @Override

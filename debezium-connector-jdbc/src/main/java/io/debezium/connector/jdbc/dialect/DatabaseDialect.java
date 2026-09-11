@@ -9,6 +9,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.temporal.TemporalAccessor;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import org.apache.kafka.connect.data.Schema;
@@ -141,6 +142,18 @@ public interface DatabaseDialect {
     String getInsertStatement(TableDescriptor table, JdbcSinkRecord record);
 
     /**
+     * Construct a batch {@code INSERT INTO} statement for multiple records specific for this dialect.
+     * This method is used to generate optimized batch insert statements, such as using UNNEST for PostgreSQL.
+     *
+     * @param table the current relational table model, should not be {@code null}
+     * @param records the list of sink records to be inserted, should not be {@code null} or empty
+     * @return an optional containing the batch insert SQL statement if supported, or empty if not supported
+     */
+    default Optional<String> getBatchInsertStatement(TableDescriptor table, List<JdbcSinkRecord> records) {
+        return Optional.empty();
+    }
+
+    /**
      * Construct a {@code UPSERT} statement specific for this dialect.
      *
      * @param table the current relational table model, should not be {@code null}
@@ -148,6 +161,18 @@ public interface DatabaseDialect {
      * @return the upsert SQL statement to be executed, never {@code null}
      */
     String getUpsertStatement(TableDescriptor table, JdbcSinkRecord record);
+
+    /**
+     * Construct a batch {@code UPSERT} statement for multiple records specific for this dialect.
+     * This method is used to generate optimized batch upsert statements, such as using UNNEST with ON CONFLICT for PostgreSQL.
+     *
+     * @param table the current relational table model, should not be {@code null}
+     * @param records the list of sink records to be upserted, should not be {@code null} or empty
+     * @return an optional containing the batch upsert SQL statement if supported, or empty if not supported
+     */
+    default Optional<String> getBatchUpsertStatement(TableDescriptor table, List<JdbcSinkRecord> records) {
+        return Optional.empty();
+    }
 
     /**
      * Construct a {@code UPDATE} statement specific for this dialect.
@@ -170,10 +195,10 @@ public interface DatabaseDialect {
     /**
      * Construct a {@code TRUNCATE} statement specific for this dialect.
      *
-     * @param table the current relational table model, should not be {@code null}
+     * @param collectionId the collection id, should not be {@code null}
      * @return the truncate SQL statement to be executed, never {@code null}
      */
-    String getTruncateStatement(TableDescriptor table);
+    String getTruncateStatement(CollectionId collectionId);
 
     /**
      * Returns the SQL binding fragment for a column, schema, and type mapping.
@@ -396,4 +421,25 @@ public interface DatabaseDialect {
      * @return set of retriable exception classes
      */
     Set<Class<? extends Exception>> getCommunicationExceptions();
+
+    /**
+     * Returns whether the given failure, or any failure in its cause chain, is one of the
+     * dialect's {@link #getCommunicationExceptions() communication exceptions} and is therefore
+     * considered transient and retriable.
+     *
+     * @param throwable the failure to inspect; may be null
+     * @return true if the failure is a communication problem with the database
+     */
+    default boolean isCommunicationException(Throwable throwable) {
+        if (throwable == null) {
+            return false;
+        }
+        for (Class<? extends Exception> communicationException : getCommunicationExceptions()) {
+            if (communicationException.isAssignableFrom(throwable.getClass())) {
+                return true;
+            }
+        }
+        return isCommunicationException(throwable.getCause());
+    }
+
 }

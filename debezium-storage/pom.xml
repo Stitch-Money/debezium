@@ -3,7 +3,7 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-parent</artifactId>
-        <version>3.5.0-SNAPSHOT</version>
+        <version>3.7.0-SNAPSHOT</version>
         <relativePath>../debezium-parent/pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -17,14 +17,18 @@
     </properties>
 
     <modules>
+        <module>debezium-storage-api</module>
+        <module>debezium-storage-common</module>
         <module>debezium-storage-kafka</module>
         <module>debezium-storage-file</module>
         <module>debezium-storage-redis</module>
+        <module>debezium-storage-rocksdb</module>
         <module>debezium-storage-s3</module>
         <module>debezium-storage-tests</module>
         <module>debezium-storage-rocketmq</module>
         <module>debezium-storage-azure-blob</module>
         <module>debezium-storage-jdbc</module>
         <module>debezium-storage-configmap</module>
+        <module>debezium-storage-chronicle-queue</module>
     </modules>
 </project>

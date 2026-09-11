@@ -5,8 +5,10 @@
  */
 package io.debezium.connector.postgresql;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 import org.postgresql.core.Oid;
 import org.postgresql.core.TypeInfo;
@@ -29,13 +31,13 @@ public class PostgresType {
     private final PostgresType elementType;
     private final TypeInfo typeInfo;
     private final int modifiers;
-    private final List<String> enumValues;
+    private final Set<String> enumValues;
 
-    private PostgresType(String name, int oid, int jdbcId, TypeInfo typeInfo, List<String> enumValues, PostgresType parentType, PostgresType elementType) {
+    private PostgresType(String name, int oid, int jdbcId, TypeInfo typeInfo, Set<String> enumValues, PostgresType parentType, PostgresType elementType) {
         this(name, oid, jdbcId, TypeRegistry.NO_TYPE_MODIFIER, typeInfo, enumValues, parentType, elementType);
     }
 
-    private PostgresType(String name, int oid, int jdbcId, int modifiers, TypeInfo typeInfo, List<String> enumValues, PostgresType parentType, PostgresType elementType) {
+    private PostgresType(String name, int oid, int jdbcId, int modifiers, TypeInfo typeInfo, Set<String> enumValues, PostgresType parentType, PostgresType elementType) {
         Objects.requireNonNull(name);
         this.name = name;
         this.oid = oid;
@@ -52,6 +54,16 @@ public class PostgresType {
      */
     public boolean isArrayType() {
         return elementType != null;
+    }
+
+    /**
+     * @return true if this is a pgvector type ({@code vector}, {@code halfvec} or {@code sparsevec}),
+     *         whose dimension is carried verbatim in {@code atttypmod}
+     */
+    public boolean isVector() {
+        return TypeRegistry.TYPE_NAME_VECTOR.equals(name)
+                || TypeRegistry.TYPE_NAME_HALF_VECTOR.equals(name)
+                || TypeRegistry.TYPE_NAME_SPARSE_VECTOR.equals(name);
     }
 
     /**
@@ -124,7 +136,7 @@ public class PostgresType {
         return rootType;
     }
 
-    public List<String> getEnumValues() {
+    public Set<String> getEnumValues() {
         return enumValues;
     }
 
@@ -288,6 +300,10 @@ public class PostgresType {
             return this;
         }
 
+        public boolean hasElementType() {
+            return this.elementTypeOid != 0;
+        }
+
         public Builder enumValues(List<String> enumValues) {
             this.enumValues = enumValues;
             return this;
@@ -304,7 +320,11 @@ public class PostgresType {
                 elementType = typeRegistry.get(elementTypeOid);
             }
 
-            return new PostgresType(name, oid, jdbcId, modifiers, typeInfo, enumValues, parentType, elementType);
+            // PostgreSQL enforces uniqueness of enum labels, so a LinkedHashSet preserves their
+            // sort order while giving O(1) membership checks on the streaming hot path.
+            Set<String> enumValueSet = enumValues == null ? null : new LinkedHashSet<>(enumValues);
+
+            return new PostgresType(name, oid, jdbcId, modifiers, typeInfo, enumValueSet, parentType, elementType);
         }
     }
 }

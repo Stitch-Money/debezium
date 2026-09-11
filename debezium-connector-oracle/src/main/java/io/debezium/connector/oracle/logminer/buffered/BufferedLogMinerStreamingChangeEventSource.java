@@ -12,7 +12,9 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +33,7 @@ import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
 import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.Scn;
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogFile;
 import io.debezium.connector.oracle.logminer.LogMinerChangeRecordEmitter;
@@ -50,10 +53,7 @@ import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.logminer.events.RedoSqlDmlEvent;
 import io.debezium.connector.oracle.logminer.events.TruncateEvent;
-import io.debezium.connector.oracle.logminer.logwriter.CommitLogWriterFlushStrategy;
 import io.debezium.connector.oracle.logminer.logwriter.LogWriterFlushStrategy;
-import io.debezium.connector.oracle.logminer.logwriter.RacCommitLogWriterFlushStrategy;
-import io.debezium.connector.oracle.logminer.logwriter.ReadOnlyLogWriterFlushStrategy;
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -74,7 +74,10 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
     private static final Logger LOGGER = LoggerFactory.getLogger(BufferedLogMinerStreamingChangeEventSource.class);
     private static final Logger ABANDONED_DETAILS_LOGGER = LoggerFactory.getLogger(BufferedLogMinerStreamingChangeEventSource.class.getName() + ".AbandonedDetails");
+    private static final Logger WINDOW_ADVANCED = LoggerFactory.getLogger(BufferedLogMinerStreamingChangeEventSource.class.getName() + ".WindowAdvanced");
+
     private static final String NO_SEQUENCE_TRX_ID_SUFFIX = "ffffffff";
+    private static final int ORACLE_TRANSACTION_ID_PREFIX_LENGTH = 8;
 
     private final String queryString;
     private final CacheProvider<Transaction> cacheProvider;
@@ -82,16 +85,39 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
     private Instant lastProcessedScnChangeTime = null;
     private Scn lastProcessedScn = Scn.NULL;
+    private Scn lastLoggedWindowAdvanceScn = Scn.NULL;
+
+    private final Map<String, DeferredTransaction> deferredTransactions = new HashMap<>();
+
+    /**
+     * Lightweight metadata record for a deferred transaction that has not yet emitted any DML events.
+     */
+    private record DeferredTransaction(String transactionId, Scn startScn, Instant changeTime,
+            String userName, String clientId, int redoThreadId) {
+    }
+
+    private record MatchedTransaction(String transactionId, Scn startScn, Instant changeTime, boolean deferred) {
+    }
+
+    private Transaction createTransaction(DeferredTransaction deferredTransaction) {
+        return transactionFactory.createTransaction(
+                deferredTransaction.transactionId(),
+                deferredTransaction.startScn(),
+                deferredTransaction.changeTime(),
+                deferredTransaction.userName(),
+                deferredTransaction.redoThreadId(),
+                deferredTransaction.clientId());
+    }
 
     public BufferedLogMinerStreamingChangeEventSource(OracleConnectorConfig connectorConfig,
-                                                      OracleConnection jdbcConnection,
+                                                      OracleConnectionFactory connectionFactory,
                                                       EventDispatcher<OraclePartition, TableId> dispatcher,
                                                       ErrorHandler errorHandler,
                                                       Clock clock,
                                                       OracleDatabaseSchema schema,
                                                       Configuration jdbcConfig,
                                                       LogMinerStreamingChangeEventSourceMetrics streamingMetrics) {
-        super(connectorConfig, jdbcConnection, dispatcher, errorHandler, clock, schema, jdbcConfig, streamingMetrics);
+        super(connectorConfig, connectionFactory, dispatcher, errorHandler, clock, schema, jdbcConfig, streamingMetrics);
 
         this.queryString = new BufferedLogMinerQueryBuilder(connectorConfig).getQuery();
         this.cacheProvider = createCacheProvider(connectorConfig);
@@ -103,7 +129,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
         try (LogWriterFlushStrategy flushStrategy = resolveFlushStrategy()) {
 
-            boolean sessionStartScnChanged = false;
             Scn sessionStartScn = getOffsetContext().getScn();
             Scn sessionEndScn = Scn.NULL;
             Scn readScn = sessionStartScn;
@@ -111,7 +136,10 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             Stopwatch watch = Stopwatch.accumulating().start();
             int miningStartAttempts = 1;
 
-            prepareLogsForMining(false, sessionStartScn);
+            boolean needsNewSession = true; // first session always starts a new session
+            boolean dictionaryWritten = false; // tracks if data dictionary is written to logs
+            boolean sessionActive = false;
+            boolean needsConnectionRestart = false;
 
             while (getContext().isRunning()) {
 
@@ -123,13 +151,30 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                 }
 
                 final Instant batchStartTime = Instant.now();
-
                 updateDatabaseTimeDifference();
+
+                if (sessionActive && !needsNewSession) {
+                    boolean timeout = isMiningSessionRestartRequired(watch);
+                    boolean logSwitch = !timeout && checkLogSwitchOccurredAndUpdate();
+                    if (timeout || logSwitch) {
+                        endMiningSession();
+                        sessionActive = false;
+                        needsNewSession = true;
+                        dictionaryWritten = false;
+                        needsConnectionRestart = getConfig().isLogMiningRestartConnection();
+                        watch = Stopwatch.accumulating().start();
+                    }
+                }
+
+                if (needsNewSession && isUsingCatalogInRedoStrategy() && !dictionaryWritten) {
+                    getLogMinerContext().writeDataDictionaryToRedoLogs();
+                    dictionaryWritten = true;
+                }
 
                 Scn currentScn = getCurrentScn();
                 getMetrics().setCurrentScn(currentScn);
 
-                sessionEndScn = calculateUpperBounds(readScn, sessionEndScn, currentScn);
+                sessionEndScn = calculateUpperBounds(readScn, currentScn);
                 if (sessionEndScn.isNull()) {
                     LOGGER.debug("Requested delay of mining by one iteration");
                     pauseBetweenMiningSessions();
@@ -138,43 +183,30 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
                 flushStrategy.flush(getCurrentScn());
 
-                final boolean miningSessionRestartRequired = isMiningSessionRestartRequired(watch);
-                final boolean logSwitchOccurred = checkLogSwitchOccurredAndUpdate();
-
-                if (miningSessionRestartRequired || logSwitchOccurred || sessionStartScnChanged) {
-                    // Mining session is active, so end the current session and restart if necessary
+                sessionEndScn = collectLogsAndFinalUpperBoundary(sessionStartScn, sessionEndScn);
+                if (!needsNewSession && hasSessionLogFilesChanged()) {
                     endMiningSession();
+                    needsNewSession = true;
+                }
 
-                    // Only restart the connection if mining session max time or log switch occurred
-                    final boolean restartRequired = miningSessionRestartRequired || logSwitchOccurred;
-                    if (restartRequired && getConfig().isLogMiningRestartConnection()) {
+                if (needsNewSession) {
+                    if (needsConnectionRestart) {
                         prepareJdbcConnection(true);
+                        needsConnectionRestart = false;
                     }
-                    else if (!restartRequired) {
-                        LOGGER.debug("SCN start position advanced to a new set of logs, restart required.");
-                    }
-
-                    prepareLogsForMining(true, sessionStartScn);
-                    sessionStartScnChanged = false;
-
-                    // Recreate the stop watch
-                    watch = Stopwatch.accumulating().start();
+                    applyLogsToSession();
+                    needsNewSession = false;
+                    sessionActive = true;
                 }
 
                 if (startMiningSession(sessionStartScn, sessionEndScn, miningStartAttempts)) {
                     miningStartAttempts = 1;
 
-                    final ProcessResult result = process(readScn, sessionEndScn);
+                    final ProcessResult result = process(sessionStartScn, readScn, sessionEndScn);
                     LOGGER.debug("ProcessResult MineStartScn={} ReadStartScn={}", result.miningSessionStartScn(), result.readStartScn());
 
                     if (!result.miningSessionStartScn.equals(sessionStartScn)) {
-                        if (hasLogMiningStartingLogChanged(sessionStartScn, result)) {
-                            // LogMiner reads a log in totality, regardless if the start position is near the
-                            // beginning, middle, or end of the log. So by updating this value if and only if
-                            // the log changes, allows for maximum session reuse.
-                            sessionStartScnChanged = true;
-                            sessionStartScn = result.miningSessionStartScn;
-                        }
+                        sessionStartScn = result.miningSessionStartScn;
                     }
 
                     readScn = result.readStartScn();
@@ -236,21 +268,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         return !logsWithLastMiningStartPosition.equals(logsWithNextMiningStartPosition);
     }
 
-    /**
-     * Resolves the Oracle LGWR buffer flushing strategy.
-     *
-     * @return the strategy to be used to flush Oracle's LGWR process, never {@code null}.
-     */
-    private LogWriterFlushStrategy resolveFlushStrategy() {
-        if (getConfig().isLogMiningReadOnly()) {
-            return new ReadOnlyLogWriterFlushStrategy();
-        }
-        if (getConfig().isRacSystem()) {
-            return new RacCommitLogWriterFlushStrategy(getConfig(), getJdbcConfiguration(), getMetrics());
-        }
-        return new CommitLogWriterFlushStrategy(getConfig(), getConnection());
-    }
-
     @SuppressWarnings("unchecked")
     private <T extends Transaction> CacheProvider<T> createCacheProvider(OracleConnectorConfig connectorConfig) {
         return (CacheProvider<T>) switch (connectorConfig.getLogMiningBufferType()) {
@@ -271,19 +288,23 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     }
 
     @VisibleForTesting
-    protected ProcessResult process(Scn startScn, Scn endScn) throws SQLException, InterruptedException {
+    protected ProcessResult process(Scn sessionStartScn, Scn startScn, Scn endScn) throws SQLException, InterruptedException {
         getBatchMetrics().reset();
 
         try (PreparedStatement statement = createQueryStatement()) {
             LOGGER.debug("Fetching results for SCN [{}, {}]", startScn, endScn);
             statement.setFetchSize(getConfig().getQueryFetchSize());
             statement.setFetchDirection(ResultSet.FETCH_FORWARD);
-            statement.setString(1, startScn.toString());
-            statement.setString(2, endScn.toString());
 
             if (getConfig().isLogMiningUseCteQuery()) {
+                statement.setString(1, sessionStartScn.toString());
+                statement.setString(2, endScn.toString());
                 statement.setString(3, startScn.toString());
                 statement.setString(4, endScn.toString());
+            }
+            else {
+                statement.setString(1, startScn.toString());
+                statement.setString(2, endScn.toString());
             }
 
             getMetrics().setLastMiningFetchRange(startScn, endScn);
@@ -325,12 +346,12 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
     @VisibleForTesting
     protected PreparedStatement createQueryStatement() throws SQLException {
-        final PreparedStatement statement = getConnection().connection()
+        final PreparedStatement statement = getStreamingConnection().connection()
                 .prepareStatement(queryString,
                         ResultSet.TYPE_FORWARD_ONLY,
                         ResultSet.CONCUR_READ_ONLY,
                         ResultSet.HOLD_CURSORS_OVER_COMMIT);
-        statement.setQueryTimeout((int) getConnection().config().getQueryTimeout().toSeconds());
+        statement.setQueryTimeout((int) getStreamingConnection().config().getQueryTimeout().toSeconds());
         return statement;
     }
 
@@ -346,6 +367,10 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
     @Override
     protected boolean isEventSkipped(LogMinerEventRow event) {
+        if (super.isEventSkipped(event)) {
+            return true;
+        }
+
         // Check whether the row has a table reference and if so, is the reference included by the filter.
         // If the reference isn't included, the row will be skipped entirely.
         if (event.getTableId() != null) {
@@ -374,6 +399,15 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     protected void handleStartEvent(LogMinerEventRow event) {
         final String transactionId = event.getTransactionId();
         if (!isRecentlyProcessed(transactionId)) {
+            if (getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled() && !Strings.isNullOrEmpty(transactionId)) {
+                deferredTransactions.computeIfAbsent(transactionId, id -> {
+                    LOGGER.trace("Deferring transaction {} start event.", id);
+                    return new DeferredTransaction(id, event.getScn(), event.getChangeTime(),
+                            event.getUserName(), event.getClientId(), event.getThread());
+                });
+                return;
+            }
+
             final Transaction transaction = getTransactionCache().getTransaction(transactionId);
             if (transaction == null) {
                 getTransactionCache().addTransaction(transactionFactory.createTransaction(event));
@@ -395,7 +429,26 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         }
 
         final Transaction transaction = getTransactionCache().getAndRemoveTransaction(transactionId);
+        boolean removedDeferredTransaction = false;
         if (transaction == null) {
+            // Check if the transaction was deferred and never promoted
+            if (!Strings.isNullOrEmpty(transactionId) && deferredTransactions.remove(transactionId) != null) {
+                LOGGER.debug("Transaction {} was deferred with no DML events, removing on commit.", transactionId);
+                removedDeferredTransaction = true;
+            }
+            else if (!Strings.isNullOrEmpty(transactionId) && transactionId.endsWith(NO_SEQUENCE_TRX_ID_SUFFIX)) {
+                // LogMiner could not resolve the commit's transaction sequence because the transaction
+                // was read in a prior mining session. There is no cached transaction to apply, but
+                // deferred entries with the same undo segment and slot prefix must still be cleaned
+                // up: the most recently started one is the transaction this commit terminates, and
+                // any older one's slot has since been reused, proving it already ended. Leaving them
+                // behind pins the offset SCN low watermark until the deferred transaction retention
+                // expires. Removal is safe because deferred entries hold no events. Cached
+                // transactions are intentionally not resolved by prefix here, since committing a
+                // guessed transaction would emit its events.
+                removedDeferredTransaction = removeDeferredTransactionsByPrefix(transactionId, "commit");
+            }
+
             if (!getOffsetContext().getCommitScn().hasEventScnBeenHandled(row)) {
                 LOGGER.debug("Transaction {} not found in cache with SCN {}, no events to commit.", transactionId, row.getScn());
             }
@@ -450,7 +503,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             final boolean skipEvents = isTransactionSkippedAtCommit(transaction);
             dispatchTransactionCommittedEvent = !skipEvents;
             final ZoneOffset databaseOffset = getMetrics().getDatabaseOffset();
-            TransactionCommitConsumer.Handler<LogMinerEvent> delegate = (event, eventIndex, eventsProcessed) -> {
+            TransactionCommitConsumer.Handler<LogMinerEvent> delegate = (event, eventIndex, eventTrxId, eventTrxSeq, eventsProcessed) -> {
                 // Update SCN in offset context only if processed SCN less than SCN of other transactions
                 if (smallestScn.isNull() || commitScn.compareTo(smallestScn) < 0) {
                     getMetrics().setOldestScnDetails(event.getScn(), event.getChangeTime());
@@ -482,7 +535,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                 getOffsetContext().setTableId(event.getTableId());
                 getOffsetContext().setRedoThread(row.getThread());
                 getOffsetContext().setRsId(event.getRsId());
-                getOffsetContext().setRowId(event.getRowId());
+                getOffsetContext().setRowId(event.getRowIdAsString());
                 getOffsetContext().setCommitTime(row.getChangeTime().minusSeconds(databaseOffset.getTotalSeconds()));
 
                 if (eventIndex == 1) {
@@ -505,8 +558,8 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                                 getPartition(),
                                 getOffsetContext(),
                                 Envelope.Operation.TRUNCATE,
-                                dmlEvent.getDmlEntry().getOldValues(),
-                                dmlEvent.getDmlEntry().getNewValues(),
+                                dmlEvent.getOldValues(),
+                                dmlEvent.getNewValues(),
                                 getSchema().tableFor(event.getTableId()),
                                 getSchema(),
                                 Clock.system());
@@ -517,8 +570,8 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                                 getPartition(),
                                 getOffsetContext(),
                                 dmlEvent.getEventType(),
-                                dmlEvent.getDmlEntry().getOldValues(),
-                                dmlEvent.getDmlEntry().getNewValues(),
+                                dmlEvent.getOldValues(),
+                                dmlEvent.getNewValues(),
                                 getSchema().tableFor(event.getTableId()),
                                 getSchema(),
                                 Clock.system());
@@ -530,12 +583,12 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                 getOffsetContext().setRedoSql(null);
             };
             try (TransactionCommitConsumer commitConsumer = new TransactionCommitConsumer(delegate, getConfig(), getSchema())) {
-                getTransactionCache().forEachEvent(transaction, event -> {
+                getTransactionCache().forEachEvent(transaction, (event, rolledBack) -> {
                     if (!getContext().isRunning()) {
                         return false;
                     }
                     LOGGER.trace("Dispatching event {}", event.getEventType());
-                    commitConsumer.accept(event);
+                    commitConsumer.accept(event, rolledBack, null, 0L);
                     return true;
                 });
             }
@@ -569,6 +622,11 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
             getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
         }
+        else if (removedDeferredTransaction) {
+            getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
+            getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
+            getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
+        }
 
         updateCommitMetrics(row, Duration.between(start, Instant.now()), numEvents);
     }
@@ -582,8 +640,71 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
             getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
         }
+        else if (removeDeferredTransaction(transactionId)) {
+            LOGGER.debug("Transaction {} was in deferred state, removed on rollback.", transactionId);
+        }
         else {
             LOGGER.debug("Transaction {} not found in cache, no events to rollback.", transactionId);
+
+            if (!Strings.isNullOrEmpty(transactionId) && transactionId.endsWith(NO_SEQUENCE_TRX_ID_SUFFIX)) {
+                // This means that Oracle LogMiner found a rollback that should be applied but its
+                // corresponding transaction was read in a prior mining session and the transaction's
+                // sequence could not be resolved. We need to search for a matching transaction by prefix.
+                final String prefix = transactionId.substring(0, ORACLE_TRANSACTION_ID_PREFIX_LENGTH);
+                LOGGER.debug("Rollback event refers to a transaction '{}' with no explicit sequence; checking all transactions with prefix '{}'",
+                        transactionId, prefix);
+
+                final List<MatchedTransaction> matchingTransactions = getMatchingTransactionsByPrefix(prefix);
+
+                if (matchingTransactions.isEmpty()) {
+                    LOGGER.debug("No matching transaction found for partial transaction '{}' with prefix '{}'",
+                            transactionId, prefix);
+                }
+                else {
+                    // Oracle reuses an undo slot only after the transaction that previously occupied
+                    // it has ended, so of all same-prefix candidates only the one with the highest
+                    // start SCN can still be in progress, and it is the one this rollback terminates.
+                    final MatchedTransaction matched = matchingTransactions.stream()
+                            .max(Comparator.comparing(MatchedTransaction::startScn))
+                            .orElseThrow();
+
+                    LOGGER.warn("Matched partial transaction '{}' to the most recent of {} transaction(s) with prefix '{}', " +
+                            "the {} transaction '{}' (startScn={}, changeTime={}). Rolling back the matched transaction.",
+                            transactionId,
+                            matchingTransactions.size(),
+                            prefix,
+                            matched.deferred() ? "deferred" : "cached",
+                            matched.transactionId(),
+                            matched.startScn(),
+                            matched.changeTime());
+
+                    if (matched.deferred()) {
+                        removeDeferredTransaction(matched.transactionId());
+                    }
+                    else {
+                        finalizeTransaction(matched.transactionId(), event.getScn(), true);
+                        getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
+                        getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
+                    }
+
+                    // Any older candidate's undo slot has since been reused, which proves that its
+                    // transaction already ended and that its terminal event was never matched. Stale
+                    // deferred entries would otherwise pin the offset SCN low watermark until the
+                    // deferred transaction retention expires; removing them is safe because a deferred
+                    // entry holds no events and a later DML event recreates the transaction. Cached
+                    // candidates are intentionally left untouched because they may carry events.
+                    for (MatchedTransaction candidate : matchingTransactions) {
+                        if (candidate != matched && candidate.deferred() && removeDeferredTransaction(candidate.transactionId())) {
+                            LOGGER.warn("Removed stale deferred transaction '{}' (startScn={}, changeTime={}) whose undo " +
+                                    "slot was reused; its terminal event was never matched.",
+                                    candidate.transactionId(),
+                                    candidate.startScn(),
+                                    candidate.changeTime());
+                        }
+                    }
+                }
+            }
+
             // In the event the transaction was prematurely removed due to retention policy, when we do find
             // the transaction's rollback in the logs in the future, we should remove the entry if it exists
             // to avoid any potential memory-leak with the cache.
@@ -593,6 +714,48 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         getMetrics().incrementRolledBackTransactionCount();
         getMetrics().addRolledBackTransactionId(transactionId);
         getBatchMetrics().rollbackObserved();
+    }
+
+    private boolean removeDeferredTransaction(String transactionId) {
+        return !Strings.isNullOrEmpty(transactionId) && deferredTransactions.remove(transactionId) != null;
+    }
+
+    private boolean removeDeferredTransactionsByPrefix(String partialTransactionId, String terminalEventName) {
+        final String prefix = partialTransactionId.substring(0, ORACLE_TRANSACTION_ID_PREFIX_LENGTH);
+        final List<DeferredTransaction> matches = deferredTransactions.values().stream()
+                .filter(t -> t.transactionId().startsWith(prefix))
+                .toList();
+        for (DeferredTransaction match : matches) {
+            deferredTransactions.remove(match.transactionId());
+            LOGGER.warn("Matched partial transaction '{}' {} to deferred transaction '{}' (startScn={}, changeTime={}); " +
+                    "removed the deferred entry.",
+                    partialTransactionId,
+                    terminalEventName,
+                    match.transactionId(),
+                    match.startScn(),
+                    match.changeTime());
+        }
+        return !matches.isEmpty();
+    }
+
+    private List<MatchedTransaction> getMatchingTransactionsByPrefix(String prefix) {
+        final List<MatchedTransaction> matches = new ArrayList<>();
+        matches.addAll(getTransactionCache().streamTransactionsAndReturn(
+                stream -> stream.filter(t -> t.getTransactionId().startsWith(prefix))
+                        .map(t -> new MatchedTransaction(t.getTransactionId(), t.getStartScn(), t.getChangeTime(), false))
+                        .toList()));
+        matches.addAll(deferredTransactions.values().stream()
+                .filter(t -> t.transactionId().startsWith(prefix))
+                .map(t -> new MatchedTransaction(t.transactionId(), t.startScn(), t.changeTime(), true))
+                .toList());
+        return matches;
+    }
+
+    private Scn getOldestDeferredTransactionStartScn() {
+        return deferredTransactions.values().stream()
+                .map(DeferredTransaction::startScn)
+                .min(Scn::compareTo)
+                .orElse(Scn.NULL);
     }
 
     @Override
@@ -704,6 +867,10 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
         abandonTransactions(getConfig().getLogMiningTransactionRetention());
 
+        if (getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled()) {
+            cleanupDeferredTransactions(getConfig().getLogMiningDeferredTransactionRetention());
+        }
+
         // Cleanup caches based on current state of the transaction cache
         final Scn minCacheScn;
         final Instant minCacheScnChangeTime;
@@ -733,9 +900,57 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
         getMetrics().setOldestScnDetails(minCacheScn, minCacheScnChangeTime);
 
+        if (getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled()) {
+            // When using deferred transaction start behavior, the mining window should not be pinned
+            // by transactions in the cache. Always use a sliding window block-by-block.
+            final Scn miningSessionStartScn = endScn.subtract(Scn.ONE);
+
+            // The offset SCN must not advance past the oldest in-flight transaction's start SCN,
+            // considering both the deferred metadata map and the promoted (DML-bearing) transaction
+            // cache. This ensures that on restart the connector goes back far enough to re-mine
+            // the START events of deferred transactions and to reconstruct any non-persisted
+            // transactions that were already promoted into the cache.
+            final Scn oldestDeferredScn = getOldestDeferredTransactionStartScn();
+            final Scn oldestScn;
+            if (oldestDeferredScn.isNull()) {
+                oldestScn = minCacheScn;
+            }
+            else if (minCacheScn.isNull()) {
+                oldestScn = oldestDeferredScn;
+            }
+            else {
+                oldestScn = oldestDeferredScn.compareTo(minCacheScn) <= 0 ? oldestDeferredScn : minCacheScn;
+            }
+
+            final Scn offsetScn;
+            if (!oldestScn.isNull() && !maxCommittedScn.isNull() && oldestScn.compareTo(maxCommittedScn) < 0) {
+                offsetScn = oldestScn.subtract(Scn.ONE);
+            }
+            else if (!maxCommittedScn.isNull()) {
+                offsetScn = maxCommittedScn;
+            }
+            else {
+                offsetScn = Scn.NULL;
+            }
+
+            if (!offsetScn.isNull()) {
+                getOffsetContext().setScn(offsetScn);
+                getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
+            }
+
+            getMetrics().setOffsetScn(getOffsetContext().getScn());
+            return new ProcessResult(miningSessionStartScn, endScn);
+        }
+
         if (!minCacheScn.isNull()) {
             // Cache have values
-            final Scn miningSessionStartScn = minCacheScn.subtract(Scn.ONE);
+            // By default, the mining window starts at the oldest transaction in the cache.
+            // If window max is configured, it may be adjusted to not pin on long-running transactions.
+            final Scn miningSessionStartScn = applyWindowMaxAdjustment(
+                    minCacheScn.subtract(Scn.ONE),
+                    endScn,
+                    minCacheScn,
+                    minCacheScnChangeTime);
 
             getOffsetContext().setScn(miningSessionStartScn);
             getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
@@ -756,6 +971,82 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             getMetrics().setOffsetScn(getOffsetContext().getScn());
             return new ProcessResult(miningSessionStartScn, endScn);
         }
+    }
+
+    /**
+     * Adjusts the mining session start SCN based on the window max duration threshold.
+     * <p>
+     * When {@code log.mining.window.max.ms} is configured, this method prevents long-running
+     * transactions from pinning the mining window to an old position. If the oldest
+     * transaction in the cache exceeds the window threshold, this method finds the oldest
+     * transaction that falls within the acceptable window, or advances to the end SCN if all
+     * transactions are too old.
+     * <p>
+     * Long-running transactions will still be captured when they eventually commit, but they
+     * won't force the connector to re-mine an ever-growing window of redo logs.
+     *
+     * @param defaultStartScn the default start SCN (oldest transaction minus one)
+     * @param endScn the current end SCN of the mining window
+     * @param minCacheScn the SCN of the oldest transaction in the cache
+     * @param minCacheScnChangeTime the change time of the oldest transaction in the cache
+     * @return the adjusted start SCN, or {@code defaultStartScn} if no adjustment is needed
+     */
+    private Scn applyWindowMaxAdjustment(Scn defaultStartScn, Scn endScn,
+                                         Scn minCacheScn, Instant minCacheScnChangeTime) {
+        final Duration windowMaxMs = getConfig().getLogMiningWindowMaxMs();
+        if (windowMaxMs.toMillis() <= 0 || lastProcessedScnChangeTime == null) {
+            return defaultStartScn;
+        }
+
+        // Mark in offsets that the window advance feature has been enabled
+        if (!getOffsetContext().isWindowAdvanceEnabled()) {
+            getOffsetContext().setWindowAdvanceEnabled();
+        }
+
+        final Instant thresholdTime = lastProcessedScnChangeTime.minus(windowMaxMs);
+
+        // Check if the oldest transaction exceeds the window threshold
+        if (minCacheScnChangeTime == null || minCacheScnChangeTime.compareTo(thresholdTime) >= 0) {
+            // Oldest transaction is within the window, no adjustment needed
+            return defaultStartScn;
+        }
+
+        // The oldest transaction exceeds the threshold, find a suitable start SCN
+        // by looking for the oldest transaction that falls within the window
+        final Optional<LogMinerTransactionCache.ScnDetails> activeScnDetails = getTransactionCache()
+                .streamTransactionsAndReturn(stream -> stream
+                        .filter(t -> t.getChangeTime().compareTo(thresholdTime) >= 0)
+                        .map(t -> new LogMinerTransactionCache.ScnDetails(t.getStartScn(), t.getChangeTime()))
+                        .min(Comparator.comparing(LogMinerTransactionCache.ScnDetails::scn)));
+
+        Scn adjustedStartScn;
+        if (activeScnDetails.isPresent()) {
+            // Found a transaction within the window, use its start SCN
+            adjustedStartScn = activeScnDetails.get().scn().subtract(Scn.ONE);
+        }
+        else {
+            // All transactions are older than the window max duration
+            // Advance to the end SCN (like we do when the cache is empty)
+            adjustedStartScn = endScn.subtract(Scn.ONE);
+        }
+
+        // Safety check: never advance past the end SCN
+        final Scn maxAllowedScn = endScn.subtract(Scn.ONE);
+        if (adjustedStartScn.compareTo(maxAllowedScn) > 0) {
+            adjustedStartScn = maxAllowedScn;
+        }
+
+        // Log a warning, but only once per oldest transaction SCN to avoid flooding logs
+        if (!minCacheScn.equals(lastLoggedWindowAdvanceScn)) {
+            WINDOW_ADVANCED.warn("Mining window lower bound advanced past transaction at SCN {} to SCN {} " +
+                    "due to log.mining.window.max.ms threshold ({}ms). " +
+                    "Long-running transactions older than the threshold will continue to be captured " +
+                    "but won't pin the mining window.",
+                    minCacheScn, adjustedStartScn, windowMaxMs.toMillis());
+            lastLoggedWindowAdvanceScn = minCacheScn;
+        }
+
+        return adjustedStartScn;
     }
 
     /**
@@ -784,7 +1075,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     private void removeEventWithRowId(LogMinerEventRow row) {
         final Transaction transaction = getTransactionCache().getTransaction(row.getTransactionId());
         if (transaction != null) {
-            if (removeTransactionEventWithRowId(transaction, row)) {
+            if (rollbackTransactionEventWithRowId(transaction, row)) {
                 return;
             }
             Loggings.logWarningAndTraceRecord(LOGGER, row,
@@ -795,13 +1086,13 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             // This means that Oracle LogMiner found an event that should be undone but its corresponding
             // undo entry was read in a prior mining session and the transaction's sequence could not be
             // resolved.
-            final String prefix = row.getTransactionId().substring(0, 8);
+            final String prefix = row.getTransactionId().substring(0, ORACLE_TRANSACTION_ID_PREFIX_LENGTH);
             LOGGER.debug("Undo change refers to a transaction that has no explicit sequence, '{}'", row.getTransactionId());
             LOGGER.debug("Checking all transactions with prefix '{}'", prefix);
 
             if (getTransactionCache().streamTransactionsAndReturn(
                     stream -> stream.filter(t -> t.getTransactionId().startsWith(prefix))
-                            .anyMatch(t -> removeTransactionEventWithRowId(t, row)))) {
+                            .anyMatch(t -> rollbackTransactionEventWithRowId(t, row)))) {
                 return;
             }
 
@@ -823,15 +1114,15 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     }
 
     /**
-     * For the specified transaction and change event, removes the latest event from the event cache that
+     * For the specified transaction and change event, marks as rolled back the latest event from the event cache that
      * matches the transaction and the change event's row identifier values.
      *
      * @param transaction the transaction, should not be {@code null}
      * @param row the event, should not be {@code null}
      * @return true if an event was found and undone, false otherwise
      */
-    private boolean removeTransactionEventWithRowId(Transaction transaction, LogMinerEventRow row) {
-        if (getTransactionCache().removeTransactionEventWithRowId(transaction, row.getRowId())) {
+    private boolean rollbackTransactionEventWithRowId(Transaction transaction, LogMinerEventRow row) {
+        if (getTransactionCache().rollbackTransactionEventWithRowId(transaction, row.getRowId())) {
             // This metric won't necessarily be accurate when LOB is enabled, it will scale based on the
             // number of times a given transaction is re-mined.
             getMetrics().increasePartialRollbackCount();
@@ -938,11 +1229,24 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
         Transaction transaction = getTransactionCache().getTransaction(transactionId);
         if (transaction == null) {
-            LOGGER.trace("Transaction {} is not in cache, creating.", transactionId);
-            transaction = transactionFactory.createTransaction(event);
-            getTransactionCache().addTransaction(transaction);
+            // Check if this transaction is in the deferred state and promote it
+            if (!Strings.isNullOrEmpty(transactionId)) {
+                final DeferredTransaction deferred = deferredTransactions.remove(transactionId);
+                if (deferred != null) {
+                    LOGGER.trace("Promoting deferred transaction {} to the transaction cache.", transactionId);
+                    transaction = createTransaction(deferred);
+                    getTransactionCache().addTransaction(transaction);
+                    getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
+                }
+            }
 
-            getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
+            if (transaction == null) {
+                LOGGER.trace("Transaction {} is not in cache, creating.", transactionId);
+                transaction = transactionFactory.createTransaction(event);
+                getTransactionCache().addTransaction(transaction);
+
+                getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
+            }
         }
 
         final int eventId = transaction.getNextEventId();
@@ -1005,7 +1309,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                 return;
             }
 
-            Optional<Scn> lastScnToAbandonTransactions = getLastScnToAbandon(getConnection(), retention);
+            Optional<Scn> lastScnToAbandonTransactions = getLastScnToAbandon(getStreamingConnection(), retention);
             if (lastScnToAbandonTransactions.isPresent()) {
                 Scn thresholdScn = lastScnToAbandonTransactions.get();
                 if (thresholdScn.compareTo(smallestScn) >= 0) {
@@ -1060,6 +1364,33 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     }
 
     /**
+     * Cleans up deferred transaction metadata that has been retained longer than the configured retention period.
+     * <p>
+     * This removes lightweight metadata for transactions that never emitted a DML event,
+     * preventing memory leaks in the deferred transaction map.
+     *
+     * @param retention the retention duration, should not be {@code null}
+     */
+    private void cleanupDeferredTransactions(Duration retention) {
+        if (Duration.ZERO.equals(retention) || deferredTransactions.isEmpty()) {
+            return;
+        }
+
+        final Optional<Scn> lastScnToAbandon = getLastScnToAbandon(getStreamingConnection(), retention);
+        if (lastScnToAbandon.isEmpty()) {
+            return;
+        }
+
+        final Scn thresholdScn = lastScnToAbandon.get();
+        final int removedBefore = deferredTransactions.size();
+        deferredTransactions.values().removeIf(deferred -> deferred.startScn().compareTo(thresholdScn) <= 0);
+        final int removed = removedBefore - deferredTransactions.size();
+        if (removed > 0) {
+            LOGGER.debug("Cleaned up {} deferred transactions with start SCN <= {}", removed, thresholdScn);
+        }
+    }
+
+    /**
      * Computes the log entry for the specified transaction that includes all affected tables with changes that
      * will be discarded by the connector.
      *
@@ -1070,8 +1401,10 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     private String getLoggedAbandonedTransactionTableNames(Transaction transaction) throws InterruptedException {
         if (ABANDONED_DETAILS_LOGGER.isDebugEnabled()) {
             final Set<String> tableNames = new HashSet<>();
-            getTransactionCache().forEachEvent(transaction, event -> {
-                tableNames.add(event.getTableId().identifier());
+            getTransactionCache().forEachEvent(transaction, (event, rolledBack) -> {
+                if (!rolledBack) {
+                    tableNames.add(event.getTableId().identifier());
+                }
                 return true;
             });
             return String.format(", %d tables [%s]", tableNames.size(), String.join(",", tableNames));

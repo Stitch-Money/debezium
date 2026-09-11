@@ -23,7 +23,6 @@ import org.postgresql.geometric.PGpoint;
 import org.postgresql.geometric.PGpolygon;
 import org.postgresql.jdbc.PgArray;
 import org.postgresql.util.PGInterval;
-import org.postgresql.util.PGtokenizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -57,6 +56,11 @@ public abstract class AbstractColumnValue<T> implements ReplicationMessage.Colum
     @Override
     public OffsetTime asOffsetTimeUtc() {
         return DateTimeFormat.get().timeWithTimeZone(asString());
+    }
+
+    @Override
+    public Object asTimeWithTimeZone() {
+        return asString();
     }
 
     @Override
@@ -138,17 +142,7 @@ public abstract class AbstractColumnValue<T> implements ReplicationMessage.Colum
 
     @Override
     public BigDecimal asMoney() {
-        final String value = asString();
-        if (value == null) {
-            return null;
-        }
-        else if (value.startsWith("-")) {
-            final String negativeMoney = "(" + value.substring(1) + ")";
-            return new BigDecimal(removeCurrencySymbol(negativeMoney));
-        }
-        else {
-            return new BigDecimal(removeCurrencySymbol(value));
-        }
+        return PostgresMoney.parse(asString());
     }
 
     @Override
@@ -214,25 +208,4 @@ public abstract class AbstractColumnValue<T> implements ReplicationMessage.Colum
         return null;
     }
 
-    /**
-     * Remove any () (for negative) & currency symbol (for example: $,)
-     */
-    protected String removeCurrencySymbol(String currency) {
-        String s1;
-        boolean negative;
-
-        negative = (currency.charAt(0) == '(');
-
-        // Remove any () (for negative) & currency symbol
-        s1 = PGtokenizer.removePara(currency).substring(1);
-
-        // Strip out any , in currency
-        int pos = s1.indexOf(',');
-        while (pos != -1) {
-            s1 = s1.substring(0, pos) + s1.substring(pos + 1);
-            pos = s1.indexOf(',');
-        }
-
-        return negative ? "-" + s1 : s1;
-    }
 }

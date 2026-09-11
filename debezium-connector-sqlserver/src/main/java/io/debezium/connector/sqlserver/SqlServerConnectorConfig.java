@@ -11,6 +11,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
@@ -23,11 +25,13 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.ConfigDefinition;
 import io.debezium.config.Configuration;
 import io.debezium.config.ConfigurationNames;
+import io.debezium.config.ConnectorConfigValidationHelper;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.document.Document;
+import io.debezium.function.Predicates;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.ColumnFilterMode;
 import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
@@ -50,7 +54,6 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
     protected static final int DEFAULT_PORT = 1433;
     protected static final int DEFAULT_MAX_TRANSACTIONS_PER_ITERATION = 500;
     private static final String READ_ONLY_INTENT = "ReadOnly";
-    private static final String APPLICATION_INTENT_KEY = "database.applicationIntent";
     private static final int DEFAULT_QUERY_FETCH_SIZE = 10_000;
 
     /**
@@ -99,7 +102,12 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         /**
          * Inject a custom snapshotter, which allows for more control over snapshots.
          */
-        CUSTOM("custom");
+        CUSTOM("custom"),
+
+        /**
+         * Combine when_needed + no_data mode
+         */
+        WHEN_NEEDED_NO_DATA("when_needed_no_data");
 
         private final String value;
 
@@ -372,7 +380,7 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
     public static final Field INSTANCE = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + SqlServerConnection.INSTANCE_NAME)
             .withDisplayName("Instance name")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 8))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withImportance(Importance.LOW)
             .withValidation(Field::isOptional)
             .withDescription("The SQL Server instance name");
@@ -380,7 +388,7 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
     public static final Field DATABASE_NAMES = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "names")
             .withDisplayName("Databases")
             .withType(Type.LIST)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 7))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.HIGH)
             .withValidation(SqlServerConnectorConfig::validateDatabaseNames)
@@ -397,15 +405,27 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
             .withDisplayName("Max transactions per iteration")
             .withDefault(DEFAULT_MAX_TRANSACTIONS_PER_ITERATION)
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withImportance(Importance.MEDIUM)
             .withValidation(Field::isNonNegativeInteger)
             .withDescription("This property can be used to reduce the connector memory usage footprint when changes are streamed from multiple tables per database.");
 
+    public static final String CDC_COLUMN_FILTER_OVERRIDE_CONFIG_NAME = "change.column.filter.override";
+
+    public static final Field CDC_COLUMN_FILTER_OVERRIDE = Field.createInternal(CDC_COLUMN_FILTER_OVERRIDE_CONFIG_NAME)
+            .withDisplayName("CDC column filter override")
+            .withDefault(false)
+            .withType(Type.BOOLEAN)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 3))
+            .withImportance(Importance.LOW)
+            .withValidation(Field::isBoolean)
+            .withDescription(
+                    "This property can be used to override the default behavior of only including columns that have been enabled for CDC. Must only be used for snapshot migrations, otherwise columns not enabled for CDC will be missing from change events and would result in inconsistent schemas and possible failures.");
+
     public static final Field SNAPSHOT_MODE = Field.create("snapshot.mode")
             .withDisplayName("Snapshot mode")
             .withEnum(SnapshotMode.class, SnapshotMode.INITIAL)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The criteria for running a snapshot upon startup of the connector. "
@@ -416,7 +436,7 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
     public static final Field SNAPSHOT_ISOLATION_MODE = Field.create("snapshot.isolation.mode")
             .withDisplayName("Snapshot isolation mode")
             .withEnum(SnapshotIsolationMode.class, SnapshotIsolationMode.REPEATABLE_READ)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("Controls which transaction isolation level is used and how long the connector locks the captured tables. "
@@ -437,7 +457,7 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
             .withEnum(SnapshotLockingMode.class, SnapshotLockingMode.EXCLUSIVE)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withDescription(
                     "Controls how the connector holds locks on tables while performing the schema snapshot when `snapshot.isolation.mode` is `REPEATABLE_READ` or `EXCLUSIVE`. The 'exclusive' "
                             + "which means the connector will hold a table lock for exclusive table access for just the initial portion of the snapshot "
@@ -481,33 +501,39 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
             .withDescription("Specifies the maximum number of rows that should be read in one go from each table while streaming. "
                     + "The connector will read the table contents in multiple batches of this size. Defaults to 0 which means no limit.");
 
+    public static final Field CAPTURE_INSTANCE_INCLUDE_LIST = Field.createInternal("capture.instance.include.list")
+            .withDisplayName("Include capture instances")
+            .withType(Type.LIST)
+            .withWidth(Width.LONG)
+            .withImportance(Importance.MEDIUM)
+            .withValidation(Field::isListOfRegex)
+            .withDescription("A comma-separated list of regular expressions that match the names of the CDC capture instances to include for streaming. "
+                    + "When set, only matching capture instances are used. May not be used with '" + Field.INTERNAL_PREFIX + "capture.instance.exclude.list" + "'.");
+
+    public static final Field CAPTURE_INSTANCE_EXCLUDE_LIST = Field.createInternal("capture.instance.exclude.list")
+            .withDisplayName("Exclude capture instances")
+            .withType(Type.LIST)
+            .withWidth(Width.LONG)
+            .withImportance(Importance.MEDIUM)
+            .withValidation(Field::isListOfRegex, SqlServerConnectorConfig::validateCaptureInstanceExcludeList)
+            .withDescription("A comma-separated list of regular expressions that match the names of the CDC capture instances to exclude from streaming. "
+                    + "Any capture instance whose name matches is ignored, so the connector never enumerates it or queries its cdc.fn_cdc_get_all_changes_# function. "
+                    + "Useful when several capture instances exist for the same source table (for example one the connector's account is not granted to read). "
+                    + "May not be used with '" + CAPTURE_INSTANCE_INCLUDE_LIST.name() + "'.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .name("SQL Server")
-            .type(
-                    DATABASE_NAMES,
-                    HOSTNAME,
-                    PORT,
-                    USER,
-                    PASSWORD,
-                    QUERY_TIMEOUT_MS,
-                    INSTANCE)
-            .connector(
-                    SNAPSHOT_MODE,
-                    SNAPSHOT_ISOLATION_MODE,
-                    MAX_TRANSACTIONS_PER_ITERATION,
-                    BINARY_HANDLING_MODE,
-                    SCHEMA_NAME_ADJUSTMENT_MODE,
-                    INCREMENTAL_SNAPSHOT_OPTION_RECOMPILE,
-                    INCREMENTAL_SNAPSHOT_CHUNK_SIZE,
-                    INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES,
-                    QUERY_FETCH_SIZE,
-                    DATA_QUERY_MODE,
-                    STREAMING_FETCH_SIZE)
-            .events(SOURCE_INFO_STRUCT_MAKER)
             .excluding(
                     SCHEMA_INCLUDE_LIST,
                     SCHEMA_EXCLUDE_LIST,
-                    CommonConnectorConfig.QUERY_FETCH_SIZE)
+                    CommonConnectorConfig.QUERY_FETCH_SIZE,
+                    RelationalDatabaseConnectorConfig.DATABASE_NAME)
+            .group(Field.Group.CONNECTION, DATABASE_NAMES, HOSTNAME, PORT, USER, PASSWORD, QUERY_TIMEOUT_MS, INSTANCE)
+            .group(Field.Group.CONNECTOR, BINARY_HANDLING_MODE, SCHEMA_NAME_ADJUSTMENT_MODE, DATA_QUERY_MODE, SOURCE_INFO_STRUCT_MAKER)
+            .group(Field.Group.CONNECTOR_ADVANCED, MAX_TRANSACTIONS_PER_ITERATION, QUERY_FETCH_SIZE, STREAMING_FETCH_SIZE,
+                    CAPTURE_INSTANCE_INCLUDE_LIST, CAPTURE_INSTANCE_EXCLUDE_LIST)
+            .group(Field.Group.CONNECTOR_SNAPSHOT, SNAPSHOT_MODE, SNAPSHOT_ISOLATION_MODE, INCREMENTAL_SNAPSHOT_OPTION_RECOMPILE, INCREMENTAL_SNAPSHOT_CHUNK_SIZE,
+                    INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES)
             .create();
 
     /**
@@ -526,10 +552,12 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
     private final SnapshotLockingMode snapshotLockingMode;
     private final boolean readOnlyDatabaseConnection;
     private final int maxTransactionsPerIteration;
+    private final boolean overrideCdcColumnFilter;
     private final boolean optionRecompile;
     private final int queryFetchSize;
     private final DataQueryMode dataQueryMode;
     private final int streamingFetchSize;
+    private final Predicate<String> captureInstanceFilter;
 
     public SqlServerConnectorConfig(Configuration config) {
         super(
@@ -554,7 +582,12 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SNAPSHOT_MODE.defaultValueAsString());
         this.queryFetchSize = config.getInteger(QUERY_FETCH_SIZE);
 
-        this.readOnlyDatabaseConnection = READ_ONLY_INTENT.equals(config.getString(APPLICATION_INTENT_KEY));
+        // Check driver.* first (new standard), fall back to database.* (old) for backward compatibility
+        String applicationIntent = config.getString(DRIVER_CONFIG_PREFIX + "applicationIntent");
+        if (applicationIntent == null) {
+            applicationIntent = config.getString(DATABASE_CONFIG_PREFIX + "applicationIntent");
+        }
+        this.readOnlyDatabaseConnection = READ_ONLY_INTENT.equals(applicationIntent);
         if (readOnlyDatabaseConnection) {
             this.snapshotIsolationMode = SnapshotIsolationMode.SNAPSHOT;
             LOGGER.info("JDBC connection has set applicationIntent = ReadOnly, switching snapshot isolation mode to {}", SnapshotIsolationMode.SNAPSHOT.name());
@@ -564,6 +597,7 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         }
 
         this.maxTransactionsPerIteration = config.getInteger(MAX_TRANSACTIONS_PER_ITERATION);
+        this.overrideCdcColumnFilter = config.getBoolean(CDC_COLUMN_FILTER_OVERRIDE);
 
         if (!config.getBoolean(MAX_LSN_OPTIMIZATION)) {
             LOGGER.warn("The option '{}' is no longer taken into account. The optimization is always enabled.", MAX_LSN_OPTIMIZATION.name());
@@ -574,6 +608,27 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         this.dataQueryMode = DataQueryMode.parse(config.getString(DATA_QUERY_MODE), DATA_QUERY_MODE.defaultValueAsString());
         this.snapshotLockingMode = SnapshotLockingMode.parse(config.getString(SNAPSHOT_LOCKING_MODE), SNAPSHOT_LOCKING_MODE.defaultValueAsString());
         this.streamingFetchSize = config.getInteger(STREAMING_FETCH_SIZE);
+        this.captureInstanceFilter = buildCaptureInstanceFilter(config);
+    }
+
+    private static Predicate<String> buildCaptureInstanceFilter(Configuration config) {
+        final String includeList = config.getString(CAPTURE_INSTANCE_INCLUDE_LIST);
+        final String excludeList = config.getString(CAPTURE_INSTANCE_EXCLUDE_LIST);
+        final Predicate<String> inclusions = !Strings.isNullOrBlank(includeList) ? Predicates.includes(includeList, Pattern.CASE_INSENSITIVE) : null;
+        final Predicate<String> exclusions = !Strings.isNullOrBlank(excludeList) ? Predicates.excludes(excludeList, Pattern.CASE_INSENSITIVE) : null;
+        if (inclusions == null && exclusions == null) {
+            return captureInstance -> true;
+        }
+        return captureInstance -> {
+            if (inclusions != null && !inclusions.test(captureInstance)) {
+                return false;
+            }
+            return exclusions == null || exclusions.test(captureInstance);
+        };
+    }
+
+    private static int validateCaptureInstanceExcludeList(Configuration config, Field field, Field.ValidationOutput problems) {
+        return ConnectorConfigValidationHelper.validateExcludeField(config, CAPTURE_INSTANCE_INCLUDE_LIST, CAPTURE_INSTANCE_EXCLUDE_LIST, problems);
     }
 
     public List<String> getDatabaseNames() {
@@ -623,6 +678,10 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
 
     public int getMaxTransactionsPerIteration() {
         return maxTransactionsPerIteration;
+    }
+
+    public boolean isOverrideCdcColumnFilter() {
+        return overrideCdcColumnFilter;
     }
 
     public boolean getOptionRecompile() {
@@ -722,6 +781,15 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         }
 
         return count;
+    }
+
+    /**
+     * A filter that decides whether a CDC capture instance (by name) should be used by the connector,
+     * derived from {@link #CAPTURE_INSTANCE_INCLUDE_LIST} / {@link #CAPTURE_INSTANCE_EXCLUDE_LIST}.
+     * Defaults to accepting every capture instance when neither option is set.
+     */
+    public Predicate<String> getCaptureInstanceFilter() {
+        return captureInstanceFilter;
     }
 
     public int getStreamingFetchSize() {

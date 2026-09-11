@@ -8,6 +8,7 @@ package io.debezium.connector.postgresql.connection.pgoutput;
 import io.debezium.annotation.Immutable;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.TypeRegistry;
+import io.debezium.relational.Column;
 
 /**
  * Defines the relational column mapping for a table.
@@ -26,6 +27,7 @@ public class ColumnMetaData {
     private final int length;
     private final int scale;
     private final String typeName;
+    private final String driverTypeName;
 
     /**
      * Create a metadata structure representing a column.
@@ -37,9 +39,10 @@ public class ColumnMetaData {
      * @param hasDefaultValue {@code true} if the column has a default value specified, {@code false} otherwise
      * @param defaultValueExpression the parsed default value literal for the column
      * @param typeModifier the attribute type modifier
+     * @param driverTypeName the type name the JDBC driver reports for the column, {@code null} when unavailable
      */
     ColumnMetaData(String columnName, PostgresType postgresType, boolean key, boolean optional, boolean hasDefaultValue, String defaultValueExpression,
-                   int typeModifier) {
+                   int typeModifier, String driverTypeName) {
         this.columnName = columnName;
         this.postgresType = postgresType;
         this.key = key;
@@ -52,7 +55,13 @@ public class ColumnMetaData {
         // for specific types and ideally for PgOutput, we should always delegate if a modifier
         // is provided. For now, I've allowed PostgresType to expose the TypeInfo object where
         // I will use it here for now until further research can be done.
-        if (TypeRegistry.NO_TYPE_MODIFIER != typeModifier && postgresType.getTypeInfo() != null) {
+        if (postgresType.isVector()) {
+            // Take the dimension straight from atttypmod: getPrecision() would yield MAX_VALUE (see
+            // PostgresType#isVector). A bare vector without a declared dimension has none.
+            length = TypeRegistry.NO_TYPE_MODIFIER != typeModifier ? typeModifier : Column.UNSET_INT_VALUE;
+            scale = 0;
+        }
+        else if (TypeRegistry.NO_TYPE_MODIFIER != typeModifier && postgresType.getTypeInfo() != null) {
             length = postgresType.getTypeInfo().getPrecision(postgresType.getOid(), typeModifier);
             scale = postgresType.getTypeInfo().getScale(postgresType.getOid(), typeModifier);
         }
@@ -61,9 +70,19 @@ public class ColumnMetaData {
             scale = postgresType.getDefaultScale();
         }
 
+        // A serial column carries the OID of its underlying int2/int4/int8 type, so a name taken from the
+        // OID loses the serial nature that the driver reports during snapshot (debezium/dbz#2232).
+        this.driverTypeName = driverTypeName != null ? driverTypeName : postgresType.getName();
+
         // Constructs a fully qualified type name, including dimensions if applicable
-        String type = postgresType.getName();
-        if (!(length == postgresType.getDefaultLength() && scale == 0)) {
+        String type = this.driverTypeName;
+        if (postgresType.isVector()) {
+            // pgvector uses a single dimension modifier, e.g. vector(3) rather than vector(3,0)
+            if (length != Column.UNSET_INT_VALUE) {
+                type += "(" + length + ")";
+            }
+        }
+        else if (!(length == postgresType.getDefaultLength() && scale == 0)) {
             type += "(" + length + "," + scale + ")";
         }
         this.typeName = type;
@@ -103,5 +122,9 @@ public class ColumnMetaData {
 
     public String getTypeName() {
         return typeName;
+    }
+
+    public String getDriverTypeName() {
+        return driverTypeName;
     }
 }

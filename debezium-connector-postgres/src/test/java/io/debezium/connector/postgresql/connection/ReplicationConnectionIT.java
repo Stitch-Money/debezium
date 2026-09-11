@@ -17,6 +17,7 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -35,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.TestHelper;
+import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIs;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIsNot;
 import io.debezium.doc.FixFor;
@@ -42,6 +44,8 @@ import io.debezium.jdbc.JdbcConnection.ResultSetMapper;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
+
+import ch.qos.logback.classic.Level;
 
 /**
  * Integration test for {@link ReplicationConnection}
@@ -118,6 +122,26 @@ public class ReplicationConnectionIT {
                 }
             }
         });
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1683")
+    void shouldNotLogTooManyUnknownTypeResolutionsOnStartup() throws Exception {
+        TestHelper.create().dropReplicationSlot("test1");
+        LogInterceptor interceptor = new LogInterceptor(TypeRegistry.class);
+        interceptor.setLoggerLevel(TypeRegistry.class, Level.TRACE);
+
+        try (ReplicationConnection conn1 = TestHelper.createForReplication("test1", true)) {
+            conn1.startStreaming(new WalPositionLocator());
+            List<String> matched = interceptor.getLogEntriesThatContainsMessage("Type OID")
+                    .stream().filter(msg -> msg.contains("not cached, attempting to lookup from database")).toList();
+
+            // At v18, PostgreSQL defines roughly 300 array types by default.
+            // Resolving most of them via individual database lookups would be a performance concern.
+            // Since DBZ-1683 caused such behavior, we set the threshold to 300.
+            assertThat(matched.size())
+                    .isLessThan(300);
+        }
     }
 
     @Test
@@ -304,6 +328,60 @@ public class ReplicationConnectionIT {
         try (ReplicationConnection connection = TestHelper.createForReplication(slotName, true)) {
             ReplicationStream stream = connection.startStreaming(new WalPositionLocator());
             expectedMessagesFromStream(stream, additionalMessages);
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1489")
+    void shouldNotMoveFlushLsnBackwardsWhenFlushingOlderLsn() throws Exception {
+        TestHelper.create().dropReplicationSlot("test");
+
+        try (PostgresConnection connection = TestHelper.create();
+                ReplicationConnection replConnection = TestHelper.createForReplication("test", true)) {
+
+            ReplicationStream stream = replConnection.startStreaming(new WalPositionLocator());
+
+            TestHelper.execute("INSERT INTO table_with_pk (b, c) VALUES('Test1', now()), ('Test2', now());");
+
+            final List<Lsn> receivedLsns = new ArrayList<>();
+            Awaitility.await()
+                    .atMost(TestHelper.waitTimeForRecords() * 2L, TimeUnit.SECONDS)
+                    .pollInterval(Duration.ofMillis(100))
+                    .until(() -> {
+                        stream.readPending(msg -> {
+                            Lsn lsn = stream.lastReceivedLsn();
+                            if (lsn != null && (receivedLsns.isEmpty() || !receivedLsns.get(receivedLsns.size() - 1).equals(lsn))) {
+                                receivedLsns.add(lsn);
+                            }
+                        });
+                        return receivedLsns.size() >= 2;
+                    });
+
+            final Lsn olderLsn = receivedLsns.get(0);
+            final Lsn newerLsn = receivedLsns.get(receivedLsns.size() - 1);
+            assertThat(newerLsn).isGreaterThan(olderLsn);
+
+            stream.flushLsn(newerLsn);
+            final Lsn flushAfterNewer = Awaitility.await()
+                    .atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS)
+                    .pollInterval(Duration.ofMillis(100))
+                    .until(() -> getFlushLsnFromStatReplication(connection), Objects::nonNull);
+            assertThat(flushAfterNewer).isGreaterThanOrEqualTo(newerLsn);
+
+            stream.flushLsn(olderLsn);
+
+            final Lsn flushAfterOlder = Awaitility.await()
+                    .atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS)
+                    .pollInterval(Duration.ofMillis(100))
+                    .until(() -> getFlushLsnFromStatReplication(connection), lsn -> lsn != null);
+
+            if (flushAfterOlder.compareTo(newerLsn) < 0) {
+                fail(String.format("debezium/dbz#1489: flush_lsn moved BACKWARDS from %s to %s (-%d bytes)",
+                        newerLsn, flushAfterOlder, newerLsn.asLong() - flushAfterOlder.asLong()));
+            }
+
+            assertThat(flushAfterOlder).isGreaterThanOrEqualTo(newerLsn);
+            stream.close();
         }
     }
 
@@ -558,5 +636,21 @@ public class ReplicationConnectionIT {
         // ...so we expect 8 messages for the above DML
         TestHelper.execute(statement);
         return 8;
+    }
+
+    private Lsn getFlushLsnFromStatReplication(PostgresConnection connection) throws SQLException {
+        final String lsnStr = connection.prepareQueryAndMap(
+                "SELECT flush_lsn FROM pg_stat_replication LIMIT 1",
+                statement -> {
+                    // No parameters needed
+                },
+                rs -> {
+                    if (rs.next()) {
+                        return rs.getString("flush_lsn");
+                    }
+                    return null;
+                });
+        connection.rollback();
+        return lsnStr != null ? Lsn.valueOf(lsnStr) : null;
     }
 }

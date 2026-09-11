@@ -17,6 +17,8 @@ import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotMode;
 import io.debezium.connector.sqlserver.util.TestHelper;
 import io.debezium.doc.FixFor;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
+import io.debezium.jdbc.TemporalPrecisionMode;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.util.Testing;
 
 /**
@@ -36,7 +38,7 @@ public class SpecialTableTypesIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    @FixFor("dbz#25")
+    @FixFor("dbz#28")
     public void shouldIgnoreTemporalTable() throws Exception {
         TestHelper.createTestDatabase();
         connection = TestHelper.testConnection();
@@ -47,6 +49,7 @@ public class SpecialTableTypesIT extends AbstractAsyncEngineConnectorTest {
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
                 .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.temporal_table")
+                .withDefault(RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.MICROSECONDS)
                 .build();
 
         connection.execute(
@@ -93,6 +96,7 @@ public class SpecialTableTypesIT extends AbstractAsyncEngineConnectorTest {
         TestHelper.enableTableCdc(connection, "normal_table");
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
+        TestHelper.waitForStreamingStarted();
 
         final var actualRecords = consumeRecordsByTopic(1, false);
         assertEquals(1, actualRecords.recordsForTopic("server1.testDB1.dbo.temporal_table").size());

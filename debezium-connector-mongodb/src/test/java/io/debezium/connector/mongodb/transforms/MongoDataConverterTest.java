@@ -123,8 +123,53 @@ public class MongoDataConverterTest {
                 .build());
     }
 
-    private String getFile(String fileName) throws IOException, URISyntaxException {
-        URL jsonResource = getClass().getClassLoader().getResource(fileName);
+    @Test
+    @FixFor("debezium/dbz#2560")
+    void shouldProcessJavaScriptWithScope() {
+        val = BsonDocument.parse("""
+                {
+                    "function": {
+                        "$code": "function() { return x; }",
+                        "$scope": {
+                            "x": { "$numberInt": "1" },
+                            "nested": { "value": "test" }
+                        }
+                    }
+                }
+                """);
+        builder = SchemaBuilder.struct().name("javascript");
+
+        final Map<String, Map<Object, BsonType>> schemaMap = converter.parseBsonDocument(val);
+        converter.buildSchema(schemaMap, builder);
+
+        final Schema finalSchema = builder.build();
+        final Struct struct = new Struct(finalSchema);
+        for (final Map.Entry<String, BsonValue> entry : val.entrySet()) {
+            converter.buildStruct(entry, finalSchema, struct);
+        }
+
+        final Schema functionSchema = finalSchema.field("function").schema();
+        assertThat(functionSchema.name()).isEqualTo("javascript.function");
+        assertThat(functionSchema.fields()).extracting("name").containsExactly("code", "scope");
+        assertThat(functionSchema.field("code").schema()).isEqualTo(Schema.OPTIONAL_STRING_SCHEMA);
+
+        final Schema scopeSchema = functionSchema.field("scope").schema();
+        assertThat(scopeSchema.name()).isEqualTo("javascript.function.scope");
+        assertThat(scopeSchema.fields()).extracting("name").containsExactly("x", "nested");
+        assertThat(scopeSchema.field("x").schema()).isEqualTo(Schema.OPTIONAL_INT32_SCHEMA);
+
+        final Schema nestedSchema = scopeSchema.field("nested").schema();
+        assertThat(nestedSchema.name()).isEqualTo("javascript.function.scope.nested");
+        assertThat(nestedSchema.field("value").schema()).isEqualTo(Schema.OPTIONAL_STRING_SCHEMA);
+
+        final Struct function = struct.getStruct("function");
+        assertThat(function.getString("code")).isEqualTo("function() { return x; }");
+        assertThat(function.getStruct("scope").getInt32("x")).isEqualTo(1);
+        assertThat(function.getStruct("scope").getStruct("nested").getString("value")).isEqualTo("test");
+    }
+
+    private String getFile(final String fileName) throws IOException, URISyntaxException {
+        final URL jsonResource = getClass().getClassLoader().getResource(fileName);
         return new String(
                 Files.readAllBytes(Paths.get(jsonResource.toURI())),
                 StandardCharsets.UTF_8);
@@ -206,5 +251,157 @@ public class MongoDataConverterTest {
                         + "}"
                         + "}");
 
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2569")
+    public void shouldProcessSymbolMinKeyAndMaxKeyValues() {
+        val = BsonDocument.parse("{\n" +
+                "    \"_id\" : \"symbol-1\",\n" +
+                "    \"symbol_value\" : { \"$symbol\" : \"symbolic\" },\n" +
+                "    \"min_key_value\" : { \"$minKey\" : 1 },\n" +
+                "    \"max_key_value\" : { \"$maxKey\" : 1 }\n" +
+                "}");
+        builder = SchemaBuilder.struct().name("withsymbol");
+        converter = new MongoDataConverter(ArrayEncoding.ARRAY);
+
+        Map<String, Map<Object, BsonType>> entry = converter.parseBsonDocument(val);
+        converter.buildSchema(entry, builder);
+
+        final Schema finalSchema = builder.build();
+        final Struct struct = new Struct(finalSchema);
+        for (Map.Entry<String, BsonValue> bsonValueEntry : val.entrySet()) {
+            converter.buildStruct(bsonValueEntry, finalSchema, struct);
+        }
+        assertThat(finalSchema).isEqualTo(
+                SchemaBuilder.struct().name("withsymbol")
+                        .field("_id", Schema.OPTIONAL_STRING_SCHEMA)
+                        .field("symbol_value", Schema.OPTIONAL_STRING_SCHEMA)
+                        .field("min_key_value", Schema.OPTIONAL_STRING_SCHEMA)
+                        .field("max_key_value", Schema.OPTIONAL_STRING_SCHEMA)
+                        .build());
+        assertThat(struct.toString()).isEqualTo(
+                "Struct{"
+                        + "_id=symbol-1,"
+                        + "symbol_value=symbolic,"
+                        + "min_key_value=MinKey,"
+                        + "max_key_value=MaxKey"
+                        + "}");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2569")
+    public void shouldProcessSymbolArray() {
+        val = BsonDocument.parse("{\n" +
+                "    \"_id\" : \"symbol-array-1\",\n" +
+                "    \"symbols\" : [ { \"$symbol\" : \"a\" }, { \"$symbol\" : \"b\" } ]\n" +
+                "}");
+        builder = SchemaBuilder.struct().name("withsymbolarray");
+        converter = new MongoDataConverter(ArrayEncoding.ARRAY);
+
+        Map<String, Map<Object, BsonType>> entry = converter.parseBsonDocument(val);
+        converter.buildSchema(entry, builder);
+
+        final Schema finalSchema = builder.build();
+        final Struct struct = new Struct(finalSchema);
+        for (Map.Entry<String, BsonValue> bsonValueEntry : val.entrySet()) {
+            converter.buildStruct(bsonValueEntry, finalSchema, struct);
+        }
+        assertThat(finalSchema).isEqualTo(
+                SchemaBuilder.struct().name("withsymbolarray")
+                        .field("_id", Schema.OPTIONAL_STRING_SCHEMA)
+                        .field("symbols", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build())
+                        .build());
+        assertThat(struct.toString()).isEqualTo(
+                "Struct{"
+                        + "_id=symbol-array-1,"
+                        + "symbols=[a, b]"
+                        + "}");
+    }
+
+    @Test
+    @FixFor("DBZ-1392")
+    public void shouldProcessHeterogeneousArrayWithEmptyNestedDocument() {
+        val = BsonDocument.parse("{\n" +
+                "    \"_id\" : ObjectId(\"66bf4a1c2f8e3b4d5a7c9e12\"),\n" +
+                "    \"users\" : [\n" +
+                "        {\"name\" : \"John\", \"age\" : 30, \"address\" : {\"street\" : \"123 Main St\", \"city\" : \"NYC\"}},\n" +
+                "        {\"name\" : \"Jane\", \"email\" : \"jane@example.com\", \"address\" : {}},\n" +
+                "        {\"name\" : \"Bob\", \"age\" : 25, \"phone\" : \"555-1234\"}\n" +
+                "    ]\n" +
+                "}");
+        builder = SchemaBuilder.struct().name("heterogeneous");
+        converter = new MongoDataConverter(ArrayEncoding.DOCUMENT);
+
+        Map<String, Map<Object, BsonType>> entry = converter.parseBsonDocument(val);
+        converter.buildSchema(entry, builder);
+
+        final Schema finalSchema = builder.build();
+        final Struct struct = new Struct(finalSchema);
+        for (Map.Entry<String, BsonValue> bsonValueEntry : val.entrySet()) {
+            converter.buildStruct(bsonValueEntry, finalSchema, struct);
+        }
+
+        // The schema name for array elements will be the parent field name plus index (e.g., users._0)
+        assertThat(finalSchema.field("users")).isNotNull();
+
+        // Verify struct was built successfully and contains the expected data
+        // For heterogeneous arrays in DOCUMENT mode, elements are indexed as _0, _1, _2...
+        assertThat(struct.getStruct("users")).isNotNull();
+        Struct usersStruct = struct.getStruct("users");
+
+        assertThat(usersStruct.getStruct("_0").get("name")).isEqualTo("John");
+        assertThat(usersStruct.getStruct("_1").get("email")).isEqualTo("jane@example.com");
+        assertThat(usersStruct.getStruct("_2").get("age")).isEqualTo(25);
+
+        // This ensures the empty address document didn't cause a crash and was handled
+        assertThat(usersStruct.getStruct("_1").getStruct("address")).isNotNull();
+        assertThat(usersStruct.getStruct("_1").getStruct("address").schema().fields()).isEmpty();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1901")
+    public void shouldHandleIdenticalArrayElementsWithDocumentEncoding() {
+        val = BsonDocument.parse("""
+                {
+                    "_id": {"$oid": "6a24288af2e947561dd394aa"},
+                    "items": [
+                        {
+                            "title": "Product",
+                            "image": "dummy img",
+                            "price": 899,
+                            "qty": 2
+                        },
+                        {
+                            "title": "Product",
+                            "image": "dummy img",
+                            "price": 899,
+                            "qty": 2
+                        }
+                    ]
+                }
+                """);
+
+        builder = SchemaBuilder.struct().name("test");
+        converter = new MongoDataConverter(ArrayEncoding.DOCUMENT);
+
+        final Map<String, Map<Object, BsonType>> schemaMap = converter.parseBsonDocument(val);
+        converter.buildSchema(schemaMap, builder);
+
+        final Schema finalSchema = builder.build();
+        final Struct struct = new Struct(finalSchema);
+
+        for (final Map.Entry<String, BsonValue> entry : val.entrySet()) {
+            converter.buildStruct(entry, finalSchema, struct);
+        }
+
+        final Struct itemsStruct = struct.getStruct("items");
+        assertThat(itemsStruct).isNotNull();
+        assertThat(itemsStruct.getStruct("_0")).isNotNull();
+        assertThat(itemsStruct.getStruct("_1")).isNotNull();
+        assertThat(itemsStruct.getStruct("_0").get("title")).isEqualTo("Product");
+        assertThat(itemsStruct.getStruct("_0").get("price")).isEqualTo(899);
+        assertThat(itemsStruct.getStruct("_1").get("title")).isEqualTo("Product");
+        assertThat(itemsStruct.getStruct("_1").get("price")).isEqualTo(899);
     }
 }

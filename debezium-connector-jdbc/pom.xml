@@ -4,27 +4,27 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-parent</artifactId>
-        <version>3.5.0-SNAPSHOT</version>
+        <version>3.7.0-SNAPSHOT</version>
         <relativePath>../debezium-parent/pom.xml</relativePath>
     </parent>
 
     <modelVersion>4.0.0</modelVersion>
     <artifactId>debezium-connector-jdbc</artifactId>
-    <version>3.5.0-SNAPSHOT</version>
+    <version>3.7.0-SNAPSHOT</version>
     <name>Debezium JDBC Sink Connector</name>
     <packaging>jar</packaging>
 
     <properties>
         <!-- Other artifact versions -->
-        <version.hibernate>7.1.0.Final</version.hibernate>
-        <version.c3p0>0.9.5.5</version.c3p0>
+        <version.hibernate>7.2.6.Final</version.hibernate>
         <version.assertjdb>3.0.0</version.assertjdb>
         <!--
         By default only run the integration tests for MySQL, PostgreSQL, and SQL Server.
-        Other tags include it-db2 and it-oracle for the DB2 and Oracle integration tests.
+        Other tags include it-db2, it-oracle, it-singlestore, and it-starrocks for the DB2, Oracle, SingleStore,
+        and StarRocks integration tests.
 
         Additionally, there are also end to end test tags that can be specified:
-        e2e-mysql, e2e-postgresql, e2e-sqlserver, e2e-db2, and e2e-oracle
+        e2e-mysql, e2e-postgresql, e2e-sqlserver, e2e-db2, e2e-oracle, e2e-singlestore, and e2e-starrocks
 
         Finally, there are 3 all-inclusive tags that can be specified:
             it - runs all integration tests
@@ -40,7 +40,11 @@
         <!-- Debezium -->
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-core</artifactId>
+            <artifactId>debezium-connector-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connect-plugins</artifactId>
         </dependency>
         <dependency>
             <groupId>io.debezium</groupId>
@@ -89,19 +93,14 @@
         <dependency>
             <groupId>org.hibernate.orm</groupId>
             <artifactId>hibernate-core</artifactId>
-            <version>${version.hibernate}</version>
         </dependency>
         <dependency>
             <groupId>org.hibernate.orm</groupId>
-            <artifactId>hibernate-c3p0</artifactId>
-            <version>${version.hibernate}</version>
+            <artifactId>hibernate-community-dialects</artifactId>
         </dependency>
-
-        <!-- Connection pool -->
         <dependency>
-            <groupId>com.mchange</groupId>
-            <artifactId>c3p0</artifactId>
-            <version>${version.c3p0}</version>
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-agroal</artifactId>
         </dependency>
 
         <!-- Testing -->
@@ -122,7 +121,13 @@
         </dependency>
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-core</artifactId>
+            <artifactId>debezium-connector-common</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-util</artifactId>
             <type>test-jar</type>
             <scope>test</scope>
         </dependency>
@@ -138,6 +143,11 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-archunit</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>io.strimzi</groupId>
             <artifactId>strimzi-test-container</artifactId>
         </dependency>
@@ -148,12 +158,22 @@
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-mysql</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-cockroachdb</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -213,6 +233,18 @@
         <dependency>
             <groupId>org.mariadb.jdbc</groupId>
             <artifactId>mariadb-java-client</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.singlestore</groupId>
+            <artifactId>singlestore-jdbc-client</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.starrocks</groupId>
+            <artifactId>starrocks-connector-j</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>mil.nga</groupId>
+            <artifactId>wkb</artifactId>
         </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>
@@ -278,6 +310,10 @@
                     </sourceDirectories>
                     <includeTestSourceDirectory>true</includeTestSourceDirectory>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>io.debezium</groupId>
+                <artifactId>debezium-schema-generator</artifactId>
             </plugin>
         </plugins>
         <resources>

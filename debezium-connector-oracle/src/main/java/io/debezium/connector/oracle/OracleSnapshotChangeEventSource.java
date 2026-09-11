@@ -25,6 +25,7 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
@@ -239,6 +240,14 @@ public class OracleSnapshotChangeEventSource extends RelationalSnapshotChangeEve
                                                  TableId tableId, List<String> columns) {
 
         return snapshotterService.getSnapshotQuery().snapshotQuery(quote(tableId), columns);
+    }
+
+    @Override
+    protected Long rowCountForTableChunked(TableId tableId) throws SQLException {
+        // Oracle TableIds carry a CDB/PDB catalog that cannot appear in a qualified name; strip it
+        // before quoting (as getSnapshotSelect does), otherwise the shared implementation would emit
+        // an invalid "catalog"."schema"."table".
+        return jdbcConnection.getRowCount(new TableId(null, tableId.schema(), tableId.table()));
     }
 
     @Override

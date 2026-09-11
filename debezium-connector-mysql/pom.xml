@@ -3,7 +3,7 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-parent</artifactId>
-        <version>3.5.0-SNAPSHOT</version>
+        <version>3.7.0-SNAPSHOT</version>
         <relativePath>../debezium-parent/pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -14,7 +14,11 @@
     <dependencies>
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-core</artifactId>
+            <artifactId>debezium-connector-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connect-plugins</artifactId>
         </dependency>
         <dependency>
             <groupId>io.debezium</groupId>
@@ -70,7 +74,19 @@
         <!-- Testing -->
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-core</artifactId>
+            <artifactId>debezium-connector-common</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-util</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connect-plugins</artifactId>
             <type>test-jar</type>
             <scope>test</scope>
         </dependency>
@@ -146,20 +162,20 @@
             <groupId>io.debezium</groupId>
             <artifactId>debezium-testing-testcontainers</artifactId>
             <scope>test</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.junit.platform</groupId>
-                    <artifactId>junit-platform-launcher</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.junit.jupiter</groupId>
-                    <artifactId>junit-jupiter</artifactId>
-                </exclusion>
-            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-archunit</artifactId>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -215,9 +231,6 @@
         <mysql.ssl.port>3306</mysql.ssl.port>
         <mysql.replica.port>3306</mysql.replica.port> <!-- by default use primary as 'replica' -->
         <mysql.init.timeout>60000</mysql.init.timeout> <!-- 60 seconds -->
-        <apicurio.image>quay.io/apicurio/apicurio-registry-mem</apicurio.image>
-        <apicurio.port>8080</apicurio.port>
-        <apicurio.init.timeout>60000</apicurio.init.timeout> <!-- 60 seconds -->
         <mysql.server.image.source>container-registry.oracle.com/mysql/community-server</mysql.server.image.source>
         <mysql.database.protocol>jdbc:mysql</mysql.database.protocol>
         <mysql.database.jdbc.driver>com.mysql.cj.jdbc.Driver</mysql.database.jdbc.driver>
@@ -230,6 +243,7 @@
         <docker.dbs>debezium/mysql-server-test-database</docker.dbs>
         <docker.filter>${docker.dbs}</docker.filter>
         <docker.skip>false</docker.skip>
+        <docker.platform>linux/amd64</docker.platform>
         <docker.initimage>rm -f /etc/localtime; ln -s /usr/share/zoneinfo/US/Samoa /etc/localtime</docker.initimage>
 
         <mockito.argLine>-javaagent:${org.mockito:mockito-core:jar}</mockito.argLine>
@@ -253,6 +267,7 @@
                             <name>debezium/mysql-server-test-database</name>
                             <run>
                                 <namingStrategy>none</namingStrategy>
+                                <platform>${docker.platform}</platform>
                                 <env>
                                     <MYSQL_ROOT_PASSWORD>debezium-rocks</MYSQL_ROOT_PASSWORD>
                                     <MYSQL_DATABASE>mysql</MYSQL_DATABASE> <!-- database created upon init -->
@@ -302,11 +317,65 @@
                             </external>
                         </image>
                         <image>
+                            <!-- Docker image for the binlog-row-image test. -->
+                            <name>debezium/mysql-server-test-binlog-row-image-database</name>
+                            <run>
+                                <namingStrategy>none</namingStrategy>
+                                <env>
+                                    <MYSQL_ROOT_PASSWORD>debezium-rocks</MYSQL_ROOT_PASSWORD>
+                                    <MYSQL_DATABASE>mysql</MYSQL_DATABASE> <!-- database created upon init -->
+                                    <MYSQL_USER>${mysql.user}</MYSQL_USER>
+                                    <MYSQL_PASSWORD>${mysql.password}</MYSQL_PASSWORD>
+                                </env>
+                                <ports>
+                                    <port>${mysql.port}:3306</port>
+                                </ports>
+                                <log>
+                                    <prefix>mysql</prefix>
+                                    <enabled>true</enabled>
+                                    <color>yellow</color>
+                                </log>
+                                <wait>
+                                    <log>(MySQL|MariaDB) init process done. Ready for start up.(?s)(.*)(mysqld|mariadbd): ready for connections.</log>
+                                    <time>${mysql.init.timeout}</time>
+                                </wait>
+                            </run>
+                            <build>
+                                <from>${mysql.server.image.source}:${version.mysql.server}</from>
+                                <runCmds>
+                                    <run>${docker.initimage}</run>
+                                </runCmds>
+                                <assembly>
+                                    <inline>
+                                        <fileSets>
+                                            <fileSet>
+                                                <directory>${project.basedir}/src/test/docker/server-binlog-row-image</directory>
+                                                <includes>
+                                                    <include>my.cnf</include>
+                                                </includes>
+                                                <outputDirectory>etc/mysql</outputDirectory>
+                                            </fileSet>
+                                            <fileSet>
+                                                <directory>${project.basedir}/src/test/docker/init</directory>
+                                                <outputDirectory>docker-entrypoint-initdb.d</outputDirectory>
+                                            </fileSet>
+                                        </fileSets>
+                                    </inline>
+                                    <targetDir>/</targetDir>
+                                </assembly>
+                            </build>
+                            <external>
+                                <type>properties</type>
+                                <mode>override</mode>
+                            </external>
+                        </image>
+                        <image>
                             <!-- A Docker image using a partial MySQL installation maintained by MySQL team
                              that enable mysql ssl connection -->
                             <name>debezium/mysql-server-test-database-ssl</name>
                             <run>
                                 <namingStrategy>none</namingStrategy>
+                                <platform>${docker.platform}</platform>
                                 <env>
                                     <MYSQL_ROOT_PASSWORD>debezium-rocks</MYSQL_ROOT_PASSWORD>
                                     <MYSQL_DATABASE>mysql</MYSQL_DATABASE> <!-- database created upon init -->
@@ -531,6 +600,9 @@
                         <image>
                             <name>${apicurio.image}:${version.apicurio}</name>
                             <run>
+                                <env>
+                                    <QUARKUS_LOG_CATEGORY__IO_APICURIO_REGISTRY_LOGGING_AUDIT__LEVEL>${apicurio.image.audit.level}</QUARKUS_LOG_CATEGORY__IO_APICURIO_REGISTRY_LOGGING_AUDIT__LEVEL>
+                                </env>
                                 <namingStrategy>none</namingStrategy>
                                 <ports>
                                     <port>${apicurio.port}:8080</port>
@@ -541,7 +613,7 @@
                                     <color>blue</color>
                                 </log>
                                 <wait>
-                                    <log>.*apicurio-registry-app.*started in.*</log>
+                                    <log>${apicurio.image.log}</log>
                                     <time>${apicurio.init.timeout}</time>
                                 </wait>
                             </run>
@@ -581,6 +653,14 @@
                 <configuration>
                     <skipTests>${skipITs}</skipTests>
                     <enableAssertions>true</enableAssertions>
+                    <!--
+                    MySqlConnectorNoBlobIT asserts behaviour that only holds against a server running with
+                    binlog_row_image=NOBLOB. It is therefore excluded from the default run and executed only
+                    via the 'mysql-binlog-row-image' profile against the dedicated Docker image.
+                    -->
+                    <excludes>
+                        <exclude>**/MySqlConnectorNoBlobIT.java</exclude>
+                    </excludes>
                     <systemPropertyVariables>
                         <!-- Make these available to the tests via system properties -->
                         <database.hostname>${docker.host.address}</database.hostname>
@@ -620,19 +700,6 @@
             <plugin>
                 <groupId>io.debezium</groupId>
                 <artifactId>debezium-schema-generator</artifactId>
-                <version>${project.version}</version>
-                <executions>
-                    <execution>
-                        <id>generate-connector-metadata</id>
-                        <goals>
-                            <goal>generate-api-spec</goal>
-                        </goals>
-                        <phase>prepare-package</phase>
-                        <configuration>
-                            <outputDirectory>${project.build.outputDirectory}/META-INF/resources/</outputDirectory>
-                        </configuration>
-                    </execution>
-                </executions>
             </plugin>
         </plugins>
         <resources>
@@ -872,10 +939,21 @@
             <properties>
                 <!-- Docker properties -->
                 <docker.dbs>debezium/mysql-server-gtids-test-database</docker.dbs>
-                <!-- Integration test properties -->
-                <database.port>${mysql.gtid.port}</database.port>
-                <database.replica.port>${mysql.gtid.port}</database.replica.port>
             </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <database.port>${mysql.gtid.port}</database.port>
+                                <database.replica.port>${mysql.gtid.port}</database.replica.port>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
         <!--  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
               Use the Docker image for Percona Server.
@@ -892,11 +970,22 @@
             <properties>
                 <!-- Docker properties -->
                 <docker.dbs>debezium/percona-server-test-database</docker.dbs>
-                <!-- Integration test properties -->
-                <database.port>${mysql.percona.port}</database.port>
-                <database.replica.port>${mysql.percona.port}</database.replica.port>
                 <docker.initimage>ln -s /usr/share/zoneinfo/Pacific/Pago_Pago /etc/localtime</docker.initimage>
             </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <database.port>${mysql.percona.port}</database.port>
+                                <database.replica.port>${mysql.percona.port}</database.replica.port>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
         <!--  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         Use the Docker image for a MySQL replica of another MySQL server
@@ -917,10 +1006,21 @@
                 <mysql.gtid.port>3306</mysql.gtid.port>
                 <mysql.gtid.replica.port>4306</mysql.gtid.replica.port>
                 <docker.dbs>debezium/mysql-server-gtids-test-database,debezium/mysql-server-gtids-test-database-replica</docker.dbs>
-                <!-- Integration test properties -->
-                <database.port>${mysql.gtid.port}</database.port>
-                <database.replica.port>${mysql.gtid.replica.port}</database.replica.port>
             </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <database.port>${mysql.gtid.port}</database.port>
+                                <database.replica.port>${mysql.gtid.replica.port}</database.replica.port>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
         <!--  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         Use the alternative Docker image for MySQL.
@@ -937,11 +1037,63 @@
             <properties>
                 <!-- Docker properties -->
                 <docker.dbs>debezium/mysql-server-test-database-ssl</docker.dbs>
-                <!-- Integration test properties -->
-                <database.port>${mysql.ssl.port}</database.port>
-                <database.replica.port>${mysql.ssl.port}</database.replica.port>
                 <docker.initimage>rm -f /etc/localtime; ln -s /usr/share/zoneinfo/Pacific/Pago_Pago /etc/localtime</docker.initimage>
             </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <database.port>${mysql.ssl.port}</database.port>
+                                <database.replica.port>${mysql.ssl.port}</database.replica.port>
+                                <database.ssl.mode>verify_ca</database.ssl.mode>
+                                <database.ssl.truststore>${project.basedir}/src/test/resources/ssl/truststore</database.ssl.truststore>
+                                <database.ssl.truststore.password>debezium</database.ssl.truststore.password>
+                                <database.ssl.keystore>${project.basedir}/src/test/resources/ssl/keystore</database.ssl.keystore>
+                                <database.ssl.keystore.password>debezium</database.ssl.keystore.password>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+              Use the Docker image configured with binlog_row_image=NOBLOB and run only the
+              MySqlConnectorNoBlobIT integration test against it. This test is excluded from
+              all other runs because its assertions only hold for a NOBLOB server.
+              To use, specify "-Dmysql-binlog-row-image" or -Pmysql-binlog-row-image on the Maven command line.
+              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ -->
+        <profile>
+            <id>mysql-binlog-row-image</id>
+            <activation>
+                <activeByDefault>false</activeByDefault>
+                <property>
+                    <name>mysql-binlog-row-image</name>
+                </property>
+            </activation>
+            <properties>
+                <!-- Docker properties: start the server image built with binlog_row_image=NOBLOB -->
+                <docker.dbs>debezium/mysql-server-test-binlog-row-image-database</docker.dbs>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <!-- Override the default exclusion so this test runs here, and only here. -->
+                            <excludes combine.self="override">
+                                <exclude>none</exclude>
+                            </excludes>
+                            <includes>
+                                <include>**/MySqlConnectorNoBlobIT.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
         <profile>
             <id>apicurio</id>

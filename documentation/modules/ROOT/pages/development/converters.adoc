@@ -13,24 +13,12 @@ ifdef::community[]
 :icons: font
 toc::[]
 
-[NOTE]
-====
-This feature is currently in incubating state, i.e. exact semantics, configuration options etc. may change in future revisions, based on the feedback we receive. Please let us know if you encounter any problems while using this extension.
-====
-
 == Datatype Conversion
-endif::community[]
 
-ifdef::product[]
-[IMPORTANT]
-====
-The use of custom-developed converters is a Technology Preview feature only.
-Technology Preview features are not supported with Red Hat production service level agreements (SLAs) and might not be functionally complete.
-Red Hat does not recommend using them in production.
-These features provide early access to upcoming product features, enabling customers to test functionality and provide feedback during the development process.
-For more information about the support scope of Red Hat Technology Preview features, see link:https://access.redhat.com/support/offerings/techpreview[https://access.redhat.com/support/offerings/techpreview].
-====
-endif::product[]
+By default, {prodname} connectors map source data types to Kafka Connect schema types using built-in type mappings.
+You can override these defaults by developing and deploying a custom converter when your downstream application requires a different data format.
+
+endif::community[]
 
 Each field in a {prodname} change event record represents a field or column in the source table or data collection.
 When a connector emits a change event record to Kafka, it converts the data type of each field in the source to a Kafka Connect schema type.
@@ -72,38 +60,34 @@ The following example shows a converter implementation of a Java class that impl
 public interface CustomConverter<S, F extends ConvertedField> {
 
     @FunctionalInterface
-    interface Converter {  // <1>
+    interface Converter {
         Object convert(Object input);
     }
 
-    public interface ConverterRegistration<S> { // <2>
-        void register(S fieldSchema, Converter converter); // <3>
+    public interface ConverterRegistration<S> {
+        void register(S fieldSchema, Converter converter);
     }
 
     void configure(Properties props);
 
-    void converterFor(F field, ConverterRegistration<S> registration); // <4>
+    void converterFor(F field, ConverterRegistration<S> registration);
 }
 ----
-.Descriptions of fields in a Java converter class that implements the `io.debezium.spi.converter.CustomConverter` interface
-[cols="1,7",options="header",subs="+attributes"]
-|===
-|Item |Description
 
-|1
-|Converts data from one type to another.
+The following list describes the purpose of select elements in the preceding Java converter class example:
 
-|2
-|Callback for registering a converter.
+`Converter`::
+Converts data from one type to another.
 
-|3
-|Registers the given schema and converter for the current field.
+`ConverterRegistration`::
+Callback for registering a converter.
+
+`register()`::
+Registers the given schema and converter for the current field.
 Should not be invoked more than once for the same field.
 
-|4
-|Registers the customized value and schema converter for use with a specific field.
-
-|===
+`converterFor()`::
+Registers the customized value and schema converter for use with a specific field.
 
 [id="debezium-custom-converter-methods"]
 === Custom converter methods
@@ -113,7 +97,7 @@ Implementations of the `CustomConverter` interface must include the following me
 `configure()`::
 Passes the properties specified in the connector configuration to the converter instance.
 The `configure` method runs when the connector is initialized.
-You can use a converter with multiple connectors and modify its behavior based on the connector's property settings. +
+You can use a converter with multiple connectors and modify its behavior based on the connector's property settings.
 The `configure` method accepts the following argument:
 
 `props`::: Contains the properties to pass to the converter instance.
@@ -122,7 +106,7 @@ Each property specifies the format for converting the values of a particular typ
 `converterFor()`::
 Registers the converter to process specific columns or fields in the data source.
 {prodname} invokes the `converterFor()` method to prompt the converter to call `registration` for the conversion.
-The `converterFor` method runs once for each column. +
+The `converterFor` method runs once for each column.
 The method accepts the following arguments:
 
 `field`:::
@@ -142,7 +126,10 @@ endif::community[]
 [id="debezium-custom-converter-example"]
 === {prodname} custom converter example
 
-The following example implements a simple converter that performs the following operations:
+The following example shows how to implement a converter that maps source columns of type `isbn` to Kafka Connect `STRING` schema values.
+Use this example as a model for writing converters that handle custom or non-standard column types in your source database.
+
+The converter in the example performs the following operations:
 
 * Runs the `configure` method, which configures the converter based on the value of the `schema.name` property that is specified in the connector configuration.
 The converter configuration is specific to each instance.
@@ -188,26 +175,22 @@ These compile dependencies must be included in your project's `pom.xml`, as show
 <dependency>
     <groupId>io.debezium</groupId>
     <artifactId>debezium-api</artifactId>
-    <version>${version.debezium}</version> // <1>
+    <version>${version.debezium}</version>
 </dependency>
 <dependency>
     <groupId>org.apache.kafka</groupId>
     <artifactId>connect-api</artifactId>
-    <version>${version.kafka}</version> <2>
+    <version>${version.kafka}</version>
 </dependency>
 ----
-[cols="1,7",options="header",subs="+attributes"]
-.Descriptions of compile dependency versions in `pom.xml`
-|===
-|Item |Description
 
-|1
-|`${version.debezium}` represents the version of the {prodname} connector.
+The following list describes the purpose of the compile dependency versions in the preceding `pom.xml`example:
 
-|2
-|`${version.kafka}` represents the version of Apache Kafka in your environment.
+`${version.debezium}`::
+Represents the version of the {prodname} connector.
 
-|===
+`${version.kafka}`::
+Represents the version of Apache Kafka in your environment.
 
 
 // Type: assembly
@@ -229,12 +212,14 @@ You cannot configure either the {prodname} MongoDB connector, or the {prodname} 
 [id="deploying-a-debezium-custom-converter"]
 === Deploying a custom converter
 
+To use a custom converter with a {prodname} connector, export the converter as a JAR file and place it in the connector's plug-in directory.
+
 .Prerequisites
 * You have a custom converter Java program.
 
 .Procedure
-* To use a custom converter with a {prodname} connector, export the Java project to a JAR file, and copy the file to the directory that contains the JAR file for each {prodname} connector that you want to use it with. +
- +
+* To use a custom converter with a {prodname} connector, export the Java project to a JAR file, and copy the file to the directory that contains the JAR file for each {prodname} connector that you want to use it with.
++
 For example, in a typical deployment, the {prodname} connector files are stored in subdirectories of a Kafka Connect directory (`/kafka/connect`), with each connector JAR in its own subdirectory (`/kafka/connect/debezium-connector-db2`, `/kafka/connect/debezium-connector-mysql`, and so forth).
 To use a converter with a connector, add the converter JAR file to the connector's subdirectory.
 
@@ -259,23 +244,18 @@ If the converter requires further information to customize the formats of specif
 +
 [subs="+quotes"]
 ----
-converters: _<converterSymbolicName>_ // <1>
-_<converterSymbolicName>_.type: _<fullyQualifiedConverterClassName>_ // <2>
+converters: _<converterSymbolicName>_
+_<converterSymbolicName>_.type: _<fullyQualifiedConverterClassName>_
 ----
 +
-[cols="1,7a",options="header",subs="+attributes"]
-.Description of connector configuration properties for enabling a converter
-|===
-|Item |Description
+The following list describes the properties in the preceding example:
 
-|1
-|The mandatory `converters` property enumerates a comma-separated list of symbolic names of the converter instances to use with the connector.
+`converters`::
+The mandatory `converters` property enumerates a comma-separated list of symbolic names of the converter instances to use with the connector.
 The values listed for this property serve as prefixes in the names of other properties that you specify for the converter.
 
-|2
-|The mandatory `_<converterSymbolicName>_.type` property specifies the name of the class that implements the converter.
-
-|===
+`_<converterSymbolicName>_.type`::
+The mandatory `_<converterSymbolicName>_.type` property specifies the name of the class that implements the converter.
 +
 For example, for the earlier xref:example-debezium-simple-custom-converter[custom converter example], you would add the following properties to the connector configuration:
 +

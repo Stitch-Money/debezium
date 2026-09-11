@@ -35,6 +35,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.antlr.AntlrDdlParser;
+import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode;
 import io.debezium.connector.binlog.jdbc.BinlogDefaultValueConverter;
 import io.debezium.connector.binlog.jdbc.BinlogSystemVariables;
 import io.debezium.connector.binlog.jdbc.BinlogValueConverters;
@@ -63,8 +64,8 @@ import io.debezium.util.Testing;
  */
 public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, D extends BinlogDefaultValueConverter, P extends AntlrDdlParser<?, ?>> {
 
-    private P parser;
-    private Tables tables;
+    protected P parser;
+    protected Tables tables;
     private SimpleDdlParserListener listener;
     private V converters;
     private TableSchemaBuilder tableSchemaBuilder;
@@ -92,7 +93,8 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
                 converters,
                 getDefaultValueConverters(converters),
                 SchemaNameAdjuster.NO_OP, new CustomConverterRegistry(null), SchemaBuilder.struct().build(),
-                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false);
+                FieldNameSelector.defaultSelector(SchemaNameAdjuster.NO_OP), false,
+                EventConvertingFailureHandlingMode.WARN);
         properties = new Properties();
         properties.put("topic.prefix", "test");
     }
@@ -350,11 +352,11 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         parser.parse("CREATE SCHEMA IF NOT EXISTS `database1` CHARACTER SET='windows-1250'", tables);
         parser.parse("CREATE TABLE IF NOT EXISTS `database1`.`table1` (\n"
                 + "`created` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
-                + "`x1` VARCHAR NOT NULL\n"
+                + "`x1` VARCHAR(255) NOT NULL\n"
                 + ") CHARACTER SET = DEFAULT;", tables);
         parser.parse("CREATE TABLE IF NOT EXISTS `database2`.`table2` (\n"
                 + "`created` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
-                + "`x1` VARCHAR NOT NULL\n"
+                + "`x1` VARCHAR(255) NOT NULL\n"
                 + ") CHARACTER SET = DEFAULT;", tables);
         assertThat(parser.getParsingExceptionsFromWalker().size()).isEqualTo(0);
         assertThat(tables.size()).isEqualTo(2);
@@ -390,7 +392,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
 
     @Test
     @FixFor("DBZ-4193")
-    public void shouldAllowAggregateWindowedFunction() {
+    void shouldAllowAggregateWindowedFunction() {
         String selectSql = "SELECT e.id,\n"
                 + "SUM(e.bin_volume) AS bin_volume,\n"
                 + "SUM(e.bin_volume) OVER(PARTITION BY id, e.bin_volume ORDER BY id) AS bin_volume_o,\n"
@@ -679,7 +681,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         assertThat(table.columnWithName("mi").jdbcType()).isEqualTo(Types.INTEGER);
         assertThat(table.columnWithName("f4").jdbcType()).isEqualTo(Types.FLOAT);
         assertThat(table.columnWithName("f8").jdbcType()).isEqualTo(Types.DOUBLE);
-        assertThat(table.columnWithName("i1").jdbcType()).isEqualTo(Types.SMALLINT);
+        assertThat(table.columnWithName("i1").jdbcType()).isEqualTo(Types.TINYINT);
         assertThat(table.columnWithName("i2").jdbcType()).isEqualTo(Types.SMALLINT);
         assertThat(table.columnWithName("i3").jdbcType()).isEqualTo(Types.INTEGER);
         assertThat(table.columnWithName("i4").jdbcType()).isEqualTo(Types.INTEGER);
@@ -1233,7 +1235,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
     }
 
     @Test
-    void shouldParseMySql56InitializationStatements() {
+    public void shouldParseMySql56InitializationStatements() {
         parser.parse(readLines(1, "ddl/mysql-test-init-5.6.ddl"), tables);
         assertThat(tables.size()).isEqualTo(85); // 1 table
         int truncateTableStatements = 8;
@@ -1242,7 +1244,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
     }
 
     @Test
-    void shouldParseMySql57InitializationStatements() {
+    public void shouldParseMySql57InitializationStatements() {
         parser.parse(readLines(1, "ddl/mysql-test-init-5.7.ddl"), tables);
         assertThat(tables.size()).isEqualTo(123);
         int truncateTableStatements = 4;
@@ -1568,6 +1570,9 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         assertParseEnumAndSetOptions("ENUM('a\\'','b','c')", "a'", "b", "c");
         assertParseEnumAndSetOptions("ENUM(\"a\\\"\",'b','c')", "a\\\"", "b", "c");
         assertParseEnumAndSetOptions("ENUM(\"a\"\"\",'b','c')", "a\"\"", "b", "c");
+        assertParseEnumAndSetOptions(
+                "ENUM('a,b','back\\\\slash','back\\\\,comma','ends\\\\')",
+                "a,b", "back\\\\slash", "back\\\\,comma", "ends\\\\");
     }
 
     @Test
@@ -1760,6 +1765,19 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
     }
 
     @Test
+    @FixFor("DBZ-2223")
+    public void shouldNotDuplicateBinaryTypeName() {
+        String ddl = "CREATE TABLE mytable (c1 BINARY(16), c2 VARBINARY(32))";
+        parser.parse(ddl, tables);
+        assertThat(parser.getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+        Table table = tables.forTable(null, null, "mytable");
+        assertThat(table.columns()).hasSize(2);
+        assertColumn(table, "c1", "BINARY", Types.BINARY, 16, -1, true, false, false, true, null);
+        assertColumn(table, "c2", "VARBINARY", Types.VARBINARY, 32, -1, true, false, false, true, null);
+    }
+
+    @Test
     void shouldParseCreateUserTable() {
         String ddl = "CREATE TABLE IF NOT EXISTS user (   Host char(60) binary DEFAULT '' NOT NULL, User char(32) binary DEFAULT '' NOT NULL, Select_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Insert_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Update_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Delete_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Create_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Drop_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Reload_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Shutdown_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Process_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, File_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Grant_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, References_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Index_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Alter_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Show_db_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Super_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Create_tmp_table_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Lock_tables_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Execute_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Repl_slave_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Repl_client_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Create_view_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Show_view_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Create_routine_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Alter_routine_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Create_user_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Event_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Trigger_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, Create_tablespace_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, ssl_type enum('','ANY','X509', 'SPECIFIED') COLLATE utf8_general_ci DEFAULT '' NOT NULL, ssl_cipher BLOB NOT NULL, x509_issuer BLOB NOT NULL, x509_subject BLOB NOT NULL, max_questions int(11) unsigned DEFAULT 0  NOT NULL, max_updates int(11) unsigned DEFAULT 0  NOT NULL, max_connections int(11) unsigned DEFAULT 0  NOT NULL, max_user_connections int(11) unsigned DEFAULT 0  NOT NULL, plugin char(64) DEFAULT 'mysql_native_password' NOT NULL, authentication_string TEXT, password_expired ENUM('N', 'Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, password_last_changed timestamp NULL DEFAULT NULL, password_lifetime smallint unsigned NULL DEFAULT NULL, account_locked ENUM('N', 'Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL, PRIMARY KEY Host (Host,User) ) engine=MyISAM CHARACTER SET utf8 COLLATE utf8_bin comment='Users and global privileges';";
         parser.parse(ddl, tables);
@@ -1878,7 +1896,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
                 + " c1 varchar(255) default null," + System.lineSeparator()
                 + " c2 varchar(255) not null," + System.lineSeparator()
                 + " c3 varchar(255) charset latin2 not null," + System.lineSeparator()
-                + " primary key ('id')" + System.lineSeparator()
+                + " primary key (`id`)" + System.lineSeparator()
                 + ") engine=InnoDB auto_increment=1006 default charset=latin1;" + System.lineSeparator();
         parser.parse(ddl, tables);
         assertVariable("character_set_server", "utf8");
@@ -1899,7 +1917,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
                 + " c1 varchar(255) default null," + System.lineSeparator()
                 + " c2 varchar(255) not null," + System.lineSeparator()
                 + " c3 varchar(255) charset latin2 not null," + System.lineSeparator()
-                + " primary key ('id')" + System.lineSeparator()
+                + " primary key (`id`)" + System.lineSeparator()
                 + ") engine=InnoDB auto_increment=1006;" + System.lineSeparator();
         parser.parse(ddl, tables);
         assertThat(tables.size()).isEqualTo(2);
@@ -2142,7 +2160,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
 
     @Test
     void shouldParseDefiner() {
-        String function = "FUNCTION fnA( a int, b int ) RETURNS tinyint(1) begin -- anything end;";
+        String function = "FUNCTION fnA( a int, b int ) RETURNS tinyint(1) begin\n  -- anything\nend;";
         String ddl = "CREATE DEFINER='mysqluser'@'%' " + function;
         parser.parse(ddl, tables);
         assertThat(tables.size()).isEqualTo(0); // no tables
@@ -2203,7 +2221,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         assertThat(t).isNotNull();
         assertThat(t.retrieveColumnNames()).containsExactly("action", "revision", "changed_on", "id", "name");
         assertThat(t.primaryKeyColumnNames()).containsExactly("id", "revision");
-        assertColumn(t, "action", "TINYINT UNSIGNED", Types.SMALLINT, 3, -1, false, false, false);
+        assertColumn(t, "action", "TINYINT UNSIGNED", Types.TINYINT, 3, -1, false, false, false);
         assertColumn(t, "revision", "INT UNSIGNED", Types.INTEGER, 10, -1, false, false, false);
         assertColumn(t, "changed_on", "DATETIME", Types.TIMESTAMP, -1, -1, false, false, false);
         assertColumn(t, "id", "VARCHAR", Types.VARCHAR, 36, -1, false, false, false);
@@ -3004,7 +3022,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
     }
 
     @Test
-    void parseTableWithPageChecksum() {
+    public void parseTableWithPageChecksum() {
         String ddl = "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (`id`)) PAGE_CHECKSUM=1;" +
                 "ALTER TABLE t PAGE_CHECKSUM=0;";
         parser.parse(ddl, tables);
@@ -3187,7 +3205,7 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         assertThat(table.columnWithName("id").isOptional()).isEqualTo(false);
         assertThat(getColumnSchema(table, "boolean_c").defaultValue()).isEqualTo(false);
         assertThat(getColumnSchema(table, "bit_c").defaultValue()).isEqualTo(true);
-        assertThat(getColumnSchema(table, "tiny_c").defaultValue()).isEqualTo((short) 2);
+        assertThat(getColumnSchema(table, "tiny_c").defaultValue()).isEqualTo((byte) 2);
         assertThat(getColumnSchema(table, "tiny_un_c").defaultValue()).isEqualTo((short) 3);
         assertThat(getColumnSchema(table, "tiny_un_z_c").defaultValue()).isEqualTo((short) 4);
         assertThat(getColumnSchema(table, "small_c").defaultValue()).isEqualTo((short) 5);
@@ -3197,8 +3215,8 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         assertThat(getColumnSchema(table, "medium_un_c").defaultValue()).isEqualTo(9);
         assertThat(getColumnSchema(table, "medium_un_z_c").defaultValue()).isEqualTo(10);
         assertThat(getColumnSchema(table, "int_c").defaultValue()).isEqualTo(11);
-        assertThat(getColumnSchema(table, "int_un_c").defaultValue()).isEqualTo(12);
-        assertThat(getColumnSchema(table, "int_un_z_c").defaultValue()).isEqualTo(13);
+        assertThat(getColumnSchema(table, "int_un_c").defaultValue()).isEqualTo(12L);
+        assertThat(getColumnSchema(table, "int_un_z_c").defaultValue()).isEqualTo(13L);
         assertThat(getColumnSchema(table, "int11_c").defaultValue()).isEqualTo(14);
         assertThat(getColumnSchema(table, "big_c").defaultValue()).isEqualTo(15L);
         assertThat(getColumnSchema(table, "big_un_c").defaultValue()).isEqualTo(new BigDecimal(16));
@@ -3442,6 +3460,109 @@ public abstract class BinlogAntlrDdlParserTest<V extends BinlogValueConverters, 
         parser.parse(ddlWithPk, tables);
         t = tables.forTable(new TableId(null, null, "t2"));
         assertColumn(t, "COUNT(``id``)", "INT", Types.INTEGER, 10, -1, false, false, false);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1301")
+    public void shouldParseStatementAsColumnName() {
+        String ddl = "CREATE TABLE t1301 (id INT PRIMARY KEY, statement VARCHAR(100));"
+                + "ALTER TABLE t1301 ADD COLUMN statement2 VARCHAR(100) AFTER statement;";
+        parser.parse(ddl, tables);
+        assertThat(parser.getParsingExceptionsFromWalker()).isEmpty();
+
+        Table table = tables.forTable(new TableId(null, null, "t1301"));
+        assertThat(table).isNotNull();
+        assertThat(table.columns()).hasSize(3);
+        assertColumn(table, "statement", "VARCHAR", Types.VARCHAR, 100, -1, true, false, false);
+        assertColumn(table, "statement2", "VARCHAR", Types.VARCHAR, 100, -1, true, false, false);
+        assertThat(table.columnWithName("statement2").position()).isEqualTo(3);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#332")
+    public void shouldParseAlterTableRenameIndexWithDollarSignIdentifiers() {
+        String ddl = "CREATE TABLE testtbl (id INT PRIMARY KEY, col INT, INDEX t$testtbl$tbl$id (id), INDEX testtbl$t$col (col));"
+                + "ALTER TABLE testtbl RENAME INDEX t$testtbl$tbl$id TO testtbl$tbl$id;"
+                + "ALTER TABLE testtbl RENAME INDEX testtbl$t$col TO testtbl$col;"
+                + "ALTER TABLE testtbl RENAME INDEX testtbl$col TO testtbl$t$post$col;";
+        parser.parse(ddl, tables);
+        assertThat(parser.getParsingExceptionsFromWalker()).isEmpty();
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table table = tables.forTable(new TableId(null, null, "testtbl"));
+        assertThat(table).isNotNull();
+        assertThat(table.retrieveColumnNames()).containsExactly("id", "col");
+        assertThat(table.primaryKeyColumnNames()).containsExactly("id");
+    }
+
+    @Test
+    @FixFor("dbz#1504")
+    public void shouldProcessAlterConvertToCharset() {
+
+        String ddl = "create table my_table (id int primary key, string1 varchar(255), string2 varchar(128)) default charset = latin1;";
+        parser.parse(ddl, tables);
+
+        Table table = tables.forTable(new TableId(null, null, "my_table"));
+        assertThat(table.defaultCharsetName()).isEqualTo("latin1");
+        assertThat(table.columnWithName("id").charsetName()).isNull();
+        assertThat(table.columnWithName("string1").charsetName()).isEqualTo("latin1");
+        assertThat(table.columnWithName("string1").length()).isEqualTo(255);
+        assertThat(table.columnWithName("string2").charsetName()).isEqualTo("latin1");
+        assertThat(table.columnWithName("string2").length()).isEqualTo(128);
+
+        ddl = "alter table my_table convert to character set utf8mb4 collate utf8mb4_unicode_ci;";
+        parser.parse(ddl, tables);
+
+        table = tables.forTable(new TableId(null, null, "my_table"));
+        assertThat(table.defaultCharsetName()).isEqualTo("utf8mb4");
+        assertThat(table.columnWithName("id").charsetName()).isNull();
+        assertThat(table.columnWithName("string1").charsetName()).isEqualTo("utf8mb4");
+        assertThat(table.columnWithName("string1").length()).isEqualTo(255);
+        assertThat(table.columnWithName("string2").charsetName()).isEqualTo("utf8mb4");
+        assertThat(table.columnWithName("string2").length()).isEqualTo(128);
+    }
+
+    @Test
+    @FixFor("DBZ-1568")
+    public void shouldHandleImplicitNullabilityInAlterTableChange() {
+        // Create table with NOT NULL column
+        String ddl = "CREATE TABLE test (\n" +
+                "  id INT PRIMARY KEY,\n" +
+                "  start_date DATE NOT NULL\n" +
+                ");";
+        parser.parse(ddl, tables);
+        assertThat(parser.getParsingExceptionsFromWalker().size()).isEqualTo(0);
+
+        Table table = tables.forTable(null, null, "test");
+        assertThat(table.columnWithName("start_date").isOptional()).isFalse();
+
+        // Alter column without explicit NULL keyword (implicit nullability)
+        ddl = "ALTER TABLE test CHANGE start_date start_date DATE DEFAULT NULL;";
+        parser.parse(ddl, tables);
+        table = tables.forTable(null, null, "test");
+
+        // Column should now be nullable per MySQL's default behavior
+        assertThat(table.columnWithName("start_date").isOptional()).isTrue();
+        assertThat(table.columnWithName("start_date").typeName()).isEqualTo("DATE");
+        assertThat(table.columnWithName("start_date").hasDefaultValue()).isTrue();
+
+        // Test with MODIFY as well
+        ddl = "CREATE TABLE test2 (\n" +
+                "  id INT PRIMARY KEY,\n" +
+                "  value INT NOT NULL\n" +
+                ");";
+        parser.parse(ddl, tables);
+        table = tables.forTable(null, null, "test2");
+        assertThat(table.columnWithName("value").isOptional()).isFalse();
+
+        // Modify column without explicit NULL keyword
+        ddl = "ALTER TABLE test2 MODIFY value INT DEFAULT 0;";
+        parser.parse(ddl, tables);
+        table = tables.forTable(null, null, "test2");
+
+        // Column should now be nullable per MySQL's default behavior
+        assertThat(table.columnWithName("value").isOptional()).isTrue();
+        assertThat(table.columnWithName("value").typeName()).isEqualTo("INT");
     }
 
     private String toIsoString(String timestamp) {

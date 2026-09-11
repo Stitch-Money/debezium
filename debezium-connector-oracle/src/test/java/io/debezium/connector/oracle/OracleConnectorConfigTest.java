@@ -134,33 +134,6 @@ public class OracleConnectorConfigTest {
     }
 
     @Test
-    void validBatchDefaults() throws Exception {
-
-        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(
-                Configuration.create()
-                        .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
-                        .build());
-
-        assertEquals(connectorConfig.getLogMiningBatchSizeDefault(), OracleConnectorConfig.DEFAULT_BATCH_SIZE);
-        assertEquals(connectorConfig.getLogMiningBatchSizeMax(), OracleConnectorConfig.MAX_BATCH_SIZE);
-        assertEquals(connectorConfig.getLogMiningBatchSizeMin(), OracleConnectorConfig.MIN_BATCH_SIZE);
-    }
-
-    @Test
-    void validSleepDefaults() throws Exception {
-
-        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(
-                Configuration.create()
-                        .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
-                        .build());
-
-        assertEquals(connectorConfig.getLogMiningSleepTimeDefault(), OracleConnectorConfig.DEFAULT_SLEEP_TIME);
-        assertEquals(connectorConfig.getLogMiningSleepTimeMax(), OracleConnectorConfig.MAX_SLEEP_TIME);
-        assertEquals(connectorConfig.getLogMiningSleepTimeMin(), OracleConnectorConfig.MIN_SLEEP_TIME);
-        assertEquals(connectorConfig.getLogMiningSleepTimeIncrement(), OracleConnectorConfig.SLEEP_TIME_INCREMENT);
-    }
-
-    @Test
     @FixFor("DBZ-5146")
     public void validQueryFetchSizeDefaults() throws Exception {
         final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(
@@ -416,5 +389,183 @@ public class OracleConnectorConfigTest {
         List<Field> fields = List.of(SIGNAL_DATA_COLLECTION);
         final Configuration config = Configuration.create().with(SIGNAL_DATA_COLLECTION, "db.schema.table").build();
         assertThat(config.validateAndRecord(fields, LOGGER::error)).isTrue();
+    }
+
+    @Test
+    public void shouldFailValidationWhenDeferredTransactionStartEnabledWithLob() {
+        List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START);
+        final Configuration config = Configuration.create()
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "logminer")
+                .with(OracleConnectorConfig.LOB_ENABLED, true)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .build();
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isFalse();
+    }
+
+    @Test
+    public void shouldPassValidationWhenDeferredTransactionStartEnabledWithoutLob() {
+        List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START);
+        final Configuration config = Configuration.create()
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "logminer")
+                .with(OracleConnectorConfig.LOB_ENABLED, false)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .build();
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isTrue();
+    }
+
+    @Test
+    public void shouldDisableDeferredTransactionStartWithUnbufferedAdapter() {
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "logminer_unbuffered")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.isDeferredLogMinerTransactionStartBehaviorEnabled()).isFalse();
+    }
+
+    @Test
+    public void shouldResolveDeferredTransactionStartViaDeprecatedAlias() {
+        List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START);
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TYPE, OracleConnectorConfig.LogMiningBufferType.MEMORY)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .build();
+
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isTrue();
+
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.isDeferredLogMinerTransactionStartBehaviorEnabled()).isTrue();
+    }
+
+    @Test
+    public void shouldReturnDefaultDeferredTransactionRetention() {
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.getLogMiningDeferredTransactionRetention()).isEqualTo(Duration.ofHours(24));
+    }
+
+    @Test
+    public void shouldReturnCustomDeferredTransactionRetention() {
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_RETENTION_MS, 3_600_000L)
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.getLogMiningDeferredTransactionRetention()).isEqualTo(Duration.ofHours(1));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldFailValidationWhenUsernameTrackingDisabledWithUsernameIncludeList() {
+        final Configuration config = logMinerConfig("logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, false)
+                .with(OracleConnectorConfig.LOG_MINING_USERNAME_INCLUDE_LIST, "DEBEZIUM")
+                .build();
+
+        final List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isFalse();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldFailValidationWhenUsernameTrackingDisabledWithUsernameExcludeList() {
+        final Configuration config = logMinerConfig("logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, false)
+                .with(OracleConnectorConfig.LOG_MINING_USERNAME_EXCLUDE_LIST, "DEBEZIUM")
+                .build();
+
+        final List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isFalse();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldFailValidationWhenClientIdTrackingDisabledWithClientIdIncludeList() {
+        final Configuration config = logMinerConfig("logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID, false)
+                .with(OracleConnectorConfig.LOG_MINING_CLIENTID_INCLUDE_LIST, "client1")
+                .build();
+
+        final List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isFalse();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldFailValidationWhenClientIdTrackingDisabledWithClientIdExcludeList() {
+        final Configuration config = logMinerConfig("logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID, false)
+                .with(OracleConnectorConfig.LOG_MINING_CLIENTID_EXCLUDE_LIST, "client1")
+                .build();
+
+        final List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isFalse();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldFailValidationWhenTrackingDisabledWithFiltersForUnbufferedAdapter() {
+        final Configuration config = logMinerConfig("logminer_unbuffered")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, false)
+                .with(OracleConnectorConfig.LOG_MINING_USERNAME_EXCLUDE_LIST, "DEBEZIUM")
+                .build();
+
+        final List<Field> fields = List.of(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isFalse();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldPassValidationWhenTrackingDisabledWithoutFilters() {
+        final Configuration config = logMinerConfig("logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, false)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID, false)
+                .build();
+
+        final List<Field> fields = List.of(
+                OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME,
+                OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isTrue();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldPassValidationWhenTrackingEnabledWithFilters() {
+        final Configuration config = logMinerConfig("logminer")
+                .with(OracleConnectorConfig.LOG_MINING_USERNAME_EXCLUDE_LIST, "DEBEZIUM")
+                .with(OracleConnectorConfig.LOG_MINING_CLIENTID_EXCLUDE_LIST, "client1")
+                .build();
+
+        final List<Field> fields = List.of(
+                OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME,
+                OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isTrue();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2473")
+    public void shouldPassValidationWhenTrackingDisabledWithFiltersForNonLogMinerAdapter() {
+        final Configuration config = logMinerConfig("xstream")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME, false)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID, false)
+                .with(OracleConnectorConfig.LOG_MINING_USERNAME_EXCLUDE_LIST, "DEBEZIUM")
+                .with(OracleConnectorConfig.LOG_MINING_CLIENTID_EXCLUDE_LIST, "client1")
+                .build();
+
+        final List<Field> fields = List.of(
+                OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_USERNAME,
+                OracleConnectorConfig.LOG_MINING_BUFFER_TRACK_CLIENT_ID);
+        assertThat(config.validateAndRecord(fields, LOGGER::error)).isTrue();
+    }
+
+    private static Configuration.Builder logMinerConfig(String adapter) {
+        return Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, adapter);
     }
 }

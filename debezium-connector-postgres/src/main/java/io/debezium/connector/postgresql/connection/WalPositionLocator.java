@@ -39,6 +39,7 @@ public class WalPositionLocator {
     private final Lsn lastCommitStoredLsn;
     private final Lsn lastEventStoredLsn;
     private final Operation lastProcessedMessageType;
+    private final long lastEventStoredLsnEventsProcessed;
     private Lsn txStartLsn = null;
     private Lsn lsnAfterLastEventStoredLsn = null;
     private Lsn firstLsnReceived = null;
@@ -46,20 +47,29 @@ public class WalPositionLocator {
     private Lsn startStreamingLsn = null;
     private boolean storeLsnAfterLastEventStoredLsn = false;
     private Set<Lsn> lsnSeen = new HashSet<>(1_000);
+    private long currentLsnEventCount = 0;
+    private long startStreamingEventsToSkip = 0;
+    private boolean skipProcessedLogicalMessage = false;
 
     public WalPositionLocator(Lsn lastCommitStoredLsn, Lsn lastEventStoredLsn, Operation lastProcessedMessageType) {
+        this(lastCommitStoredLsn, lastEventStoredLsn, lastProcessedMessageType, 0);
+    }
+
+    public WalPositionLocator(Lsn lastCommitStoredLsn, Lsn lastEventStoredLsn, Operation lastProcessedMessageType, long lsnEventsProcessed) {
         this.lastCommitStoredLsn = lastCommitStoredLsn;
         this.lastEventStoredLsn = lastEventStoredLsn;
         this.lastProcessedMessageType = lastProcessedMessageType;
+        this.lastEventStoredLsnEventsProcessed = lsnEventsProcessed;
 
-        LOGGER.info("Looking for WAL restart position for last commit LSN '{}' and last change LSN '{}'",
-                lastCommitStoredLsn, lastEventStoredLsn);
+        LOGGER.info("Looking for WAL restart position for last commit LSN '{}' and last change LSN '{}', events processed at LSN '{}'",
+                lastCommitStoredLsn, lastEventStoredLsn, lsnEventsProcessed);
     }
 
     public WalPositionLocator() {
         this.lastCommitStoredLsn = null;
         this.lastEventStoredLsn = null;
         this.lastProcessedMessageType = null;
+        this.lastEventStoredLsnEventsProcessed = 0;
 
         LOGGER.info("WAL position will not be searched");
     }
@@ -69,7 +79,7 @@ public class WalPositionLocator {
      *         the position has not been found yet
      */
     public Optional<Lsn> resumeFromLsn(Lsn currentLsn, ReplicationMessage message) {
-        LOGGER.trace("Processing LSN '{}', operation '{}'", currentLsn, message.getOperation());
+        LOGGER.trace("Processing LSN '{}', operation '{}' during WAL position search", currentLsn, message.getOperation());
 
         lsnSeen.add(currentLsn);
 
@@ -81,6 +91,29 @@ public class WalPositionLocator {
             // Event that immediately follows the last event seen
             // We can resume streaming from it
             if (currentLsn.equals(lastEventStoredLsn)) {
+                // Multiple events can share the same LSN (e.g. COPY or batched inserts).
+                // Count events at this LSN to find the precise resume point.
+                currentLsnEventCount++;
+
+                // Same-LSN skip logic only applies when multiple DML events share the same LSN
+                // (e.g. COPY or batched inserts). When lsnEventsProcessed is 1, the existing
+                // "find next different LSN" logic handles restart correctly.
+                if (lastEventStoredLsnEventsProcessed > 1 && currentLsnEventCount <= lastEventStoredLsnEventsProcessed) {
+                    LOGGER.trace("At LSN '{}', event count {} <= processed count {}, continuing search",
+                            currentLsn, currentLsnEventCount, lastEventStoredLsnEventsProcessed);
+                    return Optional.empty();
+                }
+
+                // We've passed all processed events at this LSN and there are more events remaining.
+                // Resume from this LSN, skipping the already-processed events during the replay phase.
+                if (lastEventStoredLsnEventsProcessed > 1) {
+                    startStreamingLsn = lastEventStoredLsn;
+                    startStreamingEventsToSkip = lastEventStoredLsnEventsProcessed;
+                    LOGGER.info("Will restart from LSN '{}' skipping first {} already-processed events",
+                            startStreamingLsn, startStreamingEventsToSkip);
+                    return Optional.of(startStreamingLsn);
+                }
+
                 // BEGIN and first message after change have the same LSN
                 if (txStartLsn != null
                         && (lastProcessedMessageType == null || lastProcessedMessageType == Operation.BEGIN || lastProcessedMessageType == Operation.COMMIT)) {
@@ -88,6 +121,19 @@ public class WalPositionLocator {
                     LOGGER.info("Will restart from LSN '{}' corresponding to the event following the BEGIN event", txStartLsn);
                     startStreamingLsn = txStartLsn;
                     return Optional.of(startStreamingLsn);
+                }
+
+                // PostgreSQL currently reports the end LSN of the MESSAGE rather than its start
+                // LSN. Since this LSN can also identify the next decoded operation, resume from
+                // that LSN and skip the already processed MESSAGE operation.
+                //
+                // This PostgreSQL behavior is under discussion and may change in a future version:
+                // https://www.postgresql.org/message-id/flat/d99c688994ab3a998afe26e61fe4f69f%40oss.nttdata.com
+                if (lastProcessedMessageType == Operation.MESSAGE) {
+                    startStreamingLsn = currentLsn;
+                    skipProcessedLogicalMessage = true;
+                    LOGGER.info("Last processed event was MESSAGE operation; will restart from LSN '{}' and skip that MESSAGE operation", currentLsn);
+                    return Optional.of(currentLsn);
                 }
                 return Optional.empty();
             }
@@ -98,10 +144,42 @@ public class WalPositionLocator {
             return Optional.of(startStreamingLsn);
         }
         if (currentLsn.equals(lastEventStoredLsn)) {
+            // debezium/dbz#76: In PG 17+, a COMMIT's txn->end_lsn (byte after the COMMIT WAL record)
+            // can equal the next transaction's first DML change->lsn. When the stored offset
+            // records a COMMIT at this LSN but the stream delivers a non-COMMIT event at the
+            // same position, it is a false match — the stored transaction was fully processed
+            // and this event belongs to the next unprocessed transaction.
+            if (lastProcessedMessageType == Operation.COMMIT && message.getOperation() != Operation.COMMIT
+                    && lastCommitStoredLsn != null && lastCommitStoredLsn.equals(lastEventStoredLsn)) {
+                LOGGER.info("Detected false LSN match at '{}': stored event was COMMIT but received {}. Resuming from '{}'",
+                        currentLsn, message.getOperation(), firstLsnReceived);
+                startStreamingLsn = firstLsnReceived;
+                return Optional.of(startStreamingLsn);
+            }
+
             storeLsnAfterLastEventStoredLsn = true;
+            // Start counting events at this LSN
+            currentLsnEventCount = 1;
+
+            // If we have a counter and this is not the last event at this LSN, stay in searching mode
+            if (lastEventStoredLsnEventsProcessed > 1) {
+                LOGGER.trace("At LSN '{}', starting same-LSN event count, processed count is {}",
+                        currentLsn, lastEventStoredLsnEventsProcessed);
+                return Optional.empty();
+            }
         }
 
         if (lastCommitStoredLsn == null) {
+            startStreamingLsn = firstLsnReceived;
+            return Optional.of(startStreamingLsn);
+        }
+
+        // For non-transactional MESSAGE operations, lastCommitStoredLsn equals lastEventStoredLsn
+        // (both set to the MESSAGE's LSN). Since the MESSAGE was fully processed and committed,
+        // we can safely resume from the first LSN received after restart.
+        if (lastProcessedMessageType == Operation.MESSAGE && lastCommitStoredLsn.equals(lastEventStoredLsn)) {
+            LOGGER.info("Last processed event was MESSAGE operation at LSN '{}', will restart from first LSN '{}'",
+                    lastEventStoredLsn, firstLsnReceived);
             startStreamingLsn = firstLsnReceived;
             return Optional.of(startStreamingLsn);
         }
@@ -110,9 +188,12 @@ public class WalPositionLocator {
             case BEGIN:
                 txStartLsn = currentLsn;
                 break;
+            case MESSAGE:
+                LOGGER.trace("Processing MESSAGE operation at LSN '{}' during WAL position search", currentLsn);
+                break;
             case COMMIT:
                 if (currentLsn.compareTo(lastCommitStoredLsn) > 0) {
-                    LOGGER.info("Received COMMIT LSN '{}' larger than than last stored commit LSN '{}'", currentLsn,
+                    LOGGER.info("Received COMMIT LSN '{}' larger than last stored commit LSN '{}'", currentLsn,
                             lastCommitStoredLsn);
                     if (lsnAfterLastEventStoredLsn != null) {
                         startStreamingLsn = lsnAfterLastEventStoredLsn;
@@ -156,6 +237,11 @@ public class WalPositionLocator {
             return false;
         }
         if (startStreamingLsn == null || startStreamingLsn.equals(lsn)) {
+            if (startStreamingEventsToSkip > 0) {
+                startStreamingEventsToSkip--;
+                LOGGER.debug("Message with LSN '{}' skipped, {} events remaining to skip", lsn, startStreamingEventsToSkip);
+                return true;
+            }
             LOGGER.info("Message with LSN '{}' arrived, switching off the filtering", lsn);
             passMessages = true;
             lsnSeen = new HashSet<>(); // Empty the Map as it might be large and is no longer needed
@@ -169,6 +255,17 @@ public class WalPositionLocator {
         }
         LOGGER.debug("Message with LSN '{}' filtered", lsn);
         return true;
+    }
+
+    public boolean skipProcessedLogicalMessage(Lsn lsn) {
+        if (skipProcessedLogicalMessage && startStreamingLsn != null && startStreamingLsn.equals(lsn)) {
+            skipProcessedLogicalMessage = false;
+            passMessages = true;
+            lsnSeen = new HashSet<>();
+            LOGGER.info("Processed MESSAGE operation with LSN '{}' skipped, switching off the filtering", lsn);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -196,9 +293,11 @@ public class WalPositionLocator {
     @Override
     public String toString() {
         return "WalPositionLocator [lastCommitStoredLsn=" + lastCommitStoredLsn + ", lastEventStoredLsn="
-                + lastEventStoredLsn + ", lastProcessedMessageType=" + lastProcessedMessageType + ", txStartLsn="
+                + lastEventStoredLsn + ", lastProcessedMessageType=" + lastProcessedMessageType
+                + ", lastEventStoredLsnEventsProcessed=" + lastEventStoredLsnEventsProcessed + ", txStartLsn="
                 + txStartLsn + ", lsnAfterLastEventStoredLsn=" + lsnAfterLastEventStoredLsn + ", firstLsnReceived="
                 + firstLsnReceived + ", passMessages=" + passMessages + ", startStreamingLsn=" + startStreamingLsn
-                + ", storeLsnAfterLastEventStoredLsn=" + storeLsnAfterLastEventStoredLsn + "]";
+                + ", storeLsnAfterLastEventStoredLsn=" + storeLsnAfterLastEventStoredLsn + ", startStreamingEventsToSkip="
+                + startStreamingEventsToSkip + "]";
     }
 }

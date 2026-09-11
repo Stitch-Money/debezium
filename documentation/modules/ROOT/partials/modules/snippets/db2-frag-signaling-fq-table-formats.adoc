@@ -8,7 +8,7 @@
 tag::fq-table-name-format-note[]
 [NOTE]
 ====
-If the name of a table that you want to include in a snapshot contains a dot (`.`), a space, or some other non-alphanumeric character, you must escape the table name in double quotes. +
+If the name of a table that you want to include in a snapshot contains a dot (`.`), a space, or some other non-alphanumeric character, you must escape the table name in double quotes.
 For example, to include a table that exists in the `*public*` schema and that has the name `*My.Table*`, use the following format: `*"public.\"My.Table\""*`.
 ====
 end::fq-table-name-format-note[]
@@ -103,11 +103,11 @@ tag::stopping-incremental-snapshot-example[]
 ====
 [source,sql,indent=0,subs="+attributes"]
 ----
-INSERT INTO myschema.debezium_signal (id, type, data) // <1>
-values ('ad-hoc-1',   // <2>
-    'stop-snapshot',  // <3>
-    '{"data-collections": ["schema1.table1", "schema1.table2"], // <4>
-    "type":"incremental"}'); // <5>
+INSERT INTO myschema.debezium_signal (id, type, data)
+values ('ad-hoc-1',  
+    'stop-snapshot', 
+    '{"data-collections": ["schema1.table1", "schema1.table2"],
+    "type":"incremental"}');
 ----
 ====
 +

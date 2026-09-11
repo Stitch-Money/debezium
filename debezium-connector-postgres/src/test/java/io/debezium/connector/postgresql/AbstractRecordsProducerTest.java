@@ -24,7 +24,6 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.Month;
 import java.time.OffsetDateTime;
-import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -32,6 +31,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -68,12 +68,15 @@ import io.debezium.data.Uuid;
 import io.debezium.data.VariableScaleDecimal;
 import io.debezium.data.VerifyRecord;
 import io.debezium.data.Xml;
+import io.debezium.data.geometry.Circle;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
+import io.debezium.data.geometry.Line;
 import io.debezium.data.geometry.Point;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
 import io.debezium.relational.TableId;
+import io.debezium.spatial.WkbWriter;
 import io.debezium.time.Date;
 import io.debezium.time.Interval;
 import io.debezium.time.MicroDuration;
@@ -121,11 +124,12 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
             "'-infinity'::TIMESTAMPTZ," +
             "'21016-11-04T13:51:30.000000+07:00'::TIMESTAMPTZ"
             + ")";
-    protected static final String INSERT_BIN_TYPES_STMT = "INSERT INTO bitbin_table (ba, bol, bol2, bs, bs7, bv, bv2, bvl, bvunlimited1, bvunlimited2) " +
-            "VALUES (E'\\\\001\\\\002\\\\003'::bytea, '0'::bit(1), '1'::bit(1), '11'::bit(2), '1'::bit(7), '00'::bit(2), '000000110000001000000001'::bit(24)," +
+    protected static final String INSERT_BIN_TYPES_STMT = "INSERT INTO bitbin_table (ba, bol, bol2, bs, bs7, bv1, bv, bv2, bvl, bvunlimited1, bvunlimited2) " +
+            "VALUES (E'\\\\001\\\\002\\\\003'::bytea, '0'::bit(1), '1'::bit(1), '11'::bit(2), '1'::bit(7), '1'::bit varying(1), '00'::bit(2), '000000110000001000000001'::bit(24),"
+            +
             "'1000000000000000000000000000000000000000000000000000000000000000'::bit(64), '101', '111011010001000110000001000000001')";
     protected static final String INSERT_BYTEA_BINMODE_STMT = "INSERT INTO bytea_binmode_table (ba, bytea_array) VALUES (E'\\\\001\\\\002\\\\003'::bytea, array[E'\\\\000\\\\001\\\\002'::bytea, E'\\\\003\\\\004\\\\005'::bytea])";
-    protected static final String INSERT_CIRCLE_STMT = "INSERT INTO circle_table (ccircle) VALUES ('((10, 20),10)'::circle)";
+    protected static final String INSERT_UNKNOWN_TYPE_STMT = "INSERT INTO unknown_type_table (tsq) VALUES ('fat <-> cat'::tsquery)";
     protected static final String INSERT_GEOM_TYPES_STMT = "INSERT INTO geom_table(p) VALUES ('(1,1)'::point)";
     protected static final String INSERT_TEXT_TYPES_STMT = "INSERT INTO text_table(j, jb, x, u) " +
             "VALUES ('{\"bar\": \"baz\"}'::json, '{\"bar\": \"baz\"}'::jsonb, " +
@@ -460,19 +464,19 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
     }
 
     protected List<SchemaAndValueField> schemaAndValueForUnknownColumnBytes() {
-        return Arrays.asList(new SchemaAndValueField("ccircle", Schema.OPTIONAL_BYTES_SCHEMA, ByteBuffer.wrap("<(10.0,20.0),10.0>".getBytes(StandardCharsets.UTF_8))));
+        return Arrays.asList(new SchemaAndValueField("tsq", Schema.OPTIONAL_BYTES_SCHEMA, ByteBuffer.wrap("'fat' <-> 'cat'".getBytes(StandardCharsets.UTF_8))));
     }
 
     protected List<SchemaAndValueField> schemaAndValueForUnknownColumnBase64() {
-        return Arrays.asList(new SchemaAndValueField("ccircle", Schema.OPTIONAL_STRING_SCHEMA, "PCgxMC4wLDIwLjApLDEwLjA+"));
+        return Arrays.asList(new SchemaAndValueField("tsq", Schema.OPTIONAL_STRING_SCHEMA, "J2ZhdCcgPC0+ICdjYXQn"));
     }
 
     protected List<SchemaAndValueField> schemaAndValueForUnknownColumnBase64UrlSafe() {
-        return Arrays.asList(new SchemaAndValueField("ccircle", Schema.OPTIONAL_STRING_SCHEMA, "PCgxMC4wLDIwLjApLDEwLjA-"));
+        return Arrays.asList(new SchemaAndValueField("tsq", Schema.OPTIONAL_STRING_SCHEMA, "J2ZhdCcgPC0-ICdjYXQn"));
     }
 
     protected List<SchemaAndValueField> schemaAndValueForUnknownColumnHex() {
-        return Arrays.asList(new SchemaAndValueField("ccircle", Schema.OPTIONAL_STRING_SCHEMA, "3c2831302e302c32302e30292c31302e303e"));
+        return Arrays.asList(new SchemaAndValueField("tsq", Schema.OPTIONAL_STRING_SCHEMA, "2766617427203c2d3e202763617427"));
     }
 
     protected List<SchemaAndValueField> schemasAndValuesForStringTypesWithSourceColumnTypeInfo() {
@@ -549,55 +553,79 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
     protected List<SchemaAndValueField> schemaAndValuesForRangeTypes() {
         String unboundedEnd = "infinity";
 
-        // Tstrange type
+        // Tsrange type
         String beginTsrange = "2019-03-31 15:30:00";
         String endTsrange = "2019-04-30 15:30:00";
 
         String expectedUnboundedExclusiveTsrange = String.format("[\"%s\",%s)", beginTsrange, unboundedEnd);
         String expectedBoundedInclusiveTsrange = String.format("[\"%s\",\"%s\"]", beginTsrange, endTsrange);
 
-        // Tstzrange type
-        DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSx");
-        Instant beginTstzrange = dateTimeFormatter.parse("2017-06-05 11:29:12.549426+00", Instant::from);
-        Instant endTstzrange = dateTimeFormatter.parse("2017-06-05 12:34:56.789012+00", Instant::from);
+        // Dummy expected values strictly to bypass Debezium's internal Type/Null checks
+        DateTimeFormatter f = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSxxx");
+        Instant beginTstz = f.parse("2017-06-05 11:29:12.549426+00:00", Instant::from);
+        Instant endTstz = f.parse("2017-06-05 12:34:56.789012+00:00", Instant::from);
+        String dummyBegin = f.withZone(java.time.ZoneOffset.UTC).format(beginTstz);
+        String dummyEnd = f.withZone(java.time.ZoneOffset.UTC).format(endTstz);
+        String dummyUnbounded = String.format("[\"%s\",)", dummyBegin);
+        String dummyBounded = String.format("[\"%s\",\"%s\"]", dummyBegin, dummyEnd);
 
-        // Acknowledge timezone expectation of the system running the test
-        String beginSystemTime = dateTimeFormatter.withZone(ZoneId.systemDefault()).format(beginTstzrange);
-        String endSystemTime = dateTimeFormatter.withZone(ZoneId.systemDefault()).format(endTstzrange);
+        // Tstzrange type - Timezone agnostic condition
+        final SchemaAndValueField.Condition tstzRangeCondition = (fieldName, expectedValue, actualValue) -> {
+            assertNotNull(actualValue);
+            String s = actualValue.toString();
 
-        String expectedUnboundedExclusiveTstzrange = String.format("[\"%s\",)", beginSystemTime);
-        String expectedBoundedInclusiveTstzrange = String.format("[\"%s\",\"%s\"]", beginSystemTime, endSystemTime);
+            Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(s);
+            List<String> parts = new ArrayList<>();
+            while (m.find()) {
+                parts.add(m.group(1));
+            }
+
+            assertTrue(parts.size() == 1 || parts.size() == 2, "Unexpected tstzrange format: " + s);
+
+            String beginStr = parts.get(0).matches(".*[+-]\\d{2}$") ? parts.get(0) + ":00" : parts.get(0);
+            Instant begin = f.parse(beginStr, Instant::from);
+            Instant expectedBegin = f.parse("2017-06-05 11:29:12.549426+00:00", Instant::from);
+            assertEquals(expectedBegin, begin, "Begin instant mismatch for " + fieldName);
+
+            if (parts.size() == 2) {
+                String endStr = parts.get(1).matches(".*[+-]\\d{2}$") ? parts.get(1) + ":00" : parts.get(1);
+                Instant end = f.parse(endStr, Instant::from);
+                Instant expectedEnd = f.parse("2017-06-05 12:34:56.789012+00:00", Instant::from);
+                assertEquals(expectedEnd, end, "End instant mismatch for " + fieldName);
+            }
+        };
 
         // Daterange
         String beginDaterange = "2019-03-31";
         String endDaterange = "2019-04-30";
-
         String expectedUnboundedDaterange = String.format("[%s,%s)", beginDaterange, unboundedEnd);
         String expectedBoundedDaterange = String.format("[%s,%s)", beginDaterange, endDaterange);
 
         // int4range
         String beginrange = "1000";
         String endrange = "6000";
-
         String expectedrange = String.format("[%s,%s)", beginrange, endrange);
 
         // numrange
         String beginnumrange = "5.3";
         String endnumrange = "6.3";
-
         String expectednumrange = String.format("[%s,%s)", beginnumrange, endnumrange);
 
         // int8range
         String beginint8range = "1000000";
         String endint8range = "6000000";
-
         String expectedint8range = String.format("[%s,%s)", beginint8range, endint8range);
 
         return Arrays.asList(
                 new SchemaAndValueField("unbounded_exclusive_tsrange", Schema.OPTIONAL_STRING_SCHEMA, expectedUnboundedExclusiveTsrange),
                 new SchemaAndValueField("bounded_inclusive_tsrange", Schema.OPTIONAL_STRING_SCHEMA, expectedBoundedInclusiveTsrange),
-                new SchemaAndValueField("unbounded_exclusive_tstzrange", Schema.OPTIONAL_STRING_SCHEMA, expectedUnboundedExclusiveTstzrange),
-                new SchemaAndValueField("bounded_inclusive_tstzrange", Schema.OPTIONAL_STRING_SCHEMA, expectedBoundedInclusiveTstzrange),
+
+                // Pass the dummy strings to bypass Type checking
+                new SchemaAndValueField("unbounded_exclusive_tstzrange", Schema.OPTIONAL_STRING_SCHEMA, dummyUnbounded)
+                        .assertWithCondition(tstzRangeCondition),
+                new SchemaAndValueField("bounded_inclusive_tstzrange", Schema.OPTIONAL_STRING_SCHEMA, dummyBounded)
+                        .assertWithCondition(tstzRangeCondition),
+
                 new SchemaAndValueField("unbounded_exclusive_daterange", Schema.OPTIONAL_STRING_SCHEMA, expectedUnboundedDaterange),
                 new SchemaAndValueField("bounded_exclusive_daterange", Schema.OPTIONAL_STRING_SCHEMA, expectedBoundedDaterange),
                 new SchemaAndValueField("int4_number_range", Schema.OPTIONAL_STRING_SCHEMA, expectedrange),
@@ -611,6 +639,7 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
                 new SchemaAndValueField("bol2", Schema.OPTIONAL_BOOLEAN_SCHEMA, true),
                 new SchemaAndValueField("bs", Bits.builder(2).optional().build(), new byte[]{ 3 }),
                 new SchemaAndValueField("bs7", Bits.builder(7).optional().build(), new byte[]{ 64 }),
+                new SchemaAndValueField("bv1", Schema.OPTIONAL_BOOLEAN_SCHEMA, true),
                 new SchemaAndValueField("bv", Bits.builder(2).optional().build(), new byte[]{}),
                 new SchemaAndValueField("bv2", Bits.builder(24).optional().build(), new byte[]{ 1, 2, 3 }),
                 new SchemaAndValueField("bvl", Bits.builder(64).optional().build(), new byte[]{ 0, 0, 0, 0, 0, 0, 0, -128 }), // Long.MAX_VALUE + 1
@@ -647,33 +676,21 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
         String expectedTzLarge = "+21016-11-04T06:51:30.123456Z";
         String expectedTzLargeZero = "+21016-11-04T06:51:30.000000Z";
 
-        // The assertion for minimimum timestamps is problematic as it seems that Java and PostgreSQL handles conversion from large negative date
-        // to microseconds in different way
-        // written to database: 4713-12-31T23:59:59.999999 BC
-        // arrived from decoding plugin: -210831897600000001
-        // value from decoding plugin converted to Instant: -4712-12-31T23:59:59.999999Z - 1 year difference
-        // JDBC driver delivers Timestamp B.C.E. 4713-12-31T23:59:59.000+0100 that internally contains -210835184391000001 and translates to Instant -4712-11-23T22:59:59.999999Z
-        // The result is that JDBC driver and logical decoding plugin provides different values which moreover
-        // do not map to Java conversions
-        // It seems that JDBC driver always uses Gregorian calendar while Java Time API uses Julian
-        // Also it seems that further distortions could be introduced by timezone used so instead of matching
-        // against exact value the requested date should be smaller than -4712-11-01
+        // Both snapshot and streaming now parse timestamps as strings using the proleptic Gregorian calendar
+        // (via DateTimeFormat), so they produce consistent values for extreme negative dates.
+        // Written to database: 4713-12-31T23:59:59.999999 BC
+        // Proleptic Gregorian: -4712-12-31T23:59:59.999999Z (4713 BC = year -4712 in astronomical numbering)
         final SchemaAndValueField.Condition largeNegativeTimestamp = (String fieldName, Object expectedValue, Object actualValue) -> {
-            final long expectedMinTsStreaming = -210831897600000001L;
-            final long expectedMinTsSnapshot = LocalDateTime.of(-4712, 11, 1, 0, 0, 0).toInstant(java.time.ZoneOffset.UTC).getEpochSecond() * 1_000_000;
+            final long expectedMinTs = -210831897600000001L;
             final long ts = (long) actualValue;
-            assertTrue(ts >= expectedMinTsSnapshot && ts < 0, "Negative timestamp don't match for " + fieldName + ", got " + actualValue);
+            assertEquals(expectedMinTs, ts, "Negative timestamp don't match for " + fieldName);
         };
-        // The same issue is with timezoned timestamp
         // Database: 4714-12-31T23:59:59.999999Z BC
-        // JDBC: -4713-11-23T23:59:59.999999Z
-        // Streamed as: -210863520000000001
-        // Java conversion: -4713-12-31T23:59:59.999999Z
+        // Proleptic Gregorian: -4713-12-31T23:59:59.999999Z
         final SchemaAndValueField.Condition largeNegativeTzTimestamp = (String fieldName, Object expectedValue, Object actualValue) -> {
-            final String expectedMinTsStreaming = "-4713-12-31T23:59:59.999999Z";
-            final String expectedMinTsSnapshot = "-4713-11-23T23:59:59.999999Z";
-            assertTrue(expectedMinTsSnapshot.equals(actualValue) || expectedMinTsStreaming.equals(actualValue),
-                    "Negative timestamp don't match for " + fieldName + ", got " + actualValue);
+            final String expectedMinTs = "-4713-12-31T23:59:59.999999Z";
+            assertEquals(expectedMinTs, actualValue,
+                    "Negative timestamp don't match for " + fieldName);
         };
         return Arrays.asList(new SchemaAndValueField("ts", MicroTimestamp.builder().optional().build(), expectedTs),
                 new SchemaAndValueField("tsneg", MicroTimestamp.builder().optional().build(), expectedNegTs),
@@ -788,19 +805,49 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
         element.put("scale", 3).put("value", new BigDecimal("3.333").unscaledValue().toByteArray());
         varnumArray.add(element);
 
-        DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSx");
-        Instant begin = dateTimeFormatter.parse("2017-06-05 11:29:12.549426+00", Instant::from);
-        Instant end = dateTimeFormatter.parse("2017-06-05 12:34:56.789012+00", Instant::from);
+        // Dummy expected values strictly to bypass Debezium's internal Size/Type checks
+        DateTimeFormatter f = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSxxx");
+        Instant beginTstz = f.parse("2017-06-05 11:29:12.549426+00:00", Instant::from);
+        Instant endTstz = f.parse("2017-06-05 12:34:56.789012+00:00", Instant::from);
+        String dummyBegin = f.withZone(java.time.ZoneOffset.UTC).format(beginTstz);
+        String dummyEnd = f.withZone(java.time.ZoneOffset.UTC).format(endTstz);
+        String dummyUnbounded = String.format("[\"%s\",)", dummyBegin);
+        String dummyBounded = String.format("[\"%s\",\"%s\"]", dummyBegin, dummyEnd);
+        List<String> dummyList = Arrays.asList(dummyUnbounded, dummyBounded);
 
-        // Acknowledge timezone expectation of the system running the test
-        String beginSystemTime = dateTimeFormatter.withZone(ZoneId.systemDefault()).format(begin);
-        String endSystemTime = dateTimeFormatter.withZone(ZoneId.systemDefault()).format(end);
+        // Timezone agnostic condition for tstzrange arrays
+        final SchemaAndValueField.Condition tstzRangeArrayCondition = (fieldName, expectedValue, actualValue) -> {
+            assertNotNull(actualValue);
+            assertTrue(actualValue instanceof java.util.List, "Actual value is not a list");
+            List<?> actualList = (List<?>) actualValue;
 
-        String expectedFirstTstzrange = String.format("[\"%s\",)", beginSystemTime);
-        String expectedSecondTstzrange = String.format("[\"%s\",\"%s\"]", beginSystemTime, endSystemTime);
+            for (Object item : actualList) {
+                String s = item.toString();
+                Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(s);
+                List<String> parts = new ArrayList<>();
+                while (m.find()) {
+                    parts.add(m.group(1));
+                }
 
-        return Arrays.asList(new SchemaAndValueField("int_array", SchemaBuilder.array(Schema.OPTIONAL_INT32_SCHEMA).optional().build(),
-                Arrays.asList(1, 2, 3)),
+                assertTrue(parts.size() == 1 || parts.size() == 2, "Unexpected tstzrange format in array: " + s);
+
+                String beginStr = parts.get(0).matches(".*[+-]\\d{2}$") ? parts.get(0) + ":00" : parts.get(0);
+                Instant beginInstant = f.parse(beginStr, Instant::from);
+                Instant expectedBegin = f.parse("2017-06-05 11:29:12.549426+00:00", Instant::from);
+                assertEquals(expectedBegin, beginInstant, "Begin instant mismatch for array element in " + fieldName);
+
+                if (parts.size() == 2) {
+                    String endStr = parts.get(1).matches(".*[+-]\\d{2}$") ? parts.get(1) + ":00" : parts.get(1);
+                    Instant endInstant = f.parse(endStr, Instant::from);
+                    Instant expectedEnd = f.parse("2017-06-05 12:34:56.789012+00:00", Instant::from);
+                    assertEquals(expectedEnd, endInstant, "End instant mismatch for array element in " + fieldName);
+                }
+            }
+        };
+
+        return Arrays.asList(
+                new SchemaAndValueField("int_array", SchemaBuilder.array(Schema.OPTIONAL_INT32_SCHEMA).optional().build(),
+                        Arrays.asList(1, 2, 3)),
                 new SchemaAndValueField("bigint_array", SchemaBuilder.array(Schema.OPTIONAL_INT64_SCHEMA).optional().build(),
                         Arrays.asList(1550166368505037572L)),
                 new SchemaAndValueField("text_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
@@ -822,25 +869,28 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
                                 new BigDecimal("5.60"))),
                 new SchemaAndValueField("varnumeric_array", SchemaBuilder.array(VariableScaleDecimal.builder().optional().build()).optional().build(),
                         varnumArray),
-                new SchemaAndValueField("citext_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("citext_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("four", "five", "six")),
-                new SchemaAndValueField("inet_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("inet_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("192.168.2.0/12", "192.168.1.1", "192.168.0.2/1")),
-                new SchemaAndValueField("cidr_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("cidr_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("192.168.100.128/25", "192.168.0.0/25", "192.168.1.0/24")),
-                new SchemaAndValueField("macaddr_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("macaddr_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("08:00:2b:01:02:03", "08:00:2b:01:02:03", "08:00:2b:01:02:03")),
-                new SchemaAndValueField("tsrange_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("tsrange_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("[\"2019-03-31 15:30:00\",infinity)", "[\"2019-03-31 15:30:00\",\"2019-04-30 15:30:00\"]")),
-                new SchemaAndValueField("tstzrange_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
-                        Arrays.asList(expectedFirstTstzrange, expectedSecondTstzrange)),
-                new SchemaAndValueField("daterange_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+
+                // Pass the dummyList to bypass Type and Size checking
+                new SchemaAndValueField("tstzrange_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(), dummyList)
+                        .assertWithCondition(tstzRangeArrayCondition),
+
+                new SchemaAndValueField("daterange_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("[2019-03-31,infinity)", "[2019-03-31,2019-04-30)")),
-                new SchemaAndValueField("int4range_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("int4range_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("[1,6)", "[1,4)")),
-                new SchemaAndValueField("numerange_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("numerange_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("[5.3,6.3)", "[10.0,20.0)")),
-                new SchemaAndValueField("int8range_array", SchemaBuilder.array(SchemaBuilder.OPTIONAL_STRING_SCHEMA).optional().build(),
+                new SchemaAndValueField("int8range_array", SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build(),
                         Arrays.asList("[1000000,6000000)", "[5000,9000)")),
                 new SchemaAndValueField("uuid_array", SchemaBuilder.array(Uuid.builder().optional().build()).optional().build(),
                         Arrays.asList("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "f0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")),
@@ -959,12 +1009,42 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
     }
 
     protected List<SchemaAndValueField> schemasAndValuesForDomainAliasTypes(boolean streaming) {
-        final ByteBuffer boxByteBuffer = ByteBuffer.wrap("(1.0,1.0),(0.0,0.0)".getBytes());
-        final ByteBuffer circleByteBuffer = ByteBuffer.wrap("<(10.0,4.0),10.0>".getBytes());
-        final ByteBuffer lineByteBuffer = ByteBuffer.wrap("{-1.0,0.0,0.0}".getBytes());
-        final ByteBuffer lsegByteBuffer = ByteBuffer.wrap("[(0.0,0.0),(0.0,1.0)]".getBytes());
-        final ByteBuffer pathByteBuffer = ByteBuffer.wrap("((0.0,0.0),(0.0,1.0),(0.0,2.0))".getBytes());
-        final ByteBuffer polygonByteBuffer = ByteBuffer.wrap("((0.0,0.0),(0.0,1.0),(1.0,0.0),(0.0,0.0))".getBytes());
+        // The six geometric types now map to first-class Connect schemas (dbz#2135). The expected WKB is
+        // built with the same WkbWriter the converter uses, so only coordinate correctness (and PostgreSQL's
+        // box corner normalisation) is asserted here, not raw byte layout.
+        final Schema geometrySchema = Geometry.builder().build();
+
+        // PostgreSQL normalises a box so the upper-right corner is stored first: input '(0,0),(1,1)' becomes
+        // point[0]=(1,1), point[1]=(0,0), which the converter encodes as a closed 5-point rectangle ring.
+        final Struct boxValue = Geometry.createValue(geometrySchema,
+                WkbWriter.buildPolygon(List.of(List.of(
+                        new double[]{ 1.0, 1.0 }, new double[]{ 1.0, 0.0 }, new double[]{ 0.0, 0.0 },
+                        new double[]{ 0.0, 1.0 }, new double[]{ 1.0, 1.0 }))),
+                null, Map.of(Geometry.EXTENSION_TYPE_KEY, "box"));
+
+        final Struct lsegValue = Geometry.createValue(geometrySchema,
+                WkbWriter.buildLineString(List.of(new double[]{ 0.0, 0.0 }, new double[]{ 0.0, 1.0 })),
+                null, Map.of(Geometry.EXTENSION_TYPE_KEY, "lseg"));
+
+        final Map<String, String> pathExtensions = new LinkedHashMap<>();
+        pathExtensions.put(Geometry.EXTENSION_TYPE_KEY, "path");
+        pathExtensions.put(Geometry.EXTENSION_CLOSED_KEY, "true"); // '((...))' is a closed path
+        final Struct pathValue = Geometry.createValue(geometrySchema,
+                WkbWriter.buildLineString(List.of(
+                        new double[]{ 0.0, 0.0 }, new double[]{ 0.0, 1.0 }, new double[]{ 0.0, 2.0 })),
+                null, pathExtensions);
+
+        final Struct polygonValue = Geometry.createValue(geometrySchema,
+                WkbWriter.buildPolygon(List.of(List.of(
+                        new double[]{ 0.0, 0.0 }, new double[]{ 0.0, 1.0 }, new double[]{ 1.0, 0.0 },
+                        new double[]{ 0.0, 0.0 }))),
+                null, Map.of(Geometry.EXTENSION_TYPE_KEY, "polygon"));
+
+        final Schema circleSchema = Circle.builder().build();
+        final Struct circleValue = Circle.createValue(circleSchema, 10.0, 4.0, 10.0);
+
+        final Schema lineSchema = Line.builder().build();
+        final Struct lineValue = Line.createValue(lineSchema, -1.0, 0.0, 0.0); // PG normalises '(0,0),(0,1)' to {-1,0,0}
 
         return Arrays.asList(
                 new SchemaAndValueField(PK_FIELD, SchemaBuilder.int32().defaultValue(0).build(), 1),
@@ -1002,20 +1082,20 @@ public abstract class AbstractRecordsProducerTest extends AbstractAsyncEngineCon
                         MicroDuration.durationMicros(1, 2, 3, 4, 5, 6, MicroDuration.DAYS_PER_MONTH_AVG)),
                 new SchemaAndValueField("interval_alias", MicroDuration.builder().build(),
                         MicroDuration.durationMicros(1, 2, 3, 4, 5, 6, MicroDuration.DAYS_PER_MONTH_AVG)),
-                new SchemaAndValueField("box_base", SchemaBuilder.BYTES_SCHEMA, boxByteBuffer),
-                new SchemaAndValueField("box_alias", SchemaBuilder.BYTES_SCHEMA, boxByteBuffer),
-                new SchemaAndValueField("circle_base", SchemaBuilder.BYTES_SCHEMA, circleByteBuffer),
-                new SchemaAndValueField("circle_alias", SchemaBuilder.BYTES_SCHEMA, circleByteBuffer),
-                new SchemaAndValueField("line_base", SchemaBuilder.BYTES_SCHEMA, lineByteBuffer),
-                new SchemaAndValueField("line_alias", SchemaBuilder.BYTES_SCHEMA, lineByteBuffer),
-                new SchemaAndValueField("lseg_base", SchemaBuilder.BYTES_SCHEMA, lsegByteBuffer),
-                new SchemaAndValueField("lseg_alias", SchemaBuilder.BYTES_SCHEMA, lsegByteBuffer),
-                new SchemaAndValueField("path_base", SchemaBuilder.BYTES_SCHEMA, pathByteBuffer),
-                new SchemaAndValueField("path_alias", SchemaBuilder.BYTES_SCHEMA, pathByteBuffer),
+                new SchemaAndValueField("box_base", geometrySchema, boxValue),
+                new SchemaAndValueField("box_alias", geometrySchema, boxValue),
+                new SchemaAndValueField("circle_base", circleSchema, circleValue),
+                new SchemaAndValueField("circle_alias", circleSchema, circleValue),
+                new SchemaAndValueField("line_base", lineSchema, lineValue),
+                new SchemaAndValueField("line_alias", lineSchema, lineValue),
+                new SchemaAndValueField("lseg_base", geometrySchema, lsegValue),
+                new SchemaAndValueField("lseg_alias", geometrySchema, lsegValue),
+                new SchemaAndValueField("path_base", geometrySchema, pathValue),
+                new SchemaAndValueField("path_alias", geometrySchema, pathValue),
                 new SchemaAndValueField("point_base", Point.builder().build(), Point.createValue(Point.builder().build(), 1, 1)),
                 new SchemaAndValueField("point_alias", Point.builder().build(), Point.createValue(Point.builder().build(), 1, 1)),
-                new SchemaAndValueField("polygon_base", SchemaBuilder.BYTES_SCHEMA, polygonByteBuffer),
-                new SchemaAndValueField("polygon_alias", SchemaBuilder.BYTES_SCHEMA, polygonByteBuffer),
+                new SchemaAndValueField("polygon_base", geometrySchema, polygonValue),
+                new SchemaAndValueField("polygon_alias", geometrySchema, polygonValue),
                 new SchemaAndValueField("char_base", SchemaBuilder.STRING_SCHEMA, "a"),
                 new SchemaAndValueField("char_alias", SchemaBuilder.STRING_SCHEMA, "a"),
                 new SchemaAndValueField("text_base", SchemaBuilder.STRING_SCHEMA, "Hello World"),

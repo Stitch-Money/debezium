@@ -13,6 +13,7 @@ import java.math.BigDecimal;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -370,7 +371,7 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
                 this::extractFieldValue,
                 topicName(), null);
 
-        var serialization = new JsonSerialization();
+        var serialization = new JsonSerialization(MongoDbConnectorConfig.JsonSerializationMode.LEGACY);
 
         try (var connection = connect()) {
             var codecs = connection.getDatabase(DATABASE_NAME)
@@ -437,6 +438,13 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
     @Test
     void snapshotOnlyUUID() throws Exception {
         snapshotOnly(UUID.randomUUID(), k -> UUID.randomUUID());
+    }
+
+    @Test
+    @FixFor("debezium/dbz#765")
+    void snapshotOnlyDate() throws Exception {
+        Date firstKey = new Date();
+        snapshotOnly(firstKey, k -> new Date(k.getTime() + 1000));
     }
 
     @Test
@@ -946,6 +954,37 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
                     }) == 0;
                 });
         return stopMessageFound.get();
+    }
+
+    @Test
+    @FixFor("dbz#1533")
+    public void shouldNotGetStuckOnInvalidAdditionalCondition() throws Exception {
+        // Testing.Print.enable();
+
+        populateDataCollection();
+        startConnector();
+
+        // Send a snapshot signal with a malformed additional condition.
+        // MongoDB's Document.parse() will throw a JsonParseException inside readChunk()
+        // when it tries to use the condition for the max-key query.
+        // The connector should NOT get stuck and should remain responsive.
+        insertDocuments("dbA", "signals",
+                Document.parse("{\"type\": \"execute-snapshot\", \"payload\": {"
+                        + "\"type\": \"INCREMENTAL\","
+                        + "\"data-collections\": [\"" + fullDataCollectionName() + "\"],"
+                        + "\"additional-conditions\": [{\"data-collection\": \"" + fullDataCollectionName() + "\", \"filter\": \"(THIS IS NOT VALID BSON)\"}]}}"));
+
+        // Wait to ensure the signal is processed
+        waitForAvailableRecords(waitTimeForRecords(), TimeUnit.SECONDS);
+
+        // Send a VALID snapshot signal to prove the connector is still functional
+        sendAdHocSnapshotSignal();
+
+        final int expectedRecordCount = ROW_COUNT;
+        final Map<Integer, Integer> dbChanges = consumeMixedWithIncrementalSnapshot(expectedRecordCount);
+        for (int i = 0; i < expectedRecordCount; i++) {
+            assertThat(dbChanges).contains(entry(i + 1, i));
+        }
     }
 
     @Override

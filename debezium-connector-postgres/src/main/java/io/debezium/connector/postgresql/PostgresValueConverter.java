@@ -13,6 +13,8 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.sql.Array;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -30,19 +32,30 @@ import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.PGStatement;
+import org.postgresql.geometric.PGbox;
+import org.postgresql.geometric.PGcircle;
+import org.postgresql.geometric.PGline;
+import org.postgresql.geometric.PGlseg;
+import org.postgresql.geometric.PGpath;
 import org.postgresql.geometric.PGpoint;
+import org.postgresql.geometric.PGpolygon;
 import org.postgresql.jdbc.PgArray;
 import org.postgresql.util.HStoreConverter;
 import org.postgresql.util.PGInterval;
@@ -54,6 +67,7 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.HStoreHandlingMode;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.IntervalHandlingMode;
+import io.debezium.connector.postgresql.connection.DateTimeFormat;
 import io.debezium.connector.postgresql.data.Ltree;
 import io.debezium.connector.postgresql.proto.PgProto;
 import io.debezium.data.Bits;
@@ -62,8 +76,10 @@ import io.debezium.data.SpecialValueDecimal;
 import io.debezium.data.TsVector;
 import io.debezium.data.Uuid;
 import io.debezium.data.VariableScaleDecimal;
+import io.debezium.data.geometry.Circle;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
+import io.debezium.data.geometry.Line;
 import io.debezium.data.geometry.Point;
 import io.debezium.data.vector.DoubleVector;
 import io.debezium.data.vector.FloatVector;
@@ -72,9 +88,15 @@ import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.Column;
 import io.debezium.relational.ValueConverter;
+import io.debezium.spatial.WkbWriter;
 import io.debezium.time.Conversions;
 import io.debezium.time.Interval;
 import io.debezium.time.MicroDuration;
+import io.debezium.time.StructuredDate;
+import io.debezium.time.StructuredDuration;
+import io.debezium.time.StructuredTimestamp;
+import io.debezium.time.StructuredZonedTime;
+import io.debezium.time.StructuredZonedTimestamp;
 import io.debezium.time.ZonedTime;
 import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.NumberConversions;
@@ -97,6 +119,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
     public static final OffsetDateTime POSITIVE_INFINITY_OFFSET_DATE_TIME = OffsetDateTime.ofInstant(Conversions.toInstantFromMillis(PGStatement.DATE_POSITIVE_INFINITY),
             ZoneOffset.UTC);
     public static final LocalDate POSITIVE_INFINITY_LOCAL_DATE = LocalDate.parse("-5877611-06-21");
+    public static final String POSITIVE_INFINITY_TIMESTAMP_PG_STRING = "infinity";
 
     public static final Date NEGATIVE_INFINITY_DATE = new Date(PGStatement.DATE_NEGATIVE_INFINITY);
     public static final Timestamp NEGATIVE_INFINITY_TIMESTAMP = new Timestamp(PGStatement.DATE_NEGATIVE_INFINITY);
@@ -105,6 +128,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
     public static final OffsetDateTime NEGATIVE_INFINITY_OFFSET_DATE_TIME = OffsetDateTime.ofInstant(Conversions.toInstantFromMillis(PGStatement.DATE_NEGATIVE_INFINITY),
             ZoneOffset.UTC);
     public static final LocalDate NEGATIVE_INFINITY_LOCAL_DATE = LocalDate.parse("-5877611-06-22");
+    public static final String NEGATIVE_INFINITY_TIMESTAMP_PG_STRING = "-infinity";
 
     /**
      * Variable scale decimal/numeric is defined by metadata
@@ -138,6 +162,11 @@ public class PostgresValueConverter extends JdbcValueConverters {
             .appendFraction(ChronoField.MICRO_OF_SECOND, 0, 6, true)
             .appendPattern("[XXX][XX][X]")
             .toFormatter();
+
+    // Parses a PostgreSQL TIMETZ text value into raw components, allowing the end-of-day boundary hour 24
+    // and preserving the original offset. Offset may be given as +HH, +HH:MM or +HH:MM:SS.
+    private static final Pattern TIMETZ_PATTERN = Pattern.compile(
+            "^(\\d{1,2}):(\\d{2}):(\\d{2})(?:\\.(\\d{1,6}))?([+-]\\d{2}(?::\\d{2}(?::\\d{2})?)?)$");
 
     /**
      * {@code true} if fields of data type not know should be handle as opaque binary;
@@ -200,12 +229,21 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.VARBIT:
                 return column.length() > 1 ? Bits.builder(column.length()) : SchemaBuilder.bool();
             case PgOid.INTERVAL:
+                if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                    return StructuredDuration.builder();
+                }
                 return intervalMode == IntervalHandlingMode.STRING ? Interval.builder() : MicroDuration.builder();
             case PgOid.TIMESTAMPTZ:
                 // JDBC reports this as "timestamp" even though it's with tz, so we can't use the base class...
+                if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                    return StructuredZonedTimestamp.builder();
+                }
                 return ZonedTimestamp.builder();
             case PgOid.TIMETZ:
                 // JDBC reports this as "time" but this contains TZ information
+                if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                    return StructuredZonedTime.builder();
+                }
                 return ZonedTime.builder();
             case PgOid.OID:
                 return SchemaBuilder.int64();
@@ -228,6 +266,15 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 return Uuid.builder();
             case PgOid.POINT:
                 return Point.builder();
+            case PgOid.BOX:
+            case PgOid.LSEG:
+            case PgOid.PATH:
+            case PgOid.POLYGON:
+                return Geometry.builder();
+            case PgOid.CIRCLE:
+                return Circle.builder();
+            case PgOid.LINE:
+                return Line.builder();
             case PgOid.MONEY:
                 return moneySchema();
             case PgOid.NUMERIC:
@@ -276,10 +323,16 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.TIME_ARRAY:
                 return SchemaBuilder.array(temporalPrecisionMode.getTimeBuilder(getTimePrecision(column)).optional().build());
             case PgOid.TIMETZ_ARRAY:
+                if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                    return SchemaBuilder.array(StructuredZonedTime.builder().optional().build());
+                }
                 return SchemaBuilder.array(ZonedTime.builder().optional().build());
             case PgOid.TIMESTAMP_ARRAY:
                 return SchemaBuilder.array(temporalPrecisionMode.getTimestampBuilder(getTimePrecision(column)).optional().build());
             case PgOid.TIMESTAMPTZ_ARRAY:
+                if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                    return SchemaBuilder.array(StructuredZonedTimestamp.builder().optional().build());
+                }
                 return SchemaBuilder.array(ZonedTimestamp.builder().optional().build());
             case PgOid.BYTEA_ARRAY:
                 return SchemaBuilder.array(binaryMode.getSchema().optional().build());
@@ -339,13 +392,12 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 }
 
                 final PostgresType resolvedType = typeRegistry.get(oidValue);
-
                 if (resolvedType.isEnumType()) {
                     return io.debezium.data.Enum.builder(Strings.join(",", resolvedType.getEnumValues()));
                 }
                 else if (resolvedType.isArrayType()) {
                     if (resolvedType.getElementType().isEnumType()) {
-                        List<String> enumValues = resolvedType.getElementType().getEnumValues();
+                        Set<String> enumValues = resolvedType.getElementType().getEnumValues();
                         return SchemaBuilder.array(io.debezium.data.Enum.builder(Strings.join(",", enumValues)));
                     }
                     else {
@@ -462,6 +514,18 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 return data -> convertString(column, fieldDefn, data);
             case PgOid.POINT:
                 return data -> convertPoint(column, fieldDefn, data);
+            case PgOid.BOX:
+                return data -> convertBox(column, fieldDefn, data);
+            case PgOid.LSEG:
+                return data -> convertLseg(column, fieldDefn, data);
+            case PgOid.PATH:
+                return data -> convertPath(column, fieldDefn, data);
+            case PgOid.POLYGON:
+                return data -> convertPolygon(column, fieldDefn, data);
+            case PgOid.CIRCLE:
+                return data -> convertCircle(column, fieldDefn, data);
+            case PgOid.LINE:
+                return data -> convertLine(column, fieldDefn, data);
             case PgOid.MONEY:
                 return data -> convertMoney(column, fieldDefn, data, decimalMode);
             case PgOid.NUMERIC:
@@ -553,6 +617,11 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 final PostgresType resolvedType = typeRegistry.get(oidValue);
                 if (resolvedType.isArrayType()) {
                     return createArrayConverter(column, fieldDefn);
+                }
+
+                // Enum types don't have a JDBC converter, but we need to return a converter that passes through the string value
+                if (resolvedType.isEnumType()) {
+                    return data -> convertString(column, fieldDefn, data);
                 }
 
                 final ValueConverter jdbcConverter = super.converter(column, fieldDefn);
@@ -828,11 +897,35 @@ public class PostgresValueConverter extends JdbcValueConverters {
     }
 
     @Override
-    protected Object convertBits(Column column, Field fieldDefn, Object data, int numBytes) {
-        if (data instanceof PGobject) {
-            // returned by the JDBC driver
-            data = ((PGobject) data).getValue();
+    protected ValueConverter convertBits(Column column, Field fieldDefn) {
+        // For VARBIT(1), we need special handling because JDBC returns PGobject
+        if (column.nativeType() == PgOid.VARBIT && column.length() == 1) {
+            return data -> {
+                if (data instanceof PGobject pgObject) {
+                    data = pgObject.getValue();
+                }
+                if (data instanceof String str) {
+                    return Integer.valueOf(str, 2) == 0 ? Boolean.FALSE : Boolean.TRUE;
+                }
+                return convertBit(column, fieldDefn, data);
+            };
         }
+        return super.convertBits(column, fieldDefn);
+    }
+
+    @Override
+    protected Object convertBits(Column column, Field fieldDefn, Object data, int numBytes) {
+        if (data instanceof PGobject pgObject) {
+            // returned by the JDBC driver
+            data = pgObject.getValue();
+        }
+
+        // For VARBIT(1), convert to boolean just like BIT(1)
+        if (column.length() == 1 && data instanceof String str) {
+            // Return boolean directly
+            return Integer.valueOf(str, 2) == 0 ? Boolean.FALSE : Boolean.TRUE;
+        }
+
         if (data instanceof String) {
             String dataStr = (String) data;
             BitSet bitset = new BitSet(dataStr.length());
@@ -899,6 +992,9 @@ public class PostgresValueConverter extends JdbcValueConverters {
     }
 
     protected Object convertInterval(Column column, Field fieldDefn, Object data) {
+        if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+            return convertIntervalToStructured(column, fieldDefn, data);
+        }
         Object fallback = intervalMode == IntervalHandlingMode.STRING ? Interval.toIsoString(0, 0, 0, 0, 0, new BigDecimal(0)) : NumberConversions.LONG_FALSE;
         return convertValue(column, fieldDefn, data, fallback, (r) -> {
             if (data instanceof Number) {
@@ -937,8 +1033,50 @@ public class PostgresValueConverter extends JdbcValueConverters {
         });
     }
 
+    protected Object convertIntervalToStructured(Column column, Field fieldDefn, Object data) {
+        final int precision = getTimePrecision(column);
+        return convertValue(column, fieldDefn, data, StructuredDuration.from(fieldDefn.schema(), 0, 0, 0, 0, 0, 0, 0, precision), (r) -> {
+            if (data instanceof Number) {
+                final long micros = ((Number) data).longValue();
+                final long seconds = micros / 1_000_000;
+                final int nanos = (int) (micros % 1_000_000) * 1_000;
+                r.deliver(StructuredDuration.from(fieldDefn.schema(), 0, 0, 0, 0, 0, seconds, nanos, precision));
+            }
+            if (data instanceof PGInterval) {
+                final PGInterval interval = (PGInterval) data;
+                final BigDecimal seconds = BigDecimal.valueOf(interval.getSeconds());
+                final long wholeSeconds = seconds.longValue();
+                final int nanos = seconds.subtract(BigDecimal.valueOf(wholeSeconds))
+                        .movePointRight(9)
+                        .setScale(0, RoundingMode.HALF_UP)
+                        .intValueExact();
+                r.deliver(StructuredDuration.from(
+                        fieldDefn.schema(),
+                        interval.getYears(),
+                        interval.getMonths(),
+                        interval.getDays(),
+                        interval.getHours(),
+                        interval.getMinutes(),
+                        wholeSeconds,
+                        nanos,
+                        precision));
+            }
+        });
+    }
+
     @Override
     protected Object convertTimestampWithZone(Column column, Field fieldDefn, Object data) {
+        if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+            return convertPostgresTimestampWithZoneToStructured(column, fieldDefn, data);
+        }
+        if (data instanceof String str) {
+            if (POSITIVE_INFINITY_TIMESTAMP_PG_STRING.equals(str) || NEGATIVE_INFINITY_TIMESTAMP_PG_STRING.equals(str)) {
+                return str;
+            }
+
+            data = DateTimeFormat.get().timestampWithTimeZoneToOffsetDateTime(str).withOffsetSameInstant(ZoneOffset.UTC);
+        }
+
         if (data instanceof java.util.Date) {
             // any Date like subclasses will be given to us by the JDBC driver, which uses the local VM TZ, so we need to go
             // back to GMT
@@ -946,10 +1084,10 @@ public class PostgresValueConverter extends JdbcValueConverters {
         }
 
         if (POSITIVE_INFINITY_OFFSET_DATE_TIME.equals(data)) {
-            return "infinity";
+            return POSITIVE_INFINITY_TIMESTAMP_PG_STRING;
         }
         else if (NEGATIVE_INFINITY_OFFSET_DATE_TIME.equals(data)) {
-            return "-infinity";
+            return NEGATIVE_INFINITY_TIMESTAMP_PG_STRING;
         }
         else if (data instanceof OffsetDateTime) {
             data = ((OffsetDateTime) data).toZonedDateTime();
@@ -970,14 +1108,152 @@ public class PostgresValueConverter extends JdbcValueConverters {
     @Override
     protected Object convertTimeWithZone(Column column, Field fieldDefn, Object data) {
         // during snapshotting; already receiving OffsetTime @ UTC during streaming
-        if (data instanceof String) {
+        if (data instanceof String value) {
+            // In STRUCTURED mode we preserve the raw clock components and the original offset (no UTC
+            // normalization) and allow the PostgreSQL end-of-day boundary hour 24, which OffsetTime/LocalTime
+            // cannot represent. The raw TIMETZ text is available both during snapshot and pgoutput streaming.
+            if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                return convertTimeWithZoneToStructuredPreservingOffset(column, fieldDefn, value);
+            }
+            if (PostgresTimeBoundary.isTimeWithTimeZoneBoundaryAtUtc(value)) {
+                return PostgresTimeBoundary.TIME_WITH_TIMEZONE_BOUNDARY_AT_UTC;
+            }
+
             // The TIMETZ column is returned as a String which we initially parse here
             // The parsed offset-time potentially has a zone-offset from the data, shift it after to GMT.
-            final OffsetTime offsetTime = OffsetTime.parse((String) data, TIME_WITH_TIMEZONE_FORMATTER);
+            final OffsetTime offsetTime = OffsetTime.parse(value, TIME_WITH_TIMEZONE_FORMATTER);
             data = offsetTime.withOffsetSameInstant(ZoneOffset.UTC);
         }
 
         return super.convertTimeWithZone(column, fieldDefn, data);
+    }
+
+    /**
+     * STRUCTURED-mode TIMETZ conversion that preserves the raw hour (including the boundary 24), minute,
+     * second, fractional seconds and the original offset from the PostgreSQL text value, without any UTC
+     * normalization. This is the source-side half of full PG-to-PG TIMETZ fidelity (see debezium/dbz#2100).
+     */
+    private Object convertTimeWithZoneToStructuredPreservingOffset(Column column, Field fieldDefn, String data) {
+        final int precision = getTimePrecision(column);
+        final Schema schema = fieldDefn.schema();
+        final Object fallback = StructuredZonedTime.from(schema, 0, 0, 0, 0, defaultOffset.getTotalSeconds(), precision);
+        return convertValue(column, fieldDefn, data, fallback, (r) -> {
+            try {
+                final Matcher matcher = TIMETZ_PATTERN.matcher(data.trim());
+                if (!matcher.matches()) {
+                    logger.warn("Unexpected TIMETZ value for field {} with schema {}: value={}", fieldDefn.name(), schema, data);
+                    return;
+                }
+                final int hour = Integer.parseInt(matcher.group(1));
+                final int minute = Integer.parseInt(matcher.group(2));
+                final int second = Integer.parseInt(matcher.group(3));
+                final int nanos = parseFractionToNanos(matcher.group(4));
+                final int offsetSeconds = parseOffsetSeconds(matcher.group(5));
+                r.deliver(StructuredZonedTime.from(schema, hour, minute, second, nanos, offsetSeconds, precision));
+            }
+            catch (RuntimeException e) {
+                logger.warn("Failed to convert TIMETZ value for field {} with schema {}: value={}", fieldDefn.name(), schema, data, e);
+            }
+        });
+    }
+
+    private static int parseFractionToNanos(String fraction) {
+        if (fraction == null || fraction.isEmpty()) {
+            return 0;
+        }
+        return Integer.parseInt((fraction + "000000000").substring(0, 9));
+    }
+
+    private static int parseOffsetSeconds(String offset) {
+        final int sign = offset.charAt(0) == '-' ? -1 : 1;
+        final String[] parts = offset.substring(1).split(":");
+        int seconds = Integer.parseInt(parts[0]) * 3600;
+        if (parts.length > 1) {
+            seconds += Integer.parseInt(parts[1]) * 60;
+        }
+        if (parts.length > 2) {
+            seconds += Integer.parseInt(parts[2]);
+        }
+        return sign * seconds;
+    }
+
+    protected Object convertPostgresTimestampWithZoneToStructured(Column column, Field fieldDefn, Object data) {
+        if (isPositiveInfinityTimestampWithZone(data)) {
+            return StructuredZonedTimestamp.positiveInfinity(fieldDefn.schema(), getTimePrecision(column));
+        }
+        if (isNegativeInfinityTimestampWithZone(data)) {
+            return StructuredZonedTimestamp.negativeInfinity(fieldDefn.schema(), getTimePrecision(column));
+        }
+        if (data instanceof String str) {
+            data = DateTimeFormat.get().timestampWithTimeZoneToOffsetDateTime(str).withOffsetSameInstant(ZoneOffset.UTC);
+        }
+        if (data instanceof java.util.Date) {
+            data = OffsetDateTime.ofInstant(((Date) data).toInstant(), ZoneOffset.UTC);
+        }
+        if (data instanceof OffsetDateTime) {
+            data = ((OffsetDateTime) data).toZonedDateTime();
+        }
+        return super.convertTimestampWithZone(column, fieldDefn, data);
+    }
+
+    @Override
+    protected Object convertDateToStructured(Column column, Field fieldDefn, Object data) {
+        if (isPositiveInfinityDate(data)) {
+            return StructuredDate.positiveInfinity(fieldDefn.schema());
+        }
+        if (isNegativeInfinityDate(data)) {
+            return StructuredDate.negativeInfinity(fieldDefn.schema());
+        }
+        return super.convertDateToStructured(column, fieldDefn, data);
+    }
+
+    @Override
+    protected Object convertTimestampToStructured(Column column, Field fieldDefn, Object data) {
+        if (isPositiveInfinityTimestamp(data)) {
+            return StructuredTimestamp.positiveInfinity(fieldDefn.schema(), getTimePrecision(column));
+        }
+        if (isNegativeInfinityTimestamp(data)) {
+            return StructuredTimestamp.negativeInfinity(fieldDefn.schema(), getTimePrecision(column));
+        }
+        return super.convertTimestampToStructured(column, fieldDefn, data);
+    }
+
+    private boolean isPositiveInfinityDate(Object data) {
+        return POSITIVE_INFINITY_TIMESTAMP_PG_STRING.equals(data)
+                || POSITIVE_INFINITY_DATE.equals(data)
+                || POSITIVE_INFINITY_LOCAL_DATE.equals(data);
+    }
+
+    private boolean isNegativeInfinityDate(Object data) {
+        return NEGATIVE_INFINITY_TIMESTAMP_PG_STRING.equals(data)
+                || NEGATIVE_INFINITY_DATE.equals(data)
+                || NEGATIVE_INFINITY_LOCAL_DATE.equals(data);
+    }
+
+    private boolean isPositiveInfinityTimestamp(Object data) {
+        return POSITIVE_INFINITY_TIMESTAMP_PG_STRING.equals(data)
+                || POSITIVE_INFINITY_TIMESTAMP.equals(data)
+                || POSITIVE_INFINITY_LOCAL_DATE_TIME.equals(data)
+                || POSITIVE_INFINITY_INSTANT.equals(data);
+    }
+
+    private boolean isNegativeInfinityTimestamp(Object data) {
+        return NEGATIVE_INFINITY_TIMESTAMP_PG_STRING.equals(data)
+                || NEGATIVE_INFINITY_TIMESTAMP.equals(data)
+                || NEGATIVE_INFINITY_LOCAL_DATE_TIME.equals(data)
+                || NEGATIVE_INFINITY_INSTANT.equals(data);
+    }
+
+    private boolean isPositiveInfinityTimestampWithZone(Object data) {
+        return isPositiveInfinityTimestamp(data)
+                || POSITIVE_INFINITY_DATE.equals(data)
+                || POSITIVE_INFINITY_OFFSET_DATE_TIME.equals(data);
+    }
+
+    private boolean isNegativeInfinityTimestampWithZone(Object data) {
+        return isNegativeInfinityTimestamp(data)
+                || NEGATIVE_INFINITY_DATE.equals(data)
+                || NEGATIVE_INFINITY_OFFSET_DATE_TIME.equals(data);
     }
 
     protected Object convertGeometry(Column column, Field fieldDefn, Object data) {
@@ -1089,6 +1365,191 @@ public class PostgresValueConverter extends JdbcValueConverters {
         });
     }
 
+    /**
+     * Converts a PostgreSQL {@code box} to a {@link Geometry} value. The two opposing corners are
+     * encoded as a coordinate-exact, closed 5-point polygon ring; the {@code box} label is preserved
+     * in the extensions so the sink can reconstruct the native value.
+     */
+    protected Object convertBox(Column column, Field fieldDefn, Object data) {
+        final Schema schema = fieldDefn.schema();
+        return convertValue(column, fieldDefn, data, geometryFallback(schema, "box"), (r) -> {
+            PGbox box = asGeometricValue(column, data, PGbox.class, PGbox::new);
+            if (box != null) {
+                double x1 = box.point[0].x, y1 = box.point[0].y;
+                double x2 = box.point[1].x, y2 = box.point[1].y;
+                byte[] wkb = WkbWriter.buildPolygon(List.of(List.of(
+                        new double[]{ x1, y1 },
+                        new double[]{ x1, y2 },
+                        new double[]{ x2, y2 },
+                        new double[]{ x2, y1 },
+                        new double[]{ x1, y1 })));
+                r.deliver(Geometry.createValue(schema, wkb, null, Map.of(Geometry.EXTENSION_TYPE_KEY, "box")));
+            }
+        });
+    }
+
+    /**
+     * Converts a PostgreSQL {@code lseg} (a line segment between two points) to a {@link Geometry}
+     * value encoded as a two-point line string.
+     */
+    protected Object convertLseg(Column column, Field fieldDefn, Object data) {
+        final Schema schema = fieldDefn.schema();
+        return convertValue(column, fieldDefn, data, geometryFallback(schema, "lseg"), (r) -> {
+            // ReplicationMessage#asLseg is typed as Object, so accept any PGlseg the driver/decoder returns
+            PGlseg lseg = asGeometricValue(column, data, PGlseg.class, PGlseg::new);
+            if (lseg != null) {
+                byte[] wkb = WkbWriter.buildLineString(List.of(
+                        new double[]{ lseg.point[0].x, lseg.point[0].y },
+                        new double[]{ lseg.point[1].x, lseg.point[1].y }));
+                r.deliver(Geometry.createValue(schema, wkb, null, Map.of(Geometry.EXTENSION_TYPE_KEY, "lseg")));
+            }
+        });
+    }
+
+    /**
+     * Converts a PostgreSQL {@code path} to a {@link Geometry} value encoded as a line string. A path
+     * may be open or closed; that flag has no WKB representation, so it is preserved in the extensions.
+     */
+    protected Object convertPath(Column column, Field fieldDefn, Object data) {
+        final Schema schema = fieldDefn.schema();
+        return convertValue(column, fieldDefn, data, geometryFallback(schema, "path"), (r) -> {
+            PGpath path = asGeometricValue(column, data, PGpath.class, PGpath::new);
+            if (path != null) {
+                List<double[]> points = new ArrayList<>(path.points.length);
+                for (PGpoint point : path.points) {
+                    points.add(new double[]{ point.x, point.y });
+                }
+                Map<String, String> extensions = new LinkedHashMap<>();
+                extensions.put(Geometry.EXTENSION_TYPE_KEY, "path");
+                extensions.put(Geometry.EXTENSION_CLOSED_KEY, String.valueOf(!path.open));
+                r.deliver(Geometry.createValue(schema, WkbWriter.buildLineString(points), null, extensions));
+            }
+        });
+    }
+
+    /**
+     * Converts a PostgreSQL {@code polygon} to a {@link Geometry} value encoded as a single closed
+     * polygon ring.
+     */
+    protected Object convertPolygon(Column column, Field fieldDefn, Object data) {
+        final Schema schema = fieldDefn.schema();
+        return convertValue(column, fieldDefn, data, geometryFallback(schema, "polygon"), (r) -> {
+            PGpolygon polygon = asGeometricValue(column, data, PGpolygon.class, PGpolygon::new);
+            if (polygon != null) {
+                List<double[]> ring = new ArrayList<>(polygon.points.length + 1);
+                for (PGpoint point : polygon.points) {
+                    ring.add(new double[]{ point.x, point.y });
+                }
+                closeRing(ring);
+                byte[] wkb = WkbWriter.buildPolygon(List.of(ring));
+                r.deliver(Geometry.createValue(schema, wkb, null, Map.of(Geometry.EXTENSION_TYPE_KEY, "polygon")));
+            }
+        });
+    }
+
+    /**
+     * Converts a PostgreSQL {@code circle} to a {@link Circle} value carrying its true center and
+     * radius. WKB has no curve primitive, so a circle cannot round-trip through {@link Geometry}.
+     */
+    protected Object convertCircle(Column column, Field fieldDefn, Object data) {
+        final Schema schema = fieldDefn.schema();
+        return convertValue(column, fieldDefn, data, Circle.createValue(schema, 0, 0, 0), (r) -> {
+            PGcircle circle = asGeometricValue(column, data, PGcircle.class, PGcircle::new);
+            if (circle != null) {
+                r.deliver(Circle.createValue(schema, circle.center.x, circle.center.y, circle.radius));
+            }
+        });
+    }
+
+    /**
+     * Converts a PostgreSQL {@code line} (an infinite line {@code Ax + By + C = 0}) to a {@link Line}
+     * value carrying its three coefficients.
+     */
+    protected Object convertLine(Column column, Field fieldDefn, Object data) {
+        final Schema schema = fieldDefn.schema();
+        // PostgreSQL rejects a line whose A and B coefficients are both zero, so the NOT NULL fallback
+        // uses {0,1,0} (the y = 0 axis) rather than the all-zero triple.
+        return convertValue(column, fieldDefn, data, Line.createValue(schema, 0, 1, 0), (r) -> {
+            PGline line = asGeometricValue(column, data, PGline.class, PGline::new);
+            if (line != null) {
+                r.deliver(Line.createValue(schema, line.a, line.b, line.c));
+            }
+        });
+    }
+
+    /**
+     * Coerces incoming column data to the requested {@code org.postgresql.geometric} type. Logical
+     * decoding delivers the {@code PGxxx} object directly, while snapshots via the JDBC driver may
+     * hand back the canonical text, which the given factory parses. Returns {@code null} (leaving the
+     * value unconverted) when the type is unexpected or the text cannot be parsed.
+     */
+    private <T> T asGeometricValue(Column column, Object data, Class<T> type, PGobjectFactory<T> factory) {
+        if (type.isInstance(data)) {
+            return type.cast(data);
+        }
+        if (data instanceof String) {
+            String dataString = data.toString();
+            try {
+                return factory.parse(dataString);
+            }
+            catch (SQLException e) {
+                logger.warn("Error converting the string '{}' to a {} for the column '{}'", dataString, type.getSimpleName(), column);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Builds the non-null fallback a NOT NULL geometric column falls back to when a null value is
+     * received with no column default (see {@link #convertValue}). When {@code column.propagate.source.type}
+     * is unset the sink binds these through PostGIS {@code ST_GeomFromWKB}, which enforces the OGC
+     * minimum-vertex rules (a ring needs at least four points, a line string at least two) and rejects
+     * degenerate geometry. So each fallback is a small but genuinely valid shape rather than a repeated
+     * origin point: a {@code box}/{@code polygon} is a unit square/triangle ring (the box is rebuilt from
+     * ring vertices 0 and 2, which the square places on opposite corners), and an {@code lseg}/{@code path}
+     * is a two distinct-point segment.
+     */
+    // package-private for direct unit testing of the OGC minimum-vertex invariant
+    static Struct geometryFallback(Schema schema, String type) {
+        final byte[] wkb;
+        switch (type) {
+            case "box":
+                wkb = WkbWriter.buildPolygon(List.of(List.of(
+                        new double[]{ 0, 0 }, new double[]{ 0, 1 }, new double[]{ 1, 1 },
+                        new double[]{ 1, 0 }, new double[]{ 0, 0 })));
+                break;
+            case "lseg":
+                wkb = WkbWriter.buildLineString(List.of(new double[]{ 0, 0 }, new double[]{ 1, 0 }));
+                break;
+            case "polygon":
+                wkb = WkbWriter.buildPolygon(List.of(List.of(
+                        new double[]{ 0, 0 }, new double[]{ 1, 0 }, new double[]{ 0, 1 }, new double[]{ 0, 0 })));
+                break;
+            default: // path
+                wkb = WkbWriter.buildLineString(List.of(new double[]{ 0, 0 }, new double[]{ 1, 0 }));
+                break;
+        }
+        return Geometry.createValue(schema, wkb, null, Map.of(Geometry.EXTENSION_TYPE_KEY, type));
+    }
+
+    private static void closeRing(List<double[]> ring) {
+        if (ring.size() >= 2) {
+            double[] first = ring.get(0);
+            double[] last = ring.get(ring.size() - 1);
+            if (first[0] != last[0] || first[1] != last[1]) {
+                ring.add(new double[]{ first[0], first[1] });
+            }
+        }
+    }
+
+    /**
+     * Factory that parses a {@code org.postgresql.geometric} value from its canonical text form.
+     */
+    @FunctionalInterface
+    private interface PGobjectFactory<T> {
+        T parse(String value) throws SQLException;
+    }
+
     protected Object convertArray(Column column, Field fieldDefn, PostgresType elementType, ValueConverter elementConverter, Object data) {
         return convertValue(column, fieldDefn, data, Collections.emptyList(), (r) -> {
             if (data instanceof List) {
@@ -1097,12 +1558,18 @@ public class PostgresValueConverter extends JdbcValueConverters {
                         .map(elementConverter::convert)
                         .collect(Collectors.toList()));
             }
-            else if (data instanceof PgArray) {
+            else if (data instanceof Array array) {
                 try {
-                    final Object[] values = (Object[]) ((PgArray) data).getArray();
-                    final List<Object> converted = new ArrayList<>(values.length);
-                    for (Object value : values) {
-                        converted.add(elementConverter.convert(resolveArrayValue(value, elementType)));
+                    final List<Object> converted;
+                    if (elementType.getOid() == PgOid.TIMETZ) {
+                        converted = convertTimeWithTimeZoneArray(array, elementType, elementConverter);
+                    }
+                    else {
+                        final Object[] values = (Object[]) array.getArray();
+                        converted = new ArrayList<>(values.length);
+                        for (Object value : values) {
+                            converted.add(elementConverter.convert(resolveArrayValue(value, elementType)));
+                        }
                     }
                     r.deliver(converted);
                 }
@@ -1111,6 +1578,16 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 }
             }
         });
+    }
+
+    private List<Object> convertTimeWithTimeZoneArray(Array data, PostgresType elementType, ValueConverter elementConverter) throws SQLException {
+        final List<Object> converted = new ArrayList<>();
+        try (ResultSet values = data.getResultSet()) {
+            while (values.next()) {
+                converted.add(elementConverter.convert(resolveArrayValue(values.getString(2), elementType)));
+            }
+        }
+        return converted;
     }
 
     private Object resolveArrayValue(Object value, PostgresType elementType) {
@@ -1164,6 +1641,16 @@ public class PostgresValueConverter extends JdbcValueConverters {
         if (data == null) {
             return null;
         }
+        if (data instanceof String s) {
+            return switch (s) {
+                case POSITIVE_INFINITY_TIMESTAMP_PG_STRING -> POSITIVE_INFINITY_LOCAL_DATE_TIME;
+                case NEGATIVE_INFINITY_TIMESTAMP_PG_STRING -> NEGATIVE_INFINITY_LOCAL_DATE_TIME;
+                default -> {
+                    final Instant instant = DateTimeFormat.get().timestampToInstant(s);
+                    yield LocalDateTime.ofInstant(instant, ZoneOffset.UTC);
+                }
+            };
+        }
         if (!(data instanceof Timestamp)) {
             return data;
         }
@@ -1179,6 +1666,33 @@ public class PostgresValueConverter extends JdbcValueConverters {
         final Instant instant = timestamp.toInstant();
 
         return LocalDateTime.ofInstant(instant, ZoneOffset.systemDefault());
+    }
+
+    @Override
+    protected Object convertTimestampToEpochNanos(Column column, Field fieldDefn, Object data) {
+        if (data == null) {
+            return null;
+        }
+
+        if (data instanceof Instant instant) {
+            if (POSITIVE_INFINITY_INSTANT.equals(instant)) {
+                return Long.MAX_VALUE;
+            }
+            else if (NEGATIVE_INFINITY_INSTANT.equals(instant)) {
+                return Long.MIN_VALUE;
+            }
+        }
+
+        if (data instanceof LocalDateTime localDateTime) {
+            if (POSITIVE_INFINITY_LOCAL_DATE_TIME.equals(localDateTime)) {
+                return Long.MAX_VALUE;
+            }
+            else if (NEGATIVE_INFINITY_LOCAL_DATE_TIME.equals(localDateTime)) {
+                return Long.MIN_VALUE;
+            }
+        }
+
+        return super.convertTimestampToEpochNanos(column, fieldDefn, data);
     }
 
     @Override

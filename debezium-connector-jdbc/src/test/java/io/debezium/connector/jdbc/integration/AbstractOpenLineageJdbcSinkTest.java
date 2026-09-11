@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
-import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
+import io.debezium.connector.jdbc.JdbcKafkaSinkRecord;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
 import io.debezium.connector.jdbc.junit.jupiter.Sink;
 import io.debezium.connector.jdbc.junit.jupiter.SinkRecordFactoryArgumentsProvider;
@@ -122,7 +122,8 @@ public abstract class AbstractOpenLineageJdbcSinkTest extends AbstractJdbcSinkTe
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecordNoKey(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecordNoKey(topicName, config);
         consume(createRecord);
 
         Awaitility.await()
@@ -172,7 +173,8 @@ public abstract class AbstractOpenLineageJdbcSinkTest extends AbstractJdbcSinkTe
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecordNoKey(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecordNoKey(topicName, config);
         consume(createRecord);
 
         Awaitility.await()
@@ -197,10 +199,14 @@ public abstract class AbstractOpenLineageJdbcSinkTest extends AbstractJdbcSinkTe
     private List<String> getExpectedFields() {
         return switch (getSink().getType()) {
             case MYSQL -> List.of("id;TINYINT", "name;LONGTEXT", "nick_name$;VARCHAR");
+            case SINGLESTORE -> List.of("id;BIT", "name;LONGTEXT", "nick_name$;VARCHAR");
+            case STARROCKS -> List.of("id;TINYINT", "name;VARCHAR", "nick_name$;VARCHAR");
             case POSTGRES -> List.of("id;int2", "name;text", "nick_name$;varchar");
+            case COCKROACHDB -> List.of("id;int2", "name;text", "nick_name$;varchar");
             case SQLSERVER -> List.of("id;smallint", "name;varchar", "nick_name$;varchar");
             case ORACLE -> List.of("ID;NUMBER", "NAME;CLOB", "nick_name$;VARCHAR2");
             case DB2 -> List.of("ID;SMALLINT", "NAME;CLOB", "nick_name$;VARCHAR");
+            case DB2I -> List.of("ID;SMALLINT", "NAME;CLOB", "nick_name$;VARCHAR");
         };
     }
 
