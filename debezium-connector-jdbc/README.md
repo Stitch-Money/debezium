@@ -223,6 +223,16 @@ plug-in directory (e.g. `/kafka/connect/debezium-connector-postgres`). The class
 `debezium-api`, `debezium-core` and `connect-api`, which are already on that classpath; no
 `META-INF/services` registration is needed.
 
+##### Existing tables
+
+The sink's schema evolution only adds missing columns; it never changes the type of a column that
+already exists and performs no type-mismatch check. If a target table was created before this
+converter was enabled, the affected column is still `FLOAT` or `NUMBER(38,0)`, and Snowflake will
+implicitly cast the incoming string on every write (`'1.50'` into `NUMBER(38,0)` rounds to `2`,
+`'NaN'` fails the statement). Snowflake cannot alter a column from `NUMBER` to `VARCHAR` in place,
+so such tables must be recreated (or the column dropped and re-added) **before** the converter is
+enabled for that source. Tables created afterwards get a `VARCHAR` column automatically.
+
 ##### Configuration (PostgreSQL source connector)
 
 ```properties
