@@ -177,6 +177,72 @@ This section documents the additions made to support Snowflake as a JDBC sink ta
 
 - `SnowflakeDatabaseDialect$SnowflakeDatabaseDialectProvider` added to `META-INF/services/io.debezium.connector.jdbc.dialect.DatabaseDialectProvider`.
 
+#### Converters (`converters/`)
+
+- **`UnconstrainedNumericToStringConverter`** — A Debezium `CustomConverter` that maps PostgreSQL
+  *unconstrained* `NUMERIC` columns (declared without precision and scale, e.g. `amount numeric`)
+  to a Kafka Connect `STRING` field instead of the default `io.debezium.data.VariableScaleDecimal`
+  struct. The JDBC sink then creates a `VARCHAR` column on Snowflake, preserving the full value.
+
+##### Why it is needed
+
+Under `decimal.handling.mode=precise` the PostgreSQL source connector emits unconstrained
+numerics as a variable scale decimal (a struct of `scale` + unscaled `value` bytes). Downstream,
+such columns ended up as a fixed-scale `NUMERIC(38,0)` on Snowflake, silently dropping fractional
+digits. Switching the whole source connector to `decimal.handling.mode=string` fixes this but also
+turns every *constrained* `NUMERIC(p,s)` column into a string. The converter keeps `precise` mode
+for constrained columns and only changes the columns that cannot be represented with a fixed scale.
+
+##### How it works
+
+Custom converters run inside the **source** connector, not the sink. For every column the
+PostgreSQL connector asks the converter whether it wants to take over. The converter claims a
+column only when it is a `NUMERIC`/`DECIMAL` whose reported precision is absent, `0` or `131089`
+(the pgjdbc default for a typmod of `-1`) and whose scale is absent or `0` — the same rule the
+PostgreSQL connector uses internally to detect variable scale decimals. `numeric(10)` and
+`numeric(10,2)` columns are left alone and keep their `org.apache.kafka.connect.data.Decimal`
+mapping.
+
+For claimed columns the converter registers a `STRING` schema and renders values with
+`BigDecimal.toPlainString()`, so no scientific notation is produced and trailing zeros are kept
+exactly as stored (`1.50` stays `1.50`). SQL `NULL` is passed through as `null`. The PostgreSQL
+special values are emitted with their PostgreSQL spelling so the text can be loaded back into
+PostgreSQL:
+
+| Source value | Emitted string |
+|---|---|
+| `NaN` | `NaN` |
+| `Infinity` | `Infinity` |
+| `-Infinity` | `-Infinity` |
+
+##### Deployment
+
+Because the converter is applied by the source connector, the jar containing this class
+(`debezium-connector-jdbc-<version>.jar`) must be copied into the **PostgreSQL connector's**
+plug-in directory (e.g. `/kafka/connect/debezium-connector-postgres`). The class only depends on
+`debezium-api`, `debezium-core` and `connect-api`, which are already on that classpath; no
+`META-INF/services` registration is needed.
+
+##### Existing tables
+
+The sink's schema evolution only adds missing columns; it never changes the type of a column that
+already exists and performs no type-mismatch check. If a target table was created before this
+converter was enabled, the affected column is still `FLOAT` or `NUMBER(38,0)`, and Snowflake will
+implicitly cast the incoming string on every write (`'1.50'` into `NUMBER(38,0)` rounds to `2`,
+`'NaN'` fails the statement). Snowflake cannot alter a column from `NUMBER` to `VARCHAR` in place,
+so such tables must be recreated (or the column dropped and re-added) **before** the converter is
+enabled for that source. Tables created afterwards get a `VARCHAR` column automatically.
+
+##### Configuration (PostgreSQL source connector)
+
+```properties
+decimal.handling.mode=precise
+converters=unconstrainedNumeric
+unconstrainedNumeric.type=io.debezium.connector.jdbc.converters.UnconstrainedNumericToStringConverter
+```
+
+The converter takes no further properties.
+
 #### Transforms (`transforms/`)
 
 - **`ToastColumnFilter`** — A Kafka Connect SMT that strips fields carrying the PostgreSQL TOAST
