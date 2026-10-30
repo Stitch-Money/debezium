@@ -6,6 +6,7 @@
 package io.debezium.connector.oracle;
 
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -39,6 +40,8 @@ public class IncrementalSnapshotCaseSensitiveIT extends AbstractIncrementalSnaps
         connection.execute("CREATE TABLE a (\"Pk\" numeric(9,0) primary key, aa numeric(9,0))");
         connection.execute("CREATE TABLE b (\"Pk\" numeric(9,0) primary key, aa numeric(9,0))");
         connection.execute("CREATE TABLE a42 (pk1 numeric(9,0), pk2 numeric(9,0), pk3 numeric(9,0), pk4 numeric(9,0), aa numeric(9,0))");
+        TestHelper.streamTable(connection, "a");
+        TestHelper.streamTable(connection, "b");
         TestHelper.streamTable(connection, "a42");
 
         // todo: creates signal table in the PDB, do we want it to be in the CDB?
@@ -202,7 +205,12 @@ public class IncrementalSnapshotCaseSensitiveIT extends AbstractIncrementalSnaps
 
     @Override
     protected int defaultIncrementalSnapshotChunkSize() {
-        return 250;
+        // A chunk cannot be read until the watermark that closes the previous one has been
+        // streamed back, so the chunk size is what decides how long a snapshot stays in progress.
+        // OpenLogReplicator returns those watermarks within a few milliseconds and finishes all of
+        // ROW_COUNT in well under a second, which is too quick for a test that has to pause a
+        // snapshot while it is still running.
+        return TestHelper.isOpenLogReplicator() ? 1 : 250;
     }
 
     @Override
@@ -213,5 +221,14 @@ public class IncrementalSnapshotCaseSensitiveIT extends AbstractIncrementalSnaps
     @Override
     protected String server() {
         return TestHelper.SERVER_NAME;
+    }
+
+    @Override
+    protected Duration getWaitDurationInSeconds() {
+        if (TestHelper.isXStream()) {
+            // XStream waits are more temperamental, give it more time
+            return Duration.ofMinutes(5);
+        }
+        return super.getWaitDurationInSeconds();
     }
 }

@@ -1,4 +1,4 @@
-The following list describes advanced {connector-name} connector configuration properties.
+The following list describes the advanced configuration properties for the {connector-name} connector that let you fine-tune behavior for specific environments, including schema history handling, signal channels, event filtering, and custom transformations.
 The default values for these properties rarely require changes.
 Therefore, you do not need to specify them in the connector configuration.
 
@@ -30,6 +30,38 @@ It is expected that this feature is not completely polished.
 endif::community[]
 
 
+[id="{context}-property-binlog-net-read-timeout"]
+xref:{context}-property-binlog-net-read-timeout[`binlog.net.read.timeout`]::
+
+Default value::: `0`
+
+Description:::
+The number of seconds to wait for a read from the binlog connection to complete before the server times out.
+A value of `0` means that the connector uses the MySQL server default.
++
+In high-latency network environments, the default server value for `net_read_timeout` might be too low, causing the server to close the binlog streaming connection prematurely with an `EOFException`.
+Increase this value to prevent unexpected disconnects during binlog streaming.
++
+NOTE: This value is set at the session level on the binlog streaming connection using `SET net_read_timeout=<value>`.
+It does not affect the global server setting.
+
+
+[id="{context}-property-binlog-net-write-timeout"]
+xref:{context}-property-binlog-net-write-timeout[`binlog.net.write.timeout`]::
+
+Default value::: `0`
+
+Description:::
+The number of seconds to wait for a write to the binlog connection to complete before the server times out.
+A value of `0` means that the connector uses the MySQL server default.
++
+When the server transfers large data volumes through the binlog, the default server value for `net_write_timeout` might be too low, causing the server to close the connection with an `EOFException`.
+Increase this value to prevent unexpected disconnects during streaming of large transactions.
++
+NOTE: This value is set at the session level on the binlog streaming connection using `SET net_write_timeout=<value>`.
+It does not affect the global server setting.
+
+
 [id="{context}-property-connect-keep-alive"]
 xref:{context}-property-connect-keep-alive[`connect.keep.alive`]::
 
@@ -37,6 +69,24 @@ Default value::: `true`
 
 Description:::
 A Boolean value that specifies whether a separate thread should be used to ensure that the connection to the {connector-name} server or cluster is kept alive.
+
+
+[id="{context}-property-connect-keep-alive-max-reconnect-attempts"]
+xref:{context}-property-connect-keep-alive-max-reconnect-attempts[`connect.keep.alive.max.reconnect.attempts`]::
+
+Default value::: `0`
+
+Description:::
+The number of consecutive attempts that the keep alive thread makes to restore a lost binlog connection before the connector fails.
+A value of `0` means that the keep alive thread retries indefinitely.
++
+If a connection can never be restored, for example because the {connector-name} session ended while the TCP connection remained established, retrying indefinitely leaves the connector in the `RUNNING` state without emitting any change events.
+Set this property to fail the connector task instead, so that it can be restarted with a fresh connection.
++
+Each attempt is separated by `connect.keep.alive.interval.ms`, so the connector tolerates an outage of approximately `connect.keep.alive.max.reconnect.attempts` multiplied by `connect.keep.alive.interval.ms` before it fails.
+Set a value that exceeds the length of any planned maintenance window, to avoid failing the task during a routine restart of the database.
++
+This property has no effect when `connect.keep.alive` is set to `false`.
 
 
 [id="{context}-property-converters"]
@@ -85,6 +135,31 @@ You can define tags to identify particular application instances, environments, 
 +
 For more information, see xref:customized-mbean-names[Customized MBean names].
 
+
+
+[id="{context}-property-custom-sanitize-pattern"]
+xref:{context}-property-custom-sanitize-pattern[`custom.sanitize.pattern`]::
+
+Default value::: `.*secret$|.*password$|.*sasl\.jaas\.config$|.*basic\.auth\.user\.info|.*registry\.auth\.client-secret`
+
+Description:::
+An optional regular expression that specifies a custom pattern for masking sensitive configuration keys.
++
+By default, {prodname} masks the value of configuration keys that match a predefined pattern for commonly known sensitive properties such as passwords and authentication tokens.
+To customize the way that the connector masks configuration key values, set this property to a regular expression that matches specific configuration key values that you want to mask.
++
+For example, to mask keys the contain the strings `api.key` or `token`, set this property to the following value:
+`"custom.sanitize.pattern": ".*api\\.key.*\\|.*token.*"`
++
+If you set this property for the connector, {prodname} masks any matching instances of configuration key values that it returns for display, logging, or in response to API calls.
+A string of asterisks replaces the original values, for example,  `pass:[********]`.
++
+[IMPORTANT]
+====
+The pattern that you specify for the `custom.sanitize.pattern` property overrides the default {prodname} masking pattern; the specified value does not extend or augment the default pattern.
+====
+
+
 [id="{context}-property-database-initial-statements"]
 xref:{context}-property-database-initial-statements[`database.initial.statements`]::
 
@@ -131,12 +206,13 @@ Specify a password only if the xref:{context}-property-database-ssl-keystore[`da
 [id="{context}-property-database-ssl-mode"]
 xref:{context}-property-database-ssl-mode[`database.ssl.mode`]::
 
-Default value::: `preferred`
-
 Description:::
 Specifies whether the connector uses an encrypted connection.
 +
 The following settings are available:
+
+ifdef::MYSQL[]
+Default value::: `preferred`
 
 `disabled`:::: Specifies the use of an unencrypted connection.
 
@@ -150,6 +226,19 @@ If it is unable to establish an encrypted connection, the connector fails.
 If the server TLS certificate does not match any valid CA certificates, the connector fails.
 
 `verify_identity`:::: The connector behaves as when you set the `verify_ca` option, but it also verifies that the server certificate matches the host of the remote connection.
+endif::MYSQL[]
+ifdef::MARIADB[]
+Default value::: `disable`
+
+`disable`:::: Specifies the use of an unencrypted connection.
+
+`trust`:::: The connector establishes an encrypted connection, but does not verify the server TLS certificate or hostname.
+
+`verify-ca`:::: The connector behaves as when you set the `trust` option, but it also verifies the server TLS certificate against the configured Certificate Authority (CA) certificates.
+If the server TLS certificate does not match any valid CA certificates, the connector fails.
+
+`verify-full`:::: The connector behaves as when you set the `verify-ca` option, but it also verifies that the server certificate matches the host of the remote connection.
+endif::MARIADB[]
 
 [id="{context}-property-database-ssl-truststore"]
 xref:{context}-property-database-ssl-truststore[`database.ssl.truststore`]::
@@ -169,6 +258,27 @@ Default value::: No default
 Description:::
 The password for the trust store file.
 Used to check the integrity of the truststore, and unlock the truststore.
+
+
+[id="{context}-property-ddl-parser-type"]
+xref:{context}-property-ddl-parser-type[`ddl.parser.type`]::
+
+Default value::: `default`
+
+Description:::
+Specifies which ANTLR grammar to use for parsing MySQL DDL statements.
++
+Set one of the following options:
+
+`default`:::: (Default) Uses the Oracle MySQL grammar, which is actively maintained and supports MySQL 8.0+ features.
+This grammar is based on the official MySQL grammar specification and is recommended for production use.
+
+`legacy`:::: Uses the Positive Technologies (PT) MySQL grammar.
+This option is provided for backward compatibility with existing deployments.
+The PT grammar may not support all MySQL 8.0+ features.
++
+In most cases, you should use the `default` grammar.
+Use the `legacy` grammar only if you encounter compatibility issues with existing DDL statements during migration.
 
 
 [id="{context}-property-enable-time-adjuster"]
@@ -239,6 +349,14 @@ The connector then stops.
 Instead, it logs the problematic event and its position, and then skips the event.
 
 `ignore`:::: The connector ignores the problematic event, and does not generate a log entry.
++
+The connector also applies this setting to `DATE` and `DATETIME` values that are not valid dates, such as `2020-02-31` stored with the `ALLOW_INVALID_DATES` SQL mode, in both snapshots and streaming.
+With `fail`, the connector stops.
+With `warn` or `ignore`, the connector emits such a value as the epoch, `1970-01-01`.
+To capture such values as they are stored, set xref:{context}-property-time-precision-mode[`time.precision.mode`] to `structured`.
+ifdef::MYSQL[]
+When xref:{context}-property-snapshot-fetch-size[`snapshot.fetch.size`] is set to a positive value, the MySQL server returns such values to the snapshot as zero dates, so the connector emits them in the same way as other zero values.
+endif::MYSQL[]
 
 
 
@@ -399,7 +517,17 @@ xref:{context}-property-poll-interval-ms[`poll.interval.ms`]::
 Default value::: `500` (0.5 seconds)
 
 Description:::
-Positive integer value that specifies the number of milliseconds the connector waits for new change events to appear before it starts processing a batch of events.
+Positive integer value that specifies the number of milliseconds the connector should wait during each iteration for new change events to appear.
+If a value greater than 5000 milliseconds (5 seconds) is provided, the effective wait time will be capped at 5000 milliseconds.
+
+
+[id="{context}-property-poll-dispatch-interval-ms"]
+xref:{context}-property-poll-dispatch-interval-ms[`poll.dispatch.interval.ms`]::
+
+Default value::: `0`
+
+Description:::
+An integer value that specifies the number of milliseconds the connector should accumulate events in the queue before each queue consumption.
 
 
 
@@ -426,6 +554,32 @@ Specifies whether a connector writes watermarks to the signal data collection to
 Set the value to `true` to enable a connector that has a read-only connection to the database to use an incremental snapshot watermarking strategy that does not require writing to the signal data collection.
 endif::community[]
 
+[id="{context}-property-binlog-metadata-based-schema"]
+xref:{context}-property-binlog-metadata-based-schema[`binlog.metadata.based.schema`]::
+
+Default value::: `false`
+
+Description:::
+Specifies whether the connector reconstructs the table schema from the metadata that the server writes into the binlog when it runs with `binlog_row_metadata=FULL` (the `TABLE_MAP` events), instead of from a persisted schema history topic.
++
+When set to `true`, the connector rebuilds each table's schema (column names, types, character sets, `ENUM`/`SET` values, and the primary key) from the binlog itself, and it does not create or depend on a schema history topic.
+In this mode the connector does not persist schema history, so no `schema.history.internal.*` storage or connection settings are required.
+This is an opt-in mode that requires the source server to run with `binlog_row_metadata=FULL`, which is available on MySQL 8.0 and later and on MariaDB 10.5 and later.
+If the variable is not set to `FULL`, the connector fails fast at startup.
++
+Each captured table must have a primary key reported in `TABLE_MAP` metadata or a matching xref:{context}-property-message-key-columns[`message.key.columns`] mapping that selects existing columns.
+A nullable `UNIQUE` index alone is insufficient because its definition is not included in `TABLE_MAP` metadata, even with `binlog_row_metadata=FULL`.
+The connector rejects an unsupported table before emitting snapshot data or streaming rows from its reconstructed schema, including when resuming older binlog events.
+Add a primary key, configure an explicit message key, or disable this mode to capture such a table.
++
+Because the schema is read from the binlog itself, the connector correctly resumes streaming after a restart that occurs in the middle of a multi-row `INSERT` or `UPDATE` operation.
++
+This mode works with any `snapshot.mode`.
+For modes that do not snapshot data (for example `no_data`), a fresh connector records the current binlog position before it begins streaming, so it captures only changes that occur from that point forward, rather than replaying the earliest available binlog.
++
+The two modes are not fully equivalent: schema attributes that exist only in DDL statements (for example, column default values and the integer display width) are not part of the reconstructed schema.
+For the advantages and limitations of each mode, see xref:{context}-comparing-schema-history-and-binlog-metadata-modes[the comparison between the schema history and the binlog metadata mode].
+
 [id="{context}-property-signal-data-collection"]
 xref:{context}-property-signal-data-collection[`signal.data.collection`]::
 
@@ -438,6 +592,24 @@ Use the following format to specify the collection name:
 `_<databaseName>_._<tableName>_`
 +
 Collection names are case-sensitive.
+
+[id="{context}-property-signal-data-collection-validation-enabled"]
+xref:{context}-property-signal-data-collection-validation-enabled[`signal.data.collection.validation.enabled`]::
+
+Default value::: `false`
+
+Description:::
+Specifies whether the connector validates the configured `signal.data.collection` when the connector starts.
+When set to `true`, the connector reports a problem and fails to start if any of the following checks do not pass:
++
+--
+* The signal data collection exists.
+* The value uses the expected fully-qualified format.
+* The collection has exactly three columns after `column.include.list` or `column.exclude.list` filtering is applied.
+* When the `insert_delete` incremental snapshot watermarking strategy is used, the first column is named `id`.
+--
++
+Because enabling this option can prevent a connector from starting even if its signal table worked previously, for example, a table that has an extra column that is not excluded by filtering, review your signal table configuration before you set the value to `true`.
 
 [id="{context}-property-signal-enabled-channels"]
 xref:{context}-property-signal-enabled-channels[`signal.enabled.channels`]::
@@ -510,7 +682,7 @@ Description:::
 An optional, comma-separated list of regular expressions that match the fully-qualified names (`_<databaseName>.<tableName>_`) of the tables to include in a snapshot.
 The specified items must be named in the connector's xref:{context}-property-table-include-list[`table.include.list`] property.
 +
-This property takes effect only if the connector's xref:{context}-property-snapshot-mode[`snapshot.mode`] property is set to a value other than `never`.
+This property takes effect only if the connector's xref:{context}-property-snapshot-mode[`snapshot.mode`] property is set to a value other than `no_data`.
 This property does not affect the behavior of incremental snapshots.
 +
 To match the name of a table, {prodname} applies the regular expression that you specify as an _anchored_ regular expression.
@@ -544,10 +716,10 @@ The following settings are available:
 `minimal`:::: The connector holds the global read lock for only the initial phase of the snapshot during which it reads the database schemas and other metadata.
 During the next phase of the snapshot, the connector releases the lock as it selects all rows from each table.
 To perform the SELECT operation in a consistent fashion, the connector uses a REPEATABLE READ transaction.
-Although the release of the global read lock permits other {connector-name} clients to update the database, use of REPEATABLE READ isolation ensures a consistent snapshot, because the connector continues to read the same data for the duration of  the transaction. +
+Although the release of the global read lock permits other {connector-name} clients to update the database, use of REPEATABLE READ isolation ensures a consistent snapshot, because the connector continues to read the same data for the duration of  the transaction.
 
 `extended`:::: Blocks all write operations for the duration of the snapshot.
-Use this setting if clients submit concurrent operations that are incompatible with the REPEATABLE READ isolation level in {connector-name}. +
+Use this setting if clients submit concurrent operations that are incompatible with the REPEATABLE READ isolation level in {connector-name}.
 
 `none`:::: Prevents the connector from acquiring any table locks during the snapshot.
 Although this option is allowed with all snapshot modes, it is safe to use _only_ if no schema changes occur while the snapshot is running.
@@ -582,28 +754,88 @@ Default value::: `1`
 
 Description:::
 Specifies the number of threads that the connector uses when performing an initial snapshot.
-To enable parallel initial snapshots, set the property to a value greater than 1.
-In a parallel initial snapshot, the connector processes multiple tables concurrently.
+The value must be a positive integer greater than or equal to `1`.
+When set to a value greater than `1`, the connector performs a parallel snapshot by dividing each table into chunks based on primary key ranges and processing the chunks concurrently across all available threads.
 +
 ifdef::community[]
-NOTE: Parallel initial snapshots is an incubating feature.
+NOTE: Chunk-based parallel snapshotting is an incubating feature.
 endif::community[]
 ifdef::product[]
 [IMPORTANT]
 ====
-Parallel initial snapshots is a Developer Preview feature only.
-Developer Preview software is not supported by Red{nbsp}Hat in any way and is not functionally complete or production-ready.
-Do not use Developer Preview software for production or business-critical workloads.
-Developer Preview software provides early access to upcoming product software in advance of its possible inclusion in a Red{nbsp}Hat product offering.
-Customers can use this software to test functionality and provide feedback during the development process.
-This software is subject to change or removal at any time, and has received limited testing.
-Red{nbsp}Hat might provide ways to submit feedback on Developer Preview software without an associated SLA.
+Chunk-based parallel snapshotting is a Technology Preview feature.
+Technology Preview features are not supported with Red{nbsp}Hat production service level agreements (SLAs) and might not be functionally complete.
+Red{nbsp}Hat does not recommend using them in production.
+These features provide early access to upcoming product features, enabling customers to test functionality and provide feedback during the development process.
+For more information about the support scope of Red{nbsp}Hat Technology Preview features, see link:https://access.redhat.com/support/offerings/techpreview/[Technology Preview Features Support Scope].
+====
+endif::product[]
++
+NOTE: Tables without a primary key, and tables that use snapshot select overrides, are processed as a single chunk and fall back to single-threaded snapshotting.
 
-For more information about the support scope of Red{nbsp}Hat Developer Preview software, see link:https://access.redhat.com/support/offerings/devpreview/[Developer Preview Support Scope].
+[id="{context}-property-snapshot-max-threads-multiplier"]
+xref:{context}-property-snapshot-max-threads-multiplier[`snapshot.max.threads.multiplier`]::
+
+Default value::: `1`
+
+Description:::
+A global multiplier that controls the number of chunks created per table during a parallel snapshot.
+By default, {prodname} creates one chunk per thread.
+A higher value causes the connector to create more, smaller chunks per table when running a snapshot.
+Smaller chunks keep threads more evenly loaded.
+For example, with 4 threads and a multiplier of `2`, {prodname} creates 8 chunks instead of 4.
++
+To override the multiplier for a specific table, set `snapshot.max.threads.multiplier.<fully_qualified_table_name>` to the desired value.
++
+[TIP]
+====
+Increasing the number of threads is generally more effective for improving snapshot throughput than increasing the multiplier.
+====
++
+ifdef::community[]
+NOTE: Chunk-based parallel snapshotting is an incubating feature.
+endif::community[]
+ifdef::product[]
+[IMPORTANT]
+====
+Chunk-based parallel snapshotting is a Technology Preview feature.
+Technology Preview features are not supported with Red{nbsp}Hat production service level agreements (SLAs) and might not be functionally complete.
+Red{nbsp}Hat does not recommend using them in production.
+These features provide early access to upcoming product features, enabling customers to test functionality and provide feedback during the development process.
+For more information about the support scope of Red{nbsp}Hat Technology Preview features, see link:https://access.redhat.com/support/offerings/techpreview/[Technology Preview Features Support Scope].
 ====
 endif::product[]
 
+[id="{context}-property-legacy-snapshot-max-threads"]
+xref:{context}-property-legacy-snapshot-max-threads[`legacy.snapshot.max.threads`]::
 
+Default value::: `false`
+
+Description:::
+The default value (`false`) enables the connector to accelerate initial snapshots by dividing tables into chunks and using separate threads to process each chunk concurrently.
++
+[NOTE]
+====
+When the legacy behavior is enabled, threads that complete their table snapshot remain idle while waiting for other threads to complete.
+In environments that enforce connection timeouts, idle connections can prevent the connector from closing connections cleanly after the snapshot finishes.
+An exception can then result, even if the snapshot captures all data successfully.
+If you experience this problem, set `snapshot.max.threads` to `1` and retry the snapshot.
+====
++
+ifdef::community[]
+NOTE: The legacy table-per-thread behavior is deprecated and will be removed in a future release.
+The property `internal.legacy.snapshot.max.threads` is a deprecated alias for `legacy.snapshot.max.threads` and should not be used in new configurations.
+endif::community[]
+ifdef::product[]
+[IMPORTANT]
+====
+Chunk-based parallel snapshotting is a Technology Preview feature.
+Technology Preview features are not supported with Red{nbsp}Hat production service level agreements (SLAs) and might not be functionally complete.
+Red{nbsp}Hat does not recommend using them in production.
+These features provide early access to upcoming product features, enabling customers to test functionality and provide feedback during the development process.
+For more information about the support scope of Red{nbsp}Hat Technology Preview features, see link:https://access.redhat.com/support/offerings/techpreview/[Technology Preview Features Support Scope].
+====
+endif::product[]
 
 [id="{context}-property-snapshot-mode"]
 xref:{context}-property-snapshot-mode[`snapshot.mode`]::
@@ -641,8 +873,6 @@ You can also set the property to periodically prune a database schema history to
 ====
 Do not use this mode to perform a snapshot if schema changes were committed to the database after the last connector shutdown.
 ====
-`never`:::: When the connector starts, rather than performing a snapshot, it immediately begins to stream event records for subsequent database changes.
-This option is under consideration for future deprecation, in favor of the `no_data` option.
 
 `when_needed`:::: After the connector starts, it performs a snapshot only if it detects one of the following circumstances:
 
@@ -758,33 +988,46 @@ xref:{context}-property-snapshot-select-statement-overrides[`snapshot.select.sta
 Default value::: No default
 
 Description:::
-Specifies the table rows to include in a snapshot.
-Use the property if you want a snapshot to include only a subset of the rows in a table.
-This property affects snapshots only.
-It does not apply to events that the connector reads from the log.
+Specifies the tables for which the connector uses custom `SELECT` statements to determine which rows to include in a snapshot.
 +
-The property contains a comma-separated list of fully-qualified table names in the form `_<databaseName>.<tableName>_`. For example,
+This property affects snapshots only.
+It does not apply to events that the connector reads from the log during the streaming phase.
++
+This property consists of two parts that work together:
+
+Main property::::
+A comma-separated list of fully-qualified table names in the format `_<databaseName>.<tableName>_`.
+This list identifies the tables for which you want to specify custom snapshot queries.
++
+For example:
 +
 `+"snapshot.select.statement.overrides": "inventory.products,customers.orders"+`
 +
-For each table in the list, add a further configuration property that specifies the `SELECT` statement for the connector to run on the table when it takes a snapshot.
-The specified `SELECT` statement determines the subset of table rows to include in the snapshot.
-Use the following format to specify the name of this `SELECT` statement property:
+NOTE: If the fully qualified schema or table name contains special characters, such as spaces, square brackets (`[` or `]`), or period characters (`.`),
+enclose the string in double quotes to prevent the connector from interpreting the special characters as delimiters.
+Double quotes around table names are optional if the fully qualified table name does not include spaces or special characters.
+
+Secondary properties::::
+For each table listed in the main property, you must define a corresponding `snapshot.select.statement.overrides._<databaseName>_._<tableName>_` property that specifies the custom `SELECT` statement to run during the snapshot.
 +
-`snapshot.select.statement.overrides._<databaseName>_._<tableName>_`
+The `SELECT` statement determines which rows from the table to include in the snapshot.
 +
-For example,
+For example, to specify the `SELECT` statement for the `customers.orders` table:, add the following property:
 +
 `snapshot.select.statement.overrides.customers.orders`
 +
-From a `customers.orders` table that includes the soft-delete column, `delete_flag`, add the following properties if you want a snapshot to include only those records that are not soft-deleted:
+[WARNING]
+====
+If a table is listed in the main property but its corresponding secondary property is missing, the connector logs a warning and uses the default snapshot behavior for that table.
+====
+Example configuration::::
++
+The following example shows how to configure the `snapshot.select.statement.overrides` property to perform a snapshot of the `customers.orders` table that includes only records that are not soft-deleted; that is, the value of the soft-delete field, `delete_flag`, is set to `0`.
 +
 ----
 "snapshot.select.statement.overrides": "customer.orders",
-"snapshot.select.statement.overrides.customer.orders": "SELECT * FROM [customers].[orders] WHERE delete_flag = 0 ORDER BY id DESC"
+"snapshot.select.statement.overrides.customer.orders": "SELECT * FROM customers.orders WHERE delete_flag = 0 ORDER BY id DESC"
 ----
-+
-In the resulting snapshot, the connector includes only the records for which `delete_flag = 0`.
 
 
 [id="{context}-property-snapshot-tables-order-by-row-count"]
@@ -814,6 +1057,35 @@ Schema version for the `source` block in {prodname} events.  {prodname} 0.10 int
 +
 By setting this option to `v1`, the structure used in earlier versions can be produced. However, this setting is not recommended and is planned for removal in a future {prodname} version.
 endif::community[]
+
+
+
+[id="{context}-property-statistics-metrics-enabled"]
+xref:{context}-property-statistics-metrics-enabled[`statistics.metrics.enabled`]::
+
+Default value::: `true`
+
+Description:::
+Specifies whether the connector collects advanced statistical metrics for streaming metrics, such as quantiles.
++
+When set to `true`, the connector collects the following statistics:
++
+* Minimum value
+* Maximum value
+* Average value
+* P50 (median) percentile
+* P95 percentile
+* P99 percentile
++
+NOTE: Currently only `MilliSecondsBehindSource` metric supports collecting quantiles.
++
+The statistics are computed using a probabilistic data structure (DDSketch) that provides approximate quantile values with 1% relative accuracy.
++
+When set to `false`, the connector does not collect quantiles, and the quantile JMX metrics return `null` values.
+The connector continues to collect minimum, maximum, and average values.
+Disabling quantile collection reduces memory overhead slightly.
++
+For more information, see xref:{context}-streaming-metrics[Streaming metrics].
 
 
 
@@ -874,6 +1146,22 @@ The topic name takes the following format:
 _topic.heartbeat.prefix_._topic.prefix_
 +
 For example, when you set the default value for this property, and the topic prefix is `fulfillment`, the topic name is `__debezium-heartbeat.fulfillment`.
++
+This property is ignored if `topic.heartbeat.name` is set.
+
+[id="{context}-property-topic-heartbeat-name"]
+xref:{context}-property-topic-heartbeat-name[`topic.heartbeat.name`]::
+
+Default value::: _empty_
+
+Description:::
+Specifies an explicit, full name for the topic to which the connector sends heartbeat messages, overriding the prefix-based naming derived from `topic.heartbeat.prefix` and `topic.prefix`.
++
+When set, all heartbeat messages are routed to this exact topic name, regardless of the connector's `topic.prefix`. This is useful when running multiple connectors and you want to consolidate heartbeat events into a single shared topic, avoiding the creation of a large number of single-partition heartbeat topics.
++
+For example, setting this to `debezium-heartbeat` routes all heartbeat messages to a topic named `debezium-heartbeat`.
++
+If this property is empty or unset, the connector falls back to the default behavior: _topic.heartbeat.prefix_._topic.prefix_.
 
 
 

@@ -21,6 +21,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.binlog.junit.SkipWhenSchemaHistoryDisabled;
 import io.debezium.connector.binlog.util.TestHelper;
 import io.debezium.connector.binlog.util.UniqueDatabase;
 import io.debezium.doc.FixFor;
@@ -30,6 +31,9 @@ import io.debezium.doc.FixFor;
  *
  * @author Gunnar Morling
  */
+@SkipWhenSchemaHistoryDisabled(reason = "Asserts propagated source types that include the FLOAT(M,D) precision and the NUMERIC alias, both of "
+        + "which exist only in the DDL text; the binlog TABLE_MAP metadata carries the storage type instead (the FLOAT pack length and the "
+        + "DECIMAL base type), so the propagated strings differ")
 public abstract class BinlogSourceTypeInSchemaIT<C extends SourceConnector> extends AbstractBinlogConnectorIT<C> {
 
     private static final String TYPE_NAME_PARAMETER_KEY = "__debezium.source.column.type";
@@ -46,7 +50,7 @@ public abstract class BinlogSourceTypeInSchemaIT<C extends SourceConnector> exte
     @BeforeEach
     void beforeEach() {
         stopConnector();
-        DATABASE.createAndInitialize();
+        DATABASE.create();
         initializeConnectorTestFramework();
         Files.delete(SCHEMA_HISTORY_PATH);
     }
@@ -66,12 +70,14 @@ public abstract class BinlogSourceTypeInSchemaIT<C extends SourceConnector> exte
     public void shouldPropagateSourceTypeAsSchemaParameter() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
-                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.NEVER)
+                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.NO_DATA)
                 .with("column.propagate.source.type", ".*\\.c1,.*\\.c2,.*\\.c3.*,.*\\.f.")
                 .build();
 
         // Start the connector ...
         start(getConnectorClass(), config);
+        waitForStreamingRunning(getConnectorName(), DATABASE.getServerName(), getStreamingNamespace());
+        DATABASE.initialize();
 
         // ---------------------------------------------------------------------------------------------------------------
         // Consume all of the events due to startup and initialization of the database
@@ -163,13 +169,14 @@ public abstract class BinlogSourceTypeInSchemaIT<C extends SourceConnector> exte
     public void shouldPropagateSourceTypeByDatatype() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
-                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.NEVER)
+                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.NO_DATA)
                 .with("datatype.propagate.source.type", ".+\\.FLOAT,.+\\.VARCHAR")
                 .build();
 
         // Start the connector ...
         start(getConnectorClass(), config);
         waitForStreamingRunning(getConnectorName(), DATABASE.getServerName(), getStreamingNamespace());
+        DATABASE.initialize();
 
         // ---------------------------------------------------------------------------------------------------------------
         // Consume all of the events due to startup and initialization of the database

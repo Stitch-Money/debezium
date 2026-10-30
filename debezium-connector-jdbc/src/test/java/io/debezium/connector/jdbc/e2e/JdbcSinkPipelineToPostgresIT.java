@@ -7,9 +7,11 @@ package io.debezium.connector.jdbc.e2e;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -22,6 +24,8 @@ import io.debezium.connector.jdbc.junit.jupiter.e2e.ForSource;
 import io.debezium.connector.jdbc.junit.jupiter.e2e.WithTemporalPrecisionMode;
 import io.debezium.connector.jdbc.junit.jupiter.e2e.source.Source;
 import io.debezium.connector.jdbc.junit.jupiter.e2e.source.SourceType;
+import io.debezium.doc.FixFor;
+import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.spatial.GeometryBytes;
 import io.debezium.util.HexConverter;
 
@@ -219,6 +223,73 @@ public class JdbcSinkPipelineToPostgresIT extends AbstractJdbcSinkPipelineIT {
     }
 
     @TestTemplate
+    @ForSource(value = SourceType.POSTGRES, reason = "PostgreSQL source emits multi-byte BIT values as Debezium Bits")
+    public void testBitDataTypeWithMultiByteValues(Source source, Sink sink) throws Exception {
+        assertDataTypesNonKeyOnly(source,
+                sink,
+                List.of("bit(8)", "bit(16)", "bit(24)"),
+                List.of("B'11111111'", "B'0000000100000010'", "B'000000110000001000000001'"),
+                List.of("11111111", "0000000100000010", "000000110000001000000001"),
+                (record) -> {
+                    assertColumn(sink, record, "data0", getBitsDataType(), 8);
+                    assertColumn(sink, record, "data1", getBitsDataType(), 16);
+                    assertColumn(sink, record, "data2", getBitsDataType(), 24);
+                },
+                ResultSet::getString);
+    }
+
+    @TestTemplate
+    @ForSource(value = SourceType.POSTGRES, reason = "PostgreSQL source emits multi-byte VARBIT values as Debezium Bits")
+    public void testBitVaryingDataTypeWithMultiByteValues(Source source, Sink sink) throws Exception {
+        assertDataTypesNonKeyOnly(source,
+                sink,
+                List.of("bit varying(8)", "bit varying(16)", "bit varying(24)"),
+                List.of("B'11111111'", "B'0000000100000010'", "B'000000110000001000000001'"),
+                List.of("11111111", "0000000100000010", "000000110000001000000001"),
+                (record) -> {
+                    final String dataType = source.getOptions().isColumnTypePropagated() ? "VARBIT" : getBitsDataType();
+                    assertColumn(sink, record, "data0", dataType, 8);
+                    assertColumn(sink, record, "data1", dataType, 16);
+                    assertColumn(sink, record, "data2", dataType, 24);
+                },
+                ResultSet::getString);
+    }
+
+    @TestTemplate
+    @FixFor("debezium/dbz#2100")
+    @ForSource(value = SourceType.POSTGRES, reason = "PostgreSQL TIME allows 24:00:00 as a boundary value")
+    @WithTemporalPrecisionMode(include = {
+            TemporalPrecisionMode.ADAPTIVE,
+            TemporalPrecisionMode.ADAPTIVE_TIME_MICROSECONDS,
+            TemporalPrecisionMode.MICROSECONDS,
+            TemporalPrecisionMode.NANOSECONDS
+    })
+    public void testTimeDataTypeWithBoundaryValue(Source source, Sink sink) throws Exception {
+        final List<String> typeNames = List.of("time(0)", "time(1)", "time(2)", "time(3)", "time(4)", "time(5)", "time(6)");
+        final List<String> values = List.of(
+                "'23:59:59.999999'",
+                "'23:59:59.999999'",
+                "'23:59:59.999999'",
+                "'23:59:59.999999'",
+                "'23:59:59.999999'",
+                "'23:59:59.999999'",
+                "'24:00:00'");
+
+        assertDataTypes2(source,
+                sink,
+                typeNames,
+                values,
+                Collections.nCopies(14, "24:00:00"),
+                (record) -> {
+                    for (int i = 0; i < typeNames.size(); ++i) {
+                        assertColumn(sink, record, "id" + i, getTimeType(source, true, i));
+                        assertColumn(sink, record, "data" + i, getTimeType(source, false, i));
+                    }
+                },
+                ResultSet::getString);
+    }
+
+    @TestTemplate
     @ForSource(value = { SourceType.POSTGRES }, reason = "The infinity value is valid only for PostgreSQL")
     @WithTemporalPrecisionMode
     @Override
@@ -289,6 +360,31 @@ public class JdbcSinkPipelineToPostgresIT extends AbstractJdbcSinkPipelineIT {
                 List.of("to_tsvector('english', 'This is a test for direct tsvector insert')"),
                 List.of("'direct':6 'insert':8 'test':4 'tsvector':7"),
                 (record) -> assertColumn(sink, record, "data", "tsvector"),
+                ResultSet::getString);
+    }
+
+    @TestTemplate
+    @ForSource(value = SourceType.POSTGRES, reason = "STRUCTURED-mode TIMETZ raw fidelity (offset + 24:00 boundary) is PostgreSQL specific")
+    @WithTemporalPrecisionMode(include = TemporalPrecisionMode.STRUCTURED)
+    @Disabled("Requires a source connector runtime with STRUCTURED temporal support. The e2e source pipeline runs on "
+            + "the Debezium nightly Connect image, whose PostgreSQL connector does not yet accept "
+            + "time.precision.mode=structured; enable once structured temporal support ships in the nightly image. "
+            + "Source-side fidelity is covered meanwhile by PostgresTemporalPrecisionHandlingIT and the sink literal by "
+            + "StructuredTemporalTypeTest#shouldBindStructuredZonedTimeBoundaryHour24.")
+    public void testTimeWithTimeZonePreservesOffsetAndBoundaryInStructuredMode(Source source, Sink sink) throws Exception {
+        // PostgreSQL TIMETZ keeps the offset as stored (no session-TZ adjustment) and allows the end-of-day
+        // boundary 24:00:00. In STRUCTURED mode both must round-trip to the sink unchanged, which the UTC-normalizing
+        // OffsetTime path cannot do (OffsetTime/LocalTime cannot even represent hour 24). Read the sink column as
+        // text since hour 24 is not representable by java.time types.
+        assertDataTypesNonKeyOnly(source,
+                sink,
+                List.of("time(6) with time zone", "time(6) with time zone"),
+                List.of("'24:00:00+05:30'", "'13:51:30.123789-04:30'"),
+                List.of("24:00:00+05:30", "13:51:30.123789-04:30"),
+                (record) -> {
+                    assertColumn(sink, record, "data0", getTimeWithTimezoneType(source, false, 6));
+                    assertColumn(sink, record, "data1", getTimeWithTimezoneType(source, false, 6));
+                },
                 ResultSet::getString);
     }
 

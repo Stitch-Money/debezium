@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -881,5 +882,97 @@ public class SqlServerChangeTableSetIT extends AbstractAsyncEngineConnectorTest 
         Schema colbSchema = records.get(0).valueSchema().field("after").schema().field("colb").schema();
         assertThat(colbSchema.defaultValue()).isNotNull();
         assertThat(colbSchema.defaultValue()).isEqualTo("new_default_value");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#960")
+    void excludedCaptureInstanceIsNotEnumerated() throws Exception {
+        // tableb already has its default capture instance "dbo_tableb"; add a second one for the same source table.
+        TestHelper.enableTableCdc(connection, "tableb", "tableb_v2");
+
+        // Without a filter, both capture instances of tableb are enumerated.
+        assertThat(captureInstancesFor(connection, "dbo", "tableb"))
+                .containsExactlyInAnyOrder("dbo_tableb", "tableb_v2");
+
+        // With the second instance excluded, only the default one is enumerated (its function is never queried).
+        try (SqlServerConnection filtered = TestHelper.testConnection(TestHelper.TEST_DATABASE_1,
+                builder -> builder.with(SqlServerConnectorConfig.CAPTURE_INSTANCE_EXCLUDE_LIST, "tableb_v2"))) {
+            filtered.connect();
+            assertThat(captureInstancesFor(filtered, "dbo", "tableb"))
+                    .containsExactly("dbo_tableb");
+            // Capture instances of other tables are unaffected.
+            assertThat(captureInstancesFor(filtered, "dbo", "tablea"))
+                    .containsExactly("dbo_tablea");
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#960")
+    void includeListLimitsEnumerationToMatchingCaptureInstances() throws Exception {
+        TestHelper.enableTableCdc(connection, "tableb", "tableb_v2");
+
+        try (SqlServerConnection filtered = TestHelper.testConnection(TestHelper.TEST_DATABASE_1,
+                builder -> builder.with(SqlServerConnectorConfig.CAPTURE_INSTANCE_INCLUDE_LIST, "dbo_table.*"))) {
+            filtered.connect();
+            // Only capture instances whose names match the include pattern survive; "tableb_v2" does not.
+            assertThat(captureInstancesFor(filtered, "dbo", "tableb"))
+                    .containsExactly("dbo_tableb");
+            assertThat(captureInstancesFor(filtered, "dbo", "tablea"))
+                    .containsExactly("dbo_tablea");
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2800")
+    void excludedCaptureInstanceWithSameStartLsnDoesNotShadowIncludedOne() throws Exception {
+        // tableb already has "dbo_tableb"; add a newer capture instance for the same source table. The CDC cleanup job
+        // moves start_lsn of every capture instance to the same low water mark once the retention period has passed,
+        // so in production both instances of a table end up with the same start LSN. Reproduce that with the cleanup
+        // procedure the job uses.
+        TestHelper.enableTableCdc(connection, "tableb", "tableb_v2");
+        // The low water mark has to be an LSN the capture job has processed, so produce one first.
+        connection.execute("INSERT INTO tableb VALUES(100, 'b')");
+        TestHelper.waitForCdcRecord(connection, "tableb", rs -> rs.getInt("id") == 100);
+        connection.execute("DECLARE @lwm binary(10) = sys.fn_cdc_get_max_lsn();"
+                + " EXEC sys.sp_cdc_cleanup_change_table @capture_instance = 'dbo_tableb', @low_water_mark = @lwm, @threshold = 5000;"
+                + " EXEC sys.sp_cdc_cleanup_change_table @capture_instance = 'tableb_v2', @low_water_mark = @lwm, @threshold = 5000");
+
+        // Without a filter the newest instance wins, as before.
+        assertThat(captureInstancesFor(connection, "dbo", "tableb")).containsExactly("tableb_v2");
+
+        // Excluding the newest instance must fall back to the older one instead of dropping the table.
+        try (SqlServerConnection filtered = TestHelper.testConnection(TestHelper.TEST_DATABASE_1,
+                builder -> builder.with(SqlServerConnectorConfig.CAPTURE_INSTANCE_EXCLUDE_LIST, "tableb_v2"))) {
+            filtered.connect();
+            assertThat(captureInstancesFor(filtered, "dbo", "tableb")).containsExactly("dbo_tableb");
+        }
+        // The include list has the same blind spot.
+        try (SqlServerConnection filtered = TestHelper.testConnection(TestHelper.TEST_DATABASE_1,
+                builder -> builder.with(SqlServerConnectorConfig.CAPTURE_INSTANCE_INCLUDE_LIST, "dbo_table.*"))) {
+            filtered.connect();
+            assertThat(captureInstancesFor(filtered, "dbo", "tableb")).containsExactly("dbo_tableb");
+        }
+
+        // Streaming with the exclusion in place must still deliver the changes of tableb.
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
+                .with(SqlServerConnectorConfig.CAPTURE_INSTANCE_EXCLUDE_LIST, "tableb_v2")
+                .build();
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+        TestHelper.waitForSnapshotToBeCompleted();
+
+        connection.execute("INSERT INTO tablea VALUES(1, 'a')", "INSERT INTO tableb VALUES(1, 'b')");
+
+        final SourceRecords records = consumeRecordsByTopic(2);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tablea")).hasSize(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tableb")).hasSize(1);
+    }
+
+    private static List<String> captureInstancesFor(SqlServerConnection connection, String schema, String table) throws SQLException {
+        return connection.getChangeTables(TestHelper.TEST_DATABASE_1).stream()
+                .filter(ct -> schema.equals(ct.getSourceTableId().schema()) && table.equals(ct.getSourceTableId().table()))
+                .map(SqlServerChangeTable::getCaptureInstance)
+                .collect(Collectors.toList());
     }
 }

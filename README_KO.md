@@ -1,5 +1,5 @@
 [![License](http://img.shields.io/:license-apache%202.0-brightgreen.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
-[![Maven Central](https://img.shields.io/maven-central/v/io.debezium/debezium-core?color=bright-green)](https://central.sonatype.com/search?q=io.debezium)
+[![Maven Central](https://img.shields.io/maven-central/v/io.debezium/debezium-connector-common?color=bright-green)](https://central.sonatype.com/search?q=io.debezium)
 [![User chat](https://img.shields.io/badge/chat-users-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302529-users)
 [![Developer chat](https://img.shields.io/badge/chat-devs-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302533-dev)
 [![Google Group](https://img.shields.io/:mailing%20list-debezium-brightgreen.svg)](https://groups.google.com/forum/#!forum/debezium)
@@ -69,7 +69,7 @@ CDC(Change Data Capture)를 사용하면 데이터가 오리지널 데이터베�
 
     $ git --version
     $ javac -version
-    $ mvn -version
+    $ ./mvnw -version
     $ docker --version
 
 ### 왜 도커인가?
@@ -104,7 +104,7 @@ Git 리포지토리를 복제하여 코드를 가져옵니다.
 
 그 후 메이븐을 사용하여 코드를 빌드합니다.
 
-    $ mvn clean verify
+    $ ./mvnw clean verify
 
 빌드시 다양한 DBMS에 대해 여러 개의 도커 컨테이너를 사용합니다. 도커가 실행중이 아니거나 구성되지 않은 경우에는 오류가 발생할 수 있습니다. 이 경우 도커가 실행중인지 확인해야 합니다. `docker ps` 명령어를 사용하여 도커가 실행중인지 확인하세요.
 
@@ -112,13 +112,13 @@ Git 리포지토리를 복제하여 코드를 가져옵니다.
 
 아래의 명령어를 사용하여 통합 테스트 및 도커 빌드를 건너뛸 수 있습니다.
 
-    $ mvn clean verify -DskipITs
+    $ ./mvnw clean verify -DskipITs
 
 ### 테스트, 체크스타일 및 기타 작업을 수행하지 않고 아티팩트만 빌드
 
 “quick” 빌드 프로파일을 사용하여 필수가 아닌 모든 플러그인(테스트, 통합 테스트, 체크스타일, 포맷터, API 호환성 검사등)을 건너뛸 수 있습니다.
 
-    $ mvn clean verify -Dquick
+    $ ./mvnw clean verify -Dquick
 
 위의 옵션을 사용하면 QA관련 메이븐 플러그인을 실행하지 않고 아웃푹 아티팩트만 빠르게 생성할 수 있습니다. 이 기능은 커넥터 JAR 및 아카이브를 빨리 생성할 때 매우 유용합니다. (예: 카프카 커넥터를 수동 테스트 할 경우)
 
@@ -126,11 +126,11 @@ Git 리포지토리를 복제하여 코드를 가져옵니다.
 
 Postgres 커넥터는 DB서버에서 커넥터로 변경 사항을 스트리밍하기 위한 세 가지 논리 디코딩 플러그인(decoderbufs(디폴트), wal2json, pgoutput)을 지원합니다. wal2json을 사용하여 PG 커넥터의 통합 테스트를 수행하려면 `wal2json-decoder` 빌드 프로파일을 사용합니다.
 
-    $ mvn clean install -pl :debezium-connector-postgres -Pwal2json-decoder
+    $ ./mvnw clean install -pl :debezium-connector-postgres -Pwal2json-decoder
     
 pgoutput을 사용하여 PG 커넥터의 통합 테스트를 수행하려면 `pgoutput-decoder` 및 `postgres-10` 빌드 프로파일을 활성화 해야 합니다.
 
-    $ mvn clean install -pl :debezium-connector-postgres -Ppgoutput-decoder,postgres-10
+    $ ./mvnw clean install -pl :debezium-connector-postgres -Ppgoutput-decoder,postgres-10
 
 wal2json 플러그인을 사용할 때 현재 일부 테스트를 통과하지 못합니다.
 
@@ -140,7 +140,7 @@ wal2json 플러그인을 사용할 때 현재 일부 테스트를 통과하지 �
 
 특정 버전의 Apicurio에서 wal2json 또는 pgoutput 논리 디코딩 플러그인을 사용하여 PG 커넥터 테스트를 수행하려면 테스트 속성을 아래와 같이 전달 해야 합니다.
 
-    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder 
+    $ ./mvnw clean install -pl debezium-connector-postgres -Pwal2json-decoder 
           -Ddebezium.test.apicurio.version=1.3.1.Final
 
 속성이 없으면 안정적인 버전의 Apicurio를 가져옵니다.
@@ -149,7 +149,7 @@ wal2json 플러그인을 사용할 때 현재 일부 테스트를 통과하지 �
 
 RDS 클러스터를 사용하지 않은 상황에 대해 테스트하려면 해당 유저가 복제뿐만 아니라 `pg_hda.conf`의 모든 데이터베이스에 로그인할 수 있는 권한을 가진 슈퍼유저여야 합니다. 또한 대상 서버에서 postgis 패키지를 사용할 수 있어야 테스트를 수행할 수 있습니다.
 
-    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder \
+    $ ./mvnw clean install -pl debezium-connector-postgres -Pwal2json-decoder \
          -Ddocker.skip.build=true -Ddocker.skip.run=true -Dpostgres.host=<your PG host> \
          -Dpostgres.user=<your user> -Dpostgres.password=<your password> \
          -Ddebezium.test.records.waittime=10
@@ -159,17 +159,17 @@ RDS 클러스터를 사용하지 않은 상황에 대해 테스트하려면 해�
 
 ### 오라클 XStream을 사용하여 오라클 커넥터 테스트 수행
 
-    $ mvn clean install -pl debezium-connector-oracle -Poracle,xstream -Dinstantclient.dir=<path-to-instantclient>
+    $ ./mvnw clean install -pl debezium-connector-oracle -Poracle,xstream -Dinstantclient.dir=<path-to-instantclient>
 
 ### non-CDB 데이터베이스에서 오라클 커넥터 테스트 수행
 
-    $ mvn clean install -pl debezium-connector-oracle -Poracle -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
+    $ ./mvnw clean install -pl debezium-connector-oracle -Poracle -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
 
 ### IDE에서 몽고DB oplog 캡처를 사용하여 몽고DB 테스트 수행
 
 메이븐 없이 테스트를 실행할 때는 올바른 매개 변수를 전달했는지 확인해야 합니다. `.github/workflows/mongodb-oplog-workflow.yml`에서 올바른 매개 변수를 찾아서 JVM 실행 매개 변수에 추가하고 `debezium.test`를 접두사로 추가한 후, 몽고DB 커넥터 디렉토리에서 수동으로 몽고DB 컨테이너를 시작해야 합니다
 
-    $ mvn docker:start -B -am -Passembly -Dcheckstyle.skip=true -Dformat.skip=true -Drevapi.skip -Dcapture.mode=oplog -Dversion.mongo.server=3.6 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dcapture.mode=oplog -Dmongo.server=3.6
+    $ ./mvnw docker:start -B -am -Passembly -Dcheckstyle.skip=true -Dformat.skip=true -Drevapi.skip -Dcapture.mode=oplog -Dversion.mongo.server=3.6 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dcapture.mode=oplog -Dmongo.server=3.6
 
 해당 부분은 아래의 명령어와 유사합니다.
 

@@ -6,10 +6,13 @@
 
 package io.debezium.connector.mysql.antlr.listener;
 
+import java.sql.Types;
 import java.util.concurrent.atomic.AtomicReference;
 
-import io.debezium.ddl.parser.mysql.generated.MySqlParser.CurrentTimestampContext;
-import io.debezium.ddl.parser.mysql.generated.MySqlParser.DefaultValueContext;
+import io.debezium.connector.binlog.util.BinaryLiteralDefaultValueUtils;
+import io.debezium.connector.binlog.util.BinaryLiteralDefaultValueUtils.BinaryLiteral;
+import io.debezium.connector.mysql.antlr.MySqlAntlrDdlParser;
+import io.debezium.ddl.parser.mysql.generated.MySqlParser;
 import io.debezium.ddl.parser.mysql.generated.MySqlParserBaseListener;
 import io.debezium.relational.ColumnEditor;
 
@@ -20,89 +23,165 @@ import io.debezium.relational.ColumnEditor;
  */
 public class DefaultValueParserListener extends MySqlParserBaseListener {
 
-    private final ColumnEditor columnEditor;
+    private final ColumnDefinitionParserListener columnDefinitionListener;
     private final AtomicReference<Boolean> optionalColumn;
+    private final MySqlAntlrDdlParser parser;
 
     private boolean converted;
 
-    public DefaultValueParserListener(ColumnEditor columnEditor, AtomicReference<Boolean> optionalColumn) {
-        this.columnEditor = columnEditor;
+    public DefaultValueParserListener(ColumnDefinitionParserListener columnDefinitionListener,
+                                      AtomicReference<Boolean> optionalColumn, MySqlAntlrDdlParser parser) {
+        this.columnDefinitionListener = columnDefinitionListener;
         this.optionalColumn = optionalColumn;
+        this.parser = parser;
         this.converted = false;
     }
 
+    /**
+     * Get the current active ColumnEditor dynamically.
+     * This ensures we always write to the correct editor, even when processing
+     * multiple columns in a single ALTER TABLE statement.
+     */
+    private ColumnEditor getColumnEditor() {
+        return columnDefinitionListener.getColumnEditor();
+    }
+
     @Override
-    public void enterDefaultValue(DefaultValueContext ctx) {
-        String sign = "";
-        if (ctx.NULL_LITERAL() != null) {
+    public void enterColumnAttribute(MySqlParser.ColumnAttributeContext ctx) {
+        // Check if this is a DEFAULT value attribute
+        if (ctx.DEFAULT_SYMBOL() != null || (ctx.value != null && ctx.value.getType() == MySqlParser.DEFAULT_SYMBOL)) {
+            handleDefaultValue(ctx);
+        }
+        super.enterColumnAttribute(ctx);
+    }
+
+    private void handleDefaultValue(MySqlParser.ColumnAttributeContext ctx) {
+        // The last default of a column definition applies
+        parser.binaryLiteralDefaults().remove(getColumnEditor().name());
+
+        // Handle expression-based defaults (MySQL 8.0.13+)
+        if (ctx.exprWithParentheses() != null) {
+            // Default value is calculated/expression - handle as NULL
+            getColumnEditor().defaultValueExpression(null);
+            exitDefaultValue(true);
             return;
         }
-        if (ctx.unaryOperator() != null) {
-            sign = ctx.unaryOperator().getText();
-        }
-        if (ctx.constant() != null) {
-            if (ctx.constant().stringLiteral() != null) {
-                if (ctx.constant().stringLiteral().COLLATE() == null) {
-                    columnEditor.defaultValueExpression(sign + unquote(ctx.constant().stringLiteral().getText()));
+
+        // Handle nowOrSignedLiteral
+        if (ctx.nowOrSignedLiteral() != null) {
+            MySqlParser.NowOrSignedLiteralContext literalCtx = ctx.nowOrSignedLiteral();
+
+            // Check for NOW() / CURRENT_TIMESTAMP
+            if (literalCtx.now() != null) {
+                getColumnEditor().defaultValueExpression("1970-01-01 00:00:00");
+                exitDefaultValue(true);
+                return;
+            }
+
+            // Handle signedLiteralOrNull
+            if (literalCtx.signedLiteralOrNull() != null) {
+                MySqlParser.SignedLiteralOrNullContext signedLitCtx = literalCtx.signedLiteralOrNull();
+
+                if (getColumnEditor().jdbcType() == Types.BIT) {
+                    getColumnEditor().defaultValueExpression(BitDefaultValueParser.parse(signedLitCtx, parser));
+                    exitDefaultValue(true);
+                    return;
                 }
-                else {
-                    columnEditor.defaultValueExpression(
-                            sign + unquote(ctx.constant().stringLiteral().STRING_LITERAL(0).getText()));
+
+                // Check for NULL
+                if (signedLitCtx.nullAsLiteral() != null) {
+                    exitDefaultValue(true);
+                    return;
+                }
+
+                // Handle signedLiteral
+                if (signedLitCtx.signedLiteral() != null) {
+                    MySqlParser.SignedLiteralContext signed = signedLitCtx.signedLiteral();
+
+                    // Extract sign if present
+                    String sign = "";
+                    if (signed.PLUS_OPERATOR() != null) {
+                        sign = "+";
+                    }
+                    else if (signed.MINUS_OPERATOR() != null) {
+                        sign = "-";
+                    }
+
+                    // Handle signed number
+                    if (signed.ulong_number() != null) {
+                        getColumnEditor().defaultValueExpression(sign + signed.ulong_number().getText());
+                        exitDefaultValue(true);
+                        return;
+                    }
+
+                    // Handle literal (text, numeric, temporal, etc.)
+                    if (signed.literal() != null) {
+                        handleLiteral(signed.literal(), sign);
+                        exitDefaultValue(true);
+                        return;
+                    }
                 }
             }
-            else if (ctx.constant().decimalLiteral() != null) {
-                columnEditor.defaultValueExpression(sign + ctx.constant().decimalLiteral().getText());
-            }
-            else if (ctx.constant().BIT_STRING() != null) {
-                columnEditor.defaultValueExpression(unquoteBinary(ctx.constant().BIT_STRING().getText()));
-            }
-            else if (ctx.constant().booleanLiteral() != null) {
-                columnEditor.defaultValueExpression(ctx.constant().booleanLiteral().getText());
-            }
-            else if (ctx.constant().REAL_LITERAL() != null) {
-                columnEditor.defaultValueExpression(ctx.constant().REAL_LITERAL().getText());
-            }
         }
-        else if (ctx.currentTimestamp() != null && !ctx.currentTimestamp().isEmpty()) {
-            if (ctx.currentTimestamp().size() > 1 || (ctx.ON() == null && ctx.UPDATE() == null)) {
-                final CurrentTimestampContext currentTimestamp = ctx.currentTimestamp(0);
-                if (currentTimestamp.CURRENT_TIMESTAMP() != null || currentTimestamp.NOW() != null) {
-                    columnEditor.defaultValueExpression("1970-01-01 00:00:00");
-                }
-                else {
-                    columnEditor.defaultValueExpression(currentTimestamp.getText());
-                }
-            }
-        }
-        // Default value is calculated.
-        // We thus handle it as NULL.
-        else if (ctx.expression() != null) {
-            columnEditor.defaultValueExpression(null);
-        }
+
         exitDefaultValue(true);
-        super.enterDefaultValue(ctx);
+    }
+
+    private void handleLiteral(MySqlParser.LiteralContext literalCtx, String sign) {
+        // Text literal
+        if (literalCtx.textLiteral() != null) {
+            getColumnEditor().defaultValueExpression(sign + parser.parseTextLiteral(literalCtx.textLiteral()));
+            return;
+        }
+
+        // Numeric literal
+        if (literalCtx.numLiteral() != null) {
+            getColumnEditor().defaultValueExpression(sign + literalCtx.numLiteral().getText());
+            return;
+        }
+
+        // Boolean literal
+        if (literalCtx.boolLiteral() != null) {
+            getColumnEditor().defaultValueExpression(literalCtx.boolLiteral().getText());
+            return;
+        }
+
+        // Hex/Bin number
+        if (literalCtx.HEX_NUMBER() != null || literalCtx.BIN_NUMBER() != null) {
+            getColumnEditor().defaultValueExpression(parseBinaryLiteral(literalCtx, getColumnEditor(), parser));
+            return;
+        }
+
+        // Temporal literal
+        if (literalCtx.temporalLiteral() != null) {
+            getColumnEditor().defaultValueExpression(sign + literalCtx.temporalLiteral().getText());
+            return;
+        }
+
+        // Null literal - do nothing, already handled
     }
 
     public void exitDefaultValue(boolean skipIfUnknownOptional) {
         boolean isOptionalColumn = optionalColumn.get() != null;
         if (!converted && (isOptionalColumn || !skipIfUnknownOptional)) {
             if (isOptionalColumn) {
-                columnEditor.optional(optionalColumn.get().booleanValue());
+                getColumnEditor().optional(optionalColumn.get().booleanValue());
             }
             converted = true;
         }
     }
 
-    private String unquote(String stringLiteral) {
-        if (stringLiteral != null && ((stringLiteral.startsWith("'") && stringLiteral.endsWith("'"))
-                || (stringLiteral.startsWith("\"") && stringLiteral.endsWith("\"")))) {
-            return stringLiteral.substring(1, stringLiteral.length() - 1);
-        }
-        return stringLiteral;
-    }
-
-    private String unquoteBinary(String stringLiteral) {
-        return stringLiteral.substring(2, stringLiteral.length() - 1);
+    static String parseBinaryLiteral(MySqlParser.LiteralContext literalCtx, ColumnEditor columnEditor, MySqlAntlrDdlParser parser) {
+        final byte[] bytes = literalCtx.HEX_NUMBER() != null
+                ? BinaryLiteralDefaultValueUtils.parseHexadecimal(literalCtx.HEX_NUMBER().getText())
+                : BinaryLiteralDefaultValueUtils.parseBitValue(literalCtx.BIN_NUMBER().getText());
+        final String introducer = literalCtx.UNDERSCORE_CHARSET() != null ? literalCtx.UNDERSCORE_CHARSET().getText() : null;
+        // MySQL treats X'41' like 0x41, as a number in a numeric context
+        final BinaryLiteral literal = new BinaryLiteral(bytes, true, introducer);
+        // The character set of the column may only be known at the end of the statement, which converts the literal again
+        parser.binaryLiteralDefaults().put(columnEditor.name(), literal);
+        return BinaryLiteralDefaultValueUtils.toDefaultValueExpression(columnEditor, literal, parser.currentDatabaseCharset(),
+                parser::getJavaEncodingForCharSet);
     }
 
 }

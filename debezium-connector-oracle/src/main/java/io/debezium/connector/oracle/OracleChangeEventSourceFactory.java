@@ -5,9 +5,15 @@
  */
 package io.debezium.connector.oracle;
 
+import java.sql.SQLException;
 import java.util.Optional;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.debezium.DebeziumException;
 import io.debezium.config.Configuration;
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
@@ -23,6 +29,8 @@ import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
 
 public class OracleChangeEventSourceFactory implements ChangeEventSourceFactory<OraclePartition, OracleOffsetContext> {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(OracleChangeEventSourceFactory.class);
 
     private final OracleConnectorConfig configuration;
     private final OracleConnectionFactory connectionFactory;
@@ -54,14 +62,21 @@ public class OracleChangeEventSourceFactory implements ChangeEventSourceFactory<
     @Override
     public SnapshotChangeEventSource<OraclePartition, OracleOffsetContext> getSnapshotChangeEventSource(SnapshotProgressListener<OraclePartition> snapshotProgressListener,
                                                                                                         NotificationService<OraclePartition, OracleOffsetContext> notificationService) {
-        return new OracleSnapshotChangeEventSource(configuration, connectionFactory, schema, dispatcher, clock, snapshotProgressListener, notificationService,
+        return new OracleSnapshotChangeEventSource(
+                configuration,
+                connectionFactory.snapshotConnectionFactory(),
+                schema,
+                dispatcher,
+                clock,
+                snapshotProgressListener,
+                notificationService,
                 snapshotterService);
     }
 
     @Override
     public StreamingChangeEventSource<OraclePartition, OracleOffsetContext> getStreamingChangeEventSource() {
         return configuration.getAdapter().getSource(
-                connectionFactory.mainConnection(),
+                connectionFactory,
                 dispatcher,
                 errorHandler,
                 clock,
@@ -81,7 +96,25 @@ public class OracleChangeEventSourceFactory implements ChangeEventSourceFactory<
         // If no data collection id is provided, don't return an instance as the implementation requires
         // that a signal data collection id be provided to work.
         if (configuration.getSignalingDataCollectionIds().isEmpty()) {
+            LOGGER.warn("Incremental snapshots are disabled because no '{}' is configured.",
+                    OracleConnectorConfig.SIGNAL_DATA_COLLECTION.name());
             return Optional.empty();
+        }
+
+        // Cannot use incremental snapshots with a read only connection
+        if (configuration.isLogMiningReadOnly()) {
+            LOGGER.warn("Incremental snapshots are disabled because '{}' is set to 'true'; incremental snapshots " +
+                    "require a read/write connection to maintain the signal data collection. Consider using a " +
+                    "blocking snapshot instead.", OracleConnectorConfig.LOG_MINING_READ_ONLY.name());
+            return Optional.empty();
+        }
+
+        final OracleConnection connection = connectionFactory.snapshotConnectionFactory().newConnection();
+        try {
+            connection.setAutoCommit(true);
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Failed to set incremental snapshot connection to auto-commit", e);
         }
 
         // Incremental snapshots requires a secondary database connection
@@ -90,7 +123,7 @@ public class OracleChangeEventSourceFactory implements ChangeEventSourceFactory<
         // PDB when reading snapshot records.
         return Optional.of(new OracleSignalBasedIncrementalSnapshotChangeEventSource(
                 configuration,
-                new OracleConnection(configuration, connectionFactory.mainConnection().config()),
+                connection,
                 dispatcher,
                 schema,
                 clock,

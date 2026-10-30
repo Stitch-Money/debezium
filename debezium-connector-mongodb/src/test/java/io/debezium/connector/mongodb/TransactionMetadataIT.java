@@ -9,11 +9,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.connector.mongodb.MongoDbConnectorConfig.SnapshotMode;
+import io.debezium.data.Envelope;
 import io.debezium.doc.FixFor;
 import io.debezium.schema.AbstractTopicNamingStrategy;
 import io.debezium.util.Collect;
@@ -61,6 +64,27 @@ public class TransactionMetadataIT extends AbstractMongoConnectorIT {
         final List<SourceRecord> txs = records.recordsForTopic("mongo1.transaction");
         assertThat(c1s).hasSize(7);
         assertThat(txs).hasSize(2);
+        assertThat(c1s).allSatisfy(record -> {
+            final var source = ((Struct) record.value()).getStruct(Envelope.FieldName.SOURCE);
+            final var payloadToken = BsonDocument.parse(source.getString(SourceInfo.RESUME_TOKEN));
+            final var offsetToken = ResumeTokens.fromBase64((String) record.sourceOffset().get(SourceInfo.RESUME_TOKEN));
+            assertThat(payloadToken).isEqualTo(offsetToken);
+        });
+
+        // The six writes in the transaction share a timestamp, but each has its own resume token.
+        final List<SourceRecord> transactionRecords = c1s.subList(0, documentsToInsert.size());
+        final var firstOffset = transactionRecords.get(0).sourceOffset();
+        final var transactionTimestamp = firstOffset.get(SourceInfo.TIMESTAMP);
+        final var transactionOrder = firstOffset.get(SourceInfo.ORDER);
+        assertThat(transactionTimestamp).isNotNull();
+        assertThat(transactionOrder).isNotNull();
+        assertThat(transactionRecords.stream()
+                .map(record -> ((Struct) record.value()).getStruct(Envelope.FieldName.SOURCE).getString(SourceInfo.RESUME_TOKEN)))
+                .doesNotHaveDuplicates();
+        assertThat(transactionRecords).allSatisfy(record -> {
+            assertThat(record.sourceOffset().get(SourceInfo.TIMESTAMP)).isEqualTo(transactionTimestamp);
+            assertThat(record.sourceOffset().get(SourceInfo.ORDER)).isEqualTo(transactionOrder);
+        });
 
         final List<SourceRecord> all = records.allRecordsInOrder();
         final String txId1 = assertBeginTransaction(all.get(0));
@@ -125,6 +149,68 @@ public class TransactionMetadataIT extends AbstractMongoConnectorIT {
         }
 
         assertEndTransaction(all.get(7), txId1, 6, Collect.hashMapOf("dbA.c1", 6));
+
+        stopConnector();
+    }
+
+    @Test
+    public void shouldNotEmitDuplicateEndRecordsForMultipleNonTransactionalEvents() throws Exception {
+        // Testing.Print.enable();
+        config = TestHelper.getConfiguration(mongo)
+                .edit()
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbA.c1")
+                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(MongoDbConnectorConfig.PROVIDE_TRANSACTION_METADATA, true)
+                .build();
+
+        context = new MongoDbTaskContext(config);
+
+        TestHelper.cleanDatabase(mongo, "dbA");
+
+        if (!TestHelper.transactionsSupported()) {
+            return;
+        }
+
+        start(MongoDbConnector.class, config);
+        assertConnectorIsRunning();
+
+        // Wait for snapshot completion
+        waitForSnapshotToBeCompleted("mongodb", "mongo1");
+
+        // Insert 2 documents in a transaction
+        insertDocumentsInTx("dbA", "c1",
+                new Document("_id", 1).append("data", "txn-doc-1"),
+                new Document("_id", 2).append("data", "txn-doc-2"));
+
+        // Insert first non-transactional document - this should trigger END
+        insertDocuments("dbA", "c1", new Document("_id", 3).append("data", "non-txn-doc-1"));
+
+        // Insert second non-transactional document - this should NOT trigger another END
+        insertDocuments("dbA", "c1", new Document("_id", 4).append("data", "non-txn-doc-2"));
+
+        // Insert third non-transactional document - this should NOT trigger another END
+        insertDocuments("dbA", "c1", new Document("_id", 5).append("data", "non-txn-doc-3"));
+
+        // Expected records:
+        // - BEGIN (1 transaction record)
+        // - 2 data events from transaction
+        // - END (1 transaction record) - triggered by first non-txn event
+        // - 3 data events from non-transactional inserts
+        // Total: 1 + 2 + 1 + 3 = 7 records, with exactly 2 transaction records
+        final SourceRecords records = consumeRecordsByTopic(1 + 2 + 1 + 3);
+        final List<SourceRecord> dataRecords = records.recordsForTopic("mongo1.dbA.c1");
+        final List<SourceRecord> txRecords = records.recordsForTopic("mongo1.transaction");
+
+        // Verify we have exactly 5 data records (2 from txn + 3 non-txn)
+        assertThat(dataRecords).hasSize(5);
+
+        // Critical assertion: we should have exactly 2 transaction records (1 BEGIN + 1 END)
+        // Before the fix, this would fail with 4 records (1 BEGIN + 3 ENDs)
+        assertThat(txRecords).hasSize(2);
+
+        final List<SourceRecord> all = records.allRecordsInOrder();
+        final String txId = assertBeginTransaction(all.get(0));
+        assertEndTransaction(all.get(3), txId, 2, Collect.hashMapOf("dbA.c1", 2));
 
         stopConnector();
     }

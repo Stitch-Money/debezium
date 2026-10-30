@@ -5,12 +5,12 @@
  */
 package io.debezium.connector.oracle.logminer.buffered;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerQueryBuilder;
+import io.debezium.connector.oracle.logminer.events.RowIdCodec;
 import io.debezium.util.Strings;
 
 /**
@@ -136,12 +136,22 @@ public class BufferedLogMinerQueryBuilder extends AbstractLogMinerQueryBuilder {
         operationInClause.withValues(getOperationCodesList(isCteQuery));
         predicate.append("(").append(operationInClause.build());
 
+        // Handle INTERNAL operations that can contain ROW_IDs for INSERT/UPDATE operations with empty ROW_IDs
+        if (connectorConfig.isLobEnabled() && connectorConfig.isLogMiningIncludeInternalEvents()) {
+            predicate.append(getInternalPredicate());
+        }
+
         // Handle DDL operations
         if (connectorConfig.storeOnlyCapturedTables()) {
             predicate.append(getDdlPredicate());
         }
 
         return predicate.append(")").toString();
+    }
+
+    private static String getInternalPredicate() {
+        return " OR (OPERATION_CODE = 0 AND ROLLBACK = 0 AND ROW_ID NOT LIKE '%%%s' AND SEQUENCE# > 1)"
+                .formatted(RowIdCodec.EMPTY_ROW_ID_SUFFIX);
     }
 
     private static String getDdlPredicate() {
@@ -153,18 +163,6 @@ public class BufferedLogMinerQueryBuilder extends AbstractLogMinerQueryBuilder {
             return isCteQuery ? CTE_OPERATION_CODES_LOB : OPERATION_CODES_LOB;
         }
 
-        final List<Integer> nonLobOperations = isCteQuery ? CTE_OPERATION_CODES_NO_LOB : OPERATION_CODES_NO_LOB;
-
-        if (connectorConfig.isLegacyLogMinerHeapTransactionStartBehaviorEnabled()) {
-            // The legacy behavior skipped START events as a performance optimization to avoid adding
-            // extra objects to the transaction cache. Without these, the username and client id
-            // filter options and source information block fields won't work in some corner cases if
-            // the transaction start is in a prior archive log.
-            final List<Integer> operationCodes = new ArrayList<>(nonLobOperations);
-            operationCodes.removeIf(operationCode -> operationCode == 6);
-            return operationCodes;
-        }
-
-        return nonLobOperations;
+        return isCteQuery ? CTE_OPERATION_CODES_NO_LOB : OPERATION_CODES_NO_LOB;
     }
 }

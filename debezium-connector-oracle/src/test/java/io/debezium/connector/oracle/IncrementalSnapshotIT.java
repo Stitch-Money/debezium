@@ -6,7 +6,9 @@
 package io.debezium.connector.oracle;
 
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.AfterEach;
@@ -121,6 +123,11 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Oracl
     }
 
     @Override
+    protected Optional<String> physicalRowIdentifierSurrogateKey() {
+        return Optional.of("ROWID");
+    }
+
+    @Override
     protected List<String> tableNames() {
         return List.of("DEBEZIUM.A", "DEBEZIUM.B");
     }
@@ -199,7 +206,12 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Oracl
 
     @Override
     protected int defaultIncrementalSnapshotChunkSize() {
-        return 250;
+        // A chunk cannot be read until the watermark that closes the previous one has been
+        // streamed back, so the chunk size is what decides how long a snapshot stays in progress.
+        // OpenLogReplicator returns those watermarks within a few milliseconds and finishes all of
+        // ROW_COUNT in well under a second, which is too quick for a test that has to pause a
+        // snapshot while it is still running.
+        return TestHelper.isOpenLogReplicator() ? 1 : 250;
     }
 
     @Override
@@ -225,5 +237,14 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Oracl
         TestHelper.dropTable(connection, "a");
         TestHelper.dropTable(connection, "b");
         TestHelper.dropTable(connection, "a42");
+    }
+
+    @Override
+    protected Duration getWaitDurationInSeconds() {
+        if (TestHelper.isXStream()) {
+            // XStream waits are more temperamental, give it more time
+            return Duration.ofMinutes(5);
+        }
+        return super.getWaitDurationInSeconds();
     }
 }

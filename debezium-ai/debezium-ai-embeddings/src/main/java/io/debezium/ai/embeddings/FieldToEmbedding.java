@@ -30,6 +30,7 @@ import io.debezium.Module;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.data.vector.FloatVector;
+import io.debezium.metadata.ConfigDescriptor;
 import io.debezium.transforms.ConnectRecordUtil;
 import io.debezium.transforms.SmtManager;
 import io.debezium.util.BoundedConcurrentHashMap;
@@ -47,7 +48,7 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
  *
  * @author vjuranek
  */
-public class FieldToEmbedding<R extends ConnectRecord<R>> implements Transformation<R>, Versioned {
+public class FieldToEmbedding<R extends ConnectRecord<R>> implements Transformation<R>, Versioned, ConfigDescriptor {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(FieldToEmbedding.class);
 
@@ -72,13 +73,13 @@ public class FieldToEmbedding<R extends ConnectRecord<R>> implements Transformat
             .withDeprecatedAliases(LEGACY_EMBEDDINGS_PREFIX + "field.embedding");
 
     private static final Schema EMBEDDING_SCHEMA = FloatVector.schema();
-    private static final EmbeddingsModelFactory MODEL_FACTORY = EmbeddingsModelFactoryLoader.getModelFactory();
-    public static final Field.Set ALL_FIELDS = Field.setOf(TEXT_FIELD, EMBEDDGINS_FIELD).with(MODEL_FACTORY.getConfigFields());
+    public static final Field.Set ALL_FIELDS = Field.setOf(TEXT_FIELD, EMBEDDGINS_FIELD).with(EmbeddingsModelFactoryLoader.getModelFactory().getConfigFields());
 
     private SmtManager<R> smtManager;
     private String sourceField;
     private String embeddingsField;
     private List<String> sourceFieldPath;
+    private EmbeddingsModelFactory modelFactory;
     private EmbeddingModel model;
 
     private static final String NESTING_SPLIT_REG_EXP = "\\.";
@@ -93,11 +94,12 @@ public class FieldToEmbedding<R extends ConnectRecord<R>> implements Transformat
 
         sourceField = config.getString(TEXT_FIELD);
         embeddingsField = config.getString(EMBEDDGINS_FIELD);
-        MODEL_FACTORY.configure(config);
+        modelFactory = EmbeddingsModelFactoryLoader.getModelFactory();
+        modelFactory.configure(config);
         validateConfiguration();
 
         sourceFieldPath = Arrays.asList(sourceField.split(NESTING_SPLIT_REG_EXP));
-        model = MODEL_FACTORY.getModel();
+        model = modelFactory.getModel();
     }
 
     @Override
@@ -127,11 +129,16 @@ public class FieldToEmbedding<R extends ConnectRecord<R>> implements Transformat
         return Module.version();
     }
 
+    @Override
+    public Field.Set getConfigFields() {
+        return ALL_FIELDS;
+    }
+
     protected void validateConfiguration() {
         if (sourceField == null || sourceField.isBlank()) {
             throw new ConfigException(format("'%s' must be set to non-empty value.", TEXT_FIELD));
         }
-        MODEL_FACTORY.validateConfiguration();
+        modelFactory.validateConfiguration();
     }
 
     /**

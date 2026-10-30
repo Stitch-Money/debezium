@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.binlog;
 
+import java.sql.Types;
 import java.time.Duration;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -21,6 +22,7 @@ import io.debezium.config.Field;
 import io.debezium.config.Field.ValidationOutput;
 import io.debezium.connector.binlog.gtid.GtidSet;
 import io.debezium.connector.binlog.gtid.GtidSetFactory;
+import io.debezium.connector.binlog.history.BinlogMetadataSchemaHistory;
 import io.debezium.jdbc.JdbcValueConverters.BigIntUnsignedMode;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.ColumnFilterMode;
@@ -28,6 +30,8 @@ import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
+import io.debezium.relational.history.SchemaHistory;
+import io.debezium.relational.history.SchemaHistoryListener;
 import io.debezium.schema.DefaultTopicNamingStrategy;
 import io.debezium.util.Collect;
 
@@ -121,6 +125,59 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
     }
 
     /**
+     * Set of predefined modes for handling {@code REAL} values.
+     */
+    public enum RealHandlingMode implements EnumeratedValue {
+        /**
+         * Represents {@code REAL} values as single-precision floating-point values.
+         */
+        FLOAT("float", Types.REAL),
+        /**
+         * Represents {@code REAL} values as double-precision floating-point values.
+         */
+        DOUBLE("double", Types.DOUBLE);
+
+        private final String value;
+        private final int jdbcType;
+
+        RealHandlingMode(String value, int jdbcType) {
+            this.value = value;
+            this.jdbcType = jdbcType;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @return the matching option, or null if no match is found
+         */
+        public static RealHandlingMode parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (RealHandlingMode option : RealHandlingMode.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * @return the JDBC type used to represent {@code REAL} values
+         */
+        public int asJdbcType() {
+            return jdbcType;
+        }
+    }
+
+    /**
      * Set of predefined SnapshotLockingMode options or aliases.
      */
     public enum SnapshotLockingMode implements EnumeratedValue {
@@ -173,11 +230,6 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
          * otherwise some events during the gap may be processed with an incorrect schema and corrupted.
          */
         RECOVERY("recovery"),
-        /**
-         * Never perform a snapshot and only read the binlog. This assumes the binlog contains all the history of those
-         * databases and tables that will be captured.
-         */
-        NEVER("never"),
         /**
          * Perform a snapshot and then stop before attempting to read the binlog.
          */
@@ -304,7 +356,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withType(ConfigDef.Type.STRING)
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.LOW)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withDescription("A semicolon separated list of SQL statements to be executed when a JDBC connection "
                     + "(not binlog reading connection) to the database is established. Note that the connector may "
                     + "establish JDBC connections at its own discretion, so this should typically be used for "
@@ -318,28 +370,17 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withImportance(ConfigDef.Importance.HIGH)
             .required()
             .withValidation(Field::isPositiveLong)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withDescription("A numeric ID of this database client, which must be unique across all "
                     + "currently-running database processes in the cluster. This connector joins the "
                     + "database cluster as another server (with this unique ID) so it can read the binlog.");
-
-    public static final Field SERVER_ID_OFFSET = Field.create("database.server.id.offset")
-            .withDisplayName("Cluster ID offset")
-            .withType(ConfigDef.Type.LONG)
-            .withWidth(ConfigDef.Width.LONG)
-            .withImportance(ConfigDef.Importance.HIGH)
-            .withDefault(10000L)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 0))
-            .withDescription("Only relevant if parallel snapshotting is configured. During parallel snapshotting, "
-                    + "multiple (4) connections open to the database client, and they each need their own unique "
-                    + "connection ID. This offset is used to generate those IDs from the base configured cluster ID.");
 
     public static final Field SSL_KEYSTORE = Field.create("database.ssl.keystore")
             .withDisplayName("SSL Keystore")
             .withType(ConfigDef.Type.STRING)
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withDescription("The location of the key store file. "
                     + "This is optional and can be used for two-way authentication between the client and the database.");
 
@@ -348,7 +389,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withType(ConfigDef.Type.PASSWORD)
             .withWidth(ConfigDef.Width.MEDIUM)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withDescription("The password for the key store file. "
                     + "This is optional and only needed if 'database.ssl.keystore' is configured.");
 
@@ -357,7 +398,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withType(ConfigDef.Type.STRING)
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withDescription("The location of the trust store file for the server certificate verification.");
 
     public static final Field SSL_TRUSTSTORE_PASSWORD = Field.create("database.ssl.truststore.password")
@@ -365,7 +406,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withType(ConfigDef.Type.PASSWORD)
             .withWidth(ConfigDef.Width.MEDIUM)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withDescription("The password for the trust store file. "
                     + "Used to check the integrity of the truststore, and unlock the truststore.");
 
@@ -376,7 +417,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault(30000)
             .withValidation(Field::isPositiveInteger)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withDescription("Maximum time to wait after trying to connect to the database before timing out, "
                     + "given in milliseconds. Defaults to 30 seconds (30,000 ms).");
 
@@ -387,7 +428,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(true)
             .withValidation(Field::isBoolean)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withDescription("Whether a separate thread should be used to ensure the connection is kept alive.");
 
     public static final Field KEEP_ALIVE_INTERVAL_MS = Field.create("connect.keep.alive.interval.ms")
@@ -397,19 +438,56 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(Duration.ofMinutes(1).toMillis())
             .withValidation(Field::isPositiveInteger)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withDescription("Interval for connection checking if keep alive thread is used, given in milliseconds "
                     + "Defaults to 1 minute (60,000 ms).");
+
+    public static final Field KEEP_ALIVE_MAX_RECONNECT_ATTEMPTS = Field.create("connect.keep.alive.max.reconnect.attempts")
+            .withDisplayName("Keep alive maximum reconnect attempts")
+            .withType(ConfigDef.Type.INT)
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDefault(0)
+            .withValidation(Field::isNonNegativeInteger)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
+            .withDescription("Number of consecutive attempts the keep alive thread makes to restore a lost binlog "
+                    + "connection before the connector fails. A connection that can never be restored otherwise "
+                    + "leaves the connector running without emitting any change events. Defaults to 0, meaning the "
+                    + "keep alive thread retries indefinitely.");
 
     public static final Field USE_NONGRACEFUL_DISCONNECT = Field.create("use.nongraceful.disconnect")
             .withDisplayName("Use Non-graceful Disconnect")
             .withType(ConfigDef.Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault(false)
             .withDescription("Whether to use `socket.setSoLinger(true, 0)` when BinaryLogClient"
                     + " keepalive thread triggers a disconnect for a stale connection.");
+
+    public static final Field BINLOG_NET_WRITE_TIMEOUT = Field.create("binlog.net.write.timeout")
+            .withDisplayName("Binlog Net Write Timeout")
+            .withType(ConfigDef.Type.LONG)
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.MEDIUM)
+            .withDefault(0L)
+            .withValidation(Field::isNonNegativeLong)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
+            .withDescription("The number of seconds to wait for a write to the binlog connection to complete "
+                    + "before the server times out. A value of 0 means use the MySQL server default. "
+                    + "May need to be increased when large data volumes cause EOFException during streaming.");
+
+    public static final Field BINLOG_NET_READ_TIMEOUT = Field.create("binlog.net.read.timeout")
+            .withDisplayName("Binlog Net Read Timeout")
+            .withType(ConfigDef.Type.LONG)
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.MEDIUM)
+            .withDefault(0L)
+            .withValidation(Field::isNonNegativeLong)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
+            .withDescription("The number of seconds to wait for a read from the binlog connection to complete "
+                    + "before the server times out. A value of 0 means use the MySQL server default. "
+                    + "May need to be increased in high-latency network environments to prevent EOFException during streaming.");
 
     public static final Field ROW_COUNT_FOR_STREAMING_RESULT_SETS = Field.create("min.row.count.to.stream.results")
             .withDisplayName("Stream result set of size")
@@ -418,7 +496,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withImportance(ConfigDef.Importance.LOW)
             .withDefault(1_000)
             .withValidation(Field::isNonNegativeLong)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withDescription("The number of rows a table must contain to stream results rather than pull "
                     + "all into memory during snapshots. Defaults to 1,000. Use 0 to stream all results "
                     + "and completely avoid checking the size of each table.");
@@ -430,10 +508,26 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault(DEFAULT_BINLOG_BUFFER_SIZE)
             .withValidation(Field::isNonNegativeInteger)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withDescription("The size of a look-ahead buffer used by the binlog reader to decide whether the "
                     + "transaction in progress is going to be committed or rolled back. Use 0 to disable look-ahead "
                     + "buffering. Defaults to " + DEFAULT_BINLOG_BUFFER_SIZE + " (i.e. buffering is disabled.");
+
+    public static final Field BINLOG_METADATA_BASED_SCHEMA = Field.create("binlog.metadata.based.schema")
+            .withDisplayName("Reconstruct streaming schema from binlog metadata")
+            .withType(ConfigDef.Type.BOOLEAN)
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDefault(false)
+            .withValidation(Field::isBoolean)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withDescription("When 'true', the streaming table schema is reconstructed on the fly from the "
+                    + "column metadata carried by binlog TABLE_MAP events instead of from a persisted schema "
+                    + "history topic. This is an opt-in mode that requires the source server to run with "
+                    + "'binlog_row_metadata=FULL' so that column names, types, charsets, enum/set values and the "
+                    + "primary key are present in every TABLE_MAP event. When enabled, no external schema history "
+                    + "topic is created or required. Each captured table must have a primary key available in the "
+                    + "binlog metadata or a matching 'message.key.columns' configuration. Defaults to 'false'.");
 
     public static final Field TOPIC_NAMING_STRATEGY = Field.create("topic.naming.strategy")
             .withDisplayName("Topic naming strategy class")
@@ -450,7 +544,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault(false)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withDescription("Whether the connector should include the original SQL query that generated the change "
                     + "event. Note: This option requires the database to be configured using the server option "
                     + "binlog_rows_query_log_events (MySQL) or binlog_annotate_row_events (MariaDB) set to ON."
@@ -463,36 +557,46 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withEnum(SnapshotMode.class, SnapshotMode.INITIAL)
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withDescription("The criteria for running a snapshot upon startup of the connector. "
                     + "Select one of the following snapshot options: "
                     + "'when_needed': On startup, the connector runs a snapshot if one is needed.; "
                     + "'schema_only': If the connector does not detect any offsets for the logical server name, it runs a snapshot that captures only the schema (table structures), but not any table data. After the snapshot completes, the connector begins to stream changes from the binlog.; "
                     + "'schema_only_recovery': The connector performs a snapshot that captures only the database schema history. The connector then transitions back to streaming. Use this setting to restore a corrupted or lost database schema history topic. Do not use if the database schema was modified after the connector stopped.; "
                     + "'initial' (default): If the connector does not detect any offsets for the logical server name, it runs a snapshot that captures the current full state of the configured tables. After the snapshot completes, the connector begins to stream changes from the binlog.; "
-                    + "'initial_only': The connector performs a snapshot as it does for the 'initial' option, but after the connector completes the snapshot, it stops, and does not stream changes from the binlog.; "
-                    + "'never': The connector does not run a snapshot. Upon first startup, the connector immediately begins reading from the beginning of the binlog. "
-                    + "The 'never' mode should be used with care, and only when the binlog is known to contain all history.");
+                    + "'initial_only': The connector performs a snapshot as it does for the 'initial' option, but after the connector completes the snapshot, it stops, and does not stream changes from the binlog.");
 
     public static final Field TIME_PRECISION_MODE = RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE
             .withDisplayName("The time precision mode to be used")
             .withEnum(TemporalPrecisionMode.class, TemporalPrecisionMode.ADAPTIVE_TIME_MICROSECONDS)
             .withValidation(BinlogConnectorConfig::validateTimePrecisionMode)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 26))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withDescription("Time, date and timestamps can be represented with different kinds of precisions, including: "
                     + "'adaptive_time_microseconds': the precision of date and timestamp values is based the database column's precision; but time fields always use microseconds precision; "
                     + "'connect': always represents time, date and timestamp values using Kafka Connect's built-in representations for Time, Date, and Timestamp, "
-                    + "which uses millisecond precision regardless of the database columns' precision.");
+                    + "which uses millisecond precision regardless of the database columns' precision; "
+                    + "'isostring': represents time, date, and datetime values as ISO-8601 formatted strings at the UTC time zone; "
+                    + "'structured': represents time, date, timestamp, and datetime values as Kafka Connect structs with separate calendar and clock components.");
 
     public static final Field BIGINT_UNSIGNED_HANDLING_MODE = Field.create("bigint.unsigned.handling.mode")
             .withDisplayName("The mode for handling bigint-unsigned values")
             .withEnum(BigIntUnsignedHandlingMode.class, BigIntUnsignedHandlingMode.LONG)
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 27))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withDescription("Specify how BIGINT UNSIGNED columns should be represented in change events, including: "
                     + "'precise' uses java.math.BigDecimal to represent values, which are encoded in the change events using a binary representation and Kafka Connect's 'org.apache.kafka.connect.data.Decimal' type; "
                     + "'long' (the default) represents values using Java's 'long', which may not offer the precision but will be far easier to use in consumers.");
+
+    public static final Field REAL_HANDLING_MODE = Field.create("real.handling.mode")
+            .withDisplayName("The mode for handling REAL values")
+            .withEnum(RealHandlingMode.class, RealHandlingMode.DOUBLE)
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.MEDIUM)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
+            .withDescription("Specify how REAL columns should be represented in change events, including: "
+                    + "'float' represents values using single-precision (32-bit) floating-point values; "
+                    + "'double' (the default) represents values using double-precision (64-bit) floating-point values.");
 
     /**
      * @deprecated Use {@link #EVENT_PROCESSING_FAILURE_HANDLING_MODE} instead, will be removed in Debezium 3.0.
@@ -504,18 +608,30 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withValidation(BinlogConnectorConfig::validateEventDeserializationFailureHandlingModeNotSet)
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 21))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withDescription("Specify how failures during deserialization of binlog events (i.e. when encountering a corrupted event) should be handled, including: "
                     + "'fail' (the default) an exception indicating the problematic event and its binlog position is raised, causing the connector to be stopped; "
                     + "'warn' the problematic event and its binlog position will be logged and the event will be skipped; "
                     + "'ignore' the problematic event will be skipped.");
+
+    public static final Field RESOLVE_LIKE_TABLE_SCHEMA = Field.create("resolve.create.table.like.schema")
+            .withDisplayName("Resolve CREATE TABLE LIKE reference schema")
+            .withType(ConfigDef.Type.BOOLEAN)
+            .withDefault(false)
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.MEDIUM)
+            .withGroup(Field.createGroupEntry(Field.Group.ADVANCED))
+            .withDescription("When a CREATE TABLE ... LIKE statement reference a table " +
+                    "whose schema is not in the internal cache(e.g., excluded by table filters), " +
+                    "automatically fetch the reference table's schema via SHOW CREATE TABLE " +
+                    "and retry DDL parsing. Default: false.");
 
     public static final Field INCONSISTENT_SCHEMA_HANDLING_MODE = Field.create("inconsistent.schema.handling.mode")
             .withDisplayName("Inconsistent schema failure handling")
             .withEnum(EventProcessingFailureHandlingMode.class, EventProcessingFailureHandlingMode.FAIL)
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.ADVANCED, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.ADVANCED))
             .withDescription("Specify how binlog events that belong to a table missing from internal schema representation "
                     + "(i.e. internal representation is not consistent with database) should be handled, including: "
                     + "'fail' (the default) an exception indicating the problematic event and its binlog position is raised, causing the connector to be stopped; "
@@ -528,7 +644,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withDefault(true)
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.LOW)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 22))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withDescription("The database allows the user to insert year value as either 2-digit or 4-digit. "
                     + "In case of two digit the value is automatically mapped into 1970 - 2069."
                     + "false - delegates the implicit conversion to the database; "
@@ -555,7 +671,7 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.HIGH)
             .withDependents(TABLE_INCLUDE_LIST_NAME)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 24));
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR));
 
     /**
      * Specifies the GTID ranges to be excluded.<p></p>
@@ -566,12 +682,12 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
     public static final Field GTID_SOURCE_EXCLUDES = Field.create("gtid.source.excludes")
             .withDisplayName("Exclude GTID sources")
             .withType(ConfigDef.Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 25))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withValidation(BinlogConnectorConfig::validateGtidSetExcludes)
             .withInvisibleRecommender()
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 25));
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR));
 
     /**
      * When set to {@code true}, the connector will produce DML events for transactions that were written by
@@ -584,60 +700,45 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
     public static final Field GTID_SOURCE_FILTER_DML_EVENTS = Field.create("gtid.source.filter.dml.events")
             .withDisplayName("Filter DML events")
             .withType(ConfigDef.Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 23))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withWidth(ConfigDef.Width.SHORT)
             .withImportance(ConfigDef.Importance.MEDIUM)
             .withDefault(true)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR, 23))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
             .withDescription("When set to true, only produce DML events for transactions that were written on the "
                     + "server with matching GTIDs defined by the `gtid.source.includes` or `gtid.source.excludes`, "
                     + "if they were specified.");
+
+    public static final Field IGNORE_GTID_ON_RECOVERY = Field.create("gtid.ignore.on.recovery")
+            .withDisplayName("Ignore GTID on recovery")
+            .withType(ConfigDef.Type.BOOLEAN)
+            .withDefault(false)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 8))
+            .withWidth(ConfigDef.Width.SHORT)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDescription("Whether the connector should ignore GTID during recovery and restart from the binlog file and position instead. "
+                    + "GTID mode on the server remains enabled, and GTID tracking resumes normally after recovery.");
 
     protected static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .excluding(
                     SCHEMA_INCLUDE_LIST,
                     SCHEMA_EXCLUDE_LIST,
                     RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE,
-                    RelationalDatabaseConnectorConfig.TABLE_IGNORE_BUILTIN)
-            .type(
-                    HOSTNAME,
-                    PORT,
-                    USER,
-                    PASSWORD,
-                    QUERY_TIMEOUT_MS,
-                    ON_CONNECT_STATEMENTS,
-                    SERVER_ID,
-                    SERVER_ID_OFFSET,
-                    SSL_KEYSTORE,
-                    SSL_KEYSTORE_PASSWORD,
-                    SSL_TRUSTSTORE,
-                    SSL_TRUSTSTORE_PASSWORD)
-            .connector(
-                    CONNECTION_TIMEOUT_MS,
-                    KEEP_ALIVE,
-                    KEEP_ALIVE_INTERVAL_MS,
-                    USE_NONGRACEFUL_DISCONNECT,
-                    SNAPSHOT_MODE,
-                    SNAPSHOT_QUERY_MODE,
-                    SNAPSHOT_QUERY_MODE_CUSTOM_NAME,
-                    BIGINT_UNSIGNED_HANDLING_MODE,
-                    TIME_PRECISION_MODE,
-                    ENABLE_TIME_ADJUSTER,
-                    SCHEMA_NAME_ADJUSTMENT_MODE,
-                    ROW_COUNT_FOR_STREAMING_RESULT_SETS,
-                    INCREMENTAL_SNAPSHOT_CHUNK_SIZE,
-                    INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES)
-            .events(
-                    INCLUDE_SQL_QUERY,
-                    TABLES_IGNORE_BUILTIN,
-                    DATABASE_INCLUDE_LIST,
-                    DATABASE_EXCLUDE_LIST,
-                    BUFFER_SIZE_FOR_BINLOG_READER,
-                    EVENT_DESERIALIZATION_FAILURE_HANDLING_MODE,
-                    INCONSISTENT_SCHEMA_HANDLING_MODE,
+                    RelationalDatabaseConnectorConfig.TABLE_IGNORE_BUILTIN,
+                    RelationalDatabaseConnectorConfig.DATABASE_NAME)
+            .group(Field.Group.CONNECTION, HOSTNAME, PORT, USER, PASSWORD, QUERY_TIMEOUT_MS, SERVER_ID)
+            .group(Field.Group.CONNECTION_ADVANCED, ON_CONNECT_STATEMENTS, CONNECTION_TIMEOUT_MS, KEEP_ALIVE, KEEP_ALIVE_INTERVAL_MS,
+                    KEEP_ALIVE_MAX_RECONNECT_ATTEMPTS, USE_NONGRACEFUL_DISCONNECT, BINLOG_NET_WRITE_TIMEOUT, BINLOG_NET_READ_TIMEOUT)
+            .group(Field.Group.CONNECTION_ADVANCED_SSL, SSL_KEYSTORE, SSL_KEYSTORE_PASSWORD, SSL_TRUSTSTORE, SSL_TRUSTSTORE_PASSWORD)
+            .group(Field.Group.CONNECTOR, BIGINT_UNSIGNED_HANDLING_MODE, REAL_HANDLING_MODE, TIME_PRECISION_MODE, ENABLE_TIME_ADJUSTER, SCHEMA_NAME_ADJUSTMENT_MODE,
                     GTID_SOURCE_INCLUDES,
-                    GTID_SOURCE_EXCLUDES,
-                    GTID_SOURCE_FILTER_DML_EVENTS)
+                    GTID_SOURCE_EXCLUDES, GTID_SOURCE_FILTER_DML_EVENTS)
+            .group(Field.Group.CONNECTOR_ADVANCED, ROW_COUNT_FOR_STREAMING_RESULT_SETS, BUFFER_SIZE_FOR_BINLOG_READER, INCLUDE_SQL_QUERY, IGNORE_GTID_ON_RECOVERY,
+                    BINLOG_METADATA_BASED_SCHEMA)
+            .group(Field.Group.CONNECTOR_SNAPSHOT, SNAPSHOT_MODE, SNAPSHOT_QUERY_MODE, SNAPSHOT_QUERY_MODE_CUSTOM_NAME, INCREMENTAL_SNAPSHOT_CHUNK_SIZE,
+                    INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES)
+            .group(Field.Group.FILTERS, TABLES_IGNORE_BUILTIN, DATABASE_INCLUDE_LIST, DATABASE_EXCLUDE_LIST)
+            .group(Field.Group.ADVANCED, EVENT_DESERIALIZATION_FAILURE_HANDLING_MODE, INCONSISTENT_SCHEMA_HANDLING_MODE, RESOLVE_LIKE_TABLE_SCHEMA)
             .create();
 
     private final Configuration config;
@@ -646,7 +747,10 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
     private final Duration connectionTimeout;
     private final EventProcessingFailureHandlingMode inconsistentSchemaFailureHandlingMode;
     private final BigIntUnsignedHandlingMode bigIntUnsignedHandlingMode;
+    private final RealHandlingMode realHandlingMode;
     private final boolean readOnlyConnection;
+    private final boolean ignoreGtidOnRecovery;
+    private final boolean resolveLikeTableSchema;
 
     /**
      * Create a binlog-based connector configuration.
@@ -672,6 +776,9 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
         this.connectionTimeout = Duration.ofMillis(config.getLong(CONNECTION_TIMEOUT_MS));
         this.inconsistentSchemaFailureHandlingMode = EventProcessingFailureHandlingMode.parse(config.getString(INCONSISTENT_SCHEMA_HANDLING_MODE));
         this.bigIntUnsignedHandlingMode = BigIntUnsignedHandlingMode.parse(config.getString(BIGINT_UNSIGNED_HANDLING_MODE));
+        this.realHandlingMode = RealHandlingMode.parse(config.getString(REAL_HANDLING_MODE));
+        this.ignoreGtidOnRecovery = config.getBoolean(IGNORE_GTID_ON_RECOVERY);
+        this.resolveLikeTableSchema = config.getBoolean(RESOLVE_LIKE_TABLE_SCHEMA);
     }
 
     @Override
@@ -711,10 +818,24 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
     }
 
     /**
+     * @return whether to resolve CREATE TABLE LIKE reference table schema via JDBC when missing from cache
+     */
+    public boolean isResolveLikeTableSchema() {
+        return resolveLikeTableSchema;
+    }
+
+    /**
      * @return the {@code BIGINT UNSIGNED} handling mode
      */
     public BigIntUnsignedHandlingMode getBigIntUnsignedHandlingMode() {
         return bigIntUnsignedHandlingMode;
+    }
+
+    /**
+     * @return the {@code REAL} handling mode
+     */
+    public RealHandlingMode getRealHandlingMode() {
+        return realHandlingMode;
     }
 
     /**
@@ -776,6 +897,29 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
     }
 
     /**
+     * @return whether the streaming table schema should be reconstructed from binlog TABLE_MAP metadata
+     *         (opt-in, requires {@code binlog_row_metadata=FULL}) instead of from a persisted schema history topic.
+     */
+    public boolean isBinlogMetadataBasedSchema() {
+        return config.getBoolean(BINLOG_METADATA_BASED_SCHEMA);
+    }
+
+    @Override
+    public SchemaHistory getSchemaHistory() {
+        if (!isBinlogMetadataBasedSchema()) {
+            return super.getSchemaHistory();
+        }
+        // In binlog-metadata-based schema mode the streaming schema is reconstructed from TABLE_MAP events,
+        // so no persistent schema history is used. The no-op history satisfies the historized lifecycle
+        // (the snapshot phase runs unchanged) without creating or requiring an external history topic, and
+        // without requiring any schema.history.internal.* connection settings.
+        final SchemaHistory schemaHistory = new BinlogMetadataSchemaHistory();
+        schemaHistory.configure(Configuration.empty(), getHistoryRecordComparator(),
+                SchemaHistoryListener.NOOP, useCatalogBeforeSchema());
+        return schemaHistory;
+    }
+
+    /**
      * @return the number of rows a table needs to stream results rather than read all into memory.
      */
     public long getRowCountForLargeTable() {
@@ -805,6 +949,19 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
      * @return the global transaction identifier set ({@link GtidSet} factory.
      */
     public abstract GtidSetFactory getGtidSetFactory();
+
+    /**
+     * Returns whether the connector should ignore GTID during recovery and fall back to binlog
+     * file/position instead. GTID mode on the server remains enabled; GTID tracking resumes normally
+     * after recovery.
+     *
+     * <p>The default implementation returns the value of {@code gtid.ignore.on.recovery}.
+     *
+     * @return {@code true} if GTID should be ignored on recovery; {@code false} otherwise
+     */
+    public boolean shouldIgnoreGtidOnRecovery() {
+        return ignoreGtidOnRecovery;
+    }
 
     /**
      * @return the SSL connection mode to use
@@ -898,5 +1055,27 @@ public abstract class BinlogConnectorConfig extends HistorizedRelationalDatabase
 
     public boolean usesNonGracefulDisconnect() {
         return config.getBoolean(USE_NONGRACEFUL_DISCONNECT);
+    }
+
+    /**
+     * @return the net_write_timeout in seconds, 0 means use server default
+     */
+    public long getBinlogNetWriteTimeout() {
+        return config.getLong(BINLOG_NET_WRITE_TIMEOUT);
+    }
+
+    /**
+     * @return the net_read_timeout in seconds, 0 means use server default
+     */
+    public long getBinlogNetReadTimeout() {
+        return config.getLong(BINLOG_NET_READ_TIMEOUT);
+    }
+
+    /**
+     * @return the number of consecutive failed reconnect attempts after which the connector fails,
+     *         0 means the keep alive thread reconnects indefinitely
+     */
+    public int getKeepAliveMaxReconnectAttempts() {
+        return config.getInteger(KEEP_ALIVE_MAX_RECONNECT_ATTEMPTS);
     }
 }

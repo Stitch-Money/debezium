@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -16,9 +17,12 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.hibernate.cfg.AgroalSettings;
 import org.hibernate.cfg.AvailableSettings;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,7 +42,7 @@ import io.debezium.sink.naming.CollectionNamingStrategy;
  * @author Chris Cranford
  */
 @Tag("UnitTests")
-public class JdbcSinkConnectorConfigTest {
+public class JdbcSinkConnectorConfigTest extends AbstractBaseJdbcSinkTest {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(JdbcSinkConnectorConfigTest.class);
 
@@ -48,7 +52,7 @@ public class JdbcSinkConnectorConfigTest {
         final Field connectionUserName = JdbcSinkConnectorConfig.CONNECTION_USER_FIELD;
         final Field connectionPassword = JdbcSinkConnectorConfig.CONNECTION_PASSWORD_FIELD;
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(Collections.emptyMap());
+        final JdbcSinkConnectorConfig config = getConfig(Collections.emptyMap());
         assertThat(config.validateAndRecord(List.of(connectionUrl, connectionUserName, connectionPassword), LOGGER::error)).isFalse();
     }
 
@@ -57,20 +61,33 @@ public class JdbcSinkConnectorConfigTest {
         final Map<String, String> properties = new HashMap<>();
         properties.put(JdbcSinkConnectorConfig.INSERT_MODE, "upsert");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.INSERT_MODE_FIELD), LOGGER::error)).isFalse();
         assertThat(config.getInsertMode()).isEqualTo(JdbcSinkConnectorConfig.InsertMode.UPSERT);
     }
 
     @Test
-    public void testNonDefaultDeleteEnabledPropertyWithPrimaryKeyModeNotRecordKey() {
+    public void testNonDefaultDeleteEnabledPropertyWithPrimaryKeyModeNone() {
+        final Map<String, String> properties = new HashMap<>();
+        properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "none");
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+
+        assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.DELETE_ENABLED_FIELD, JdbcSinkConnectorConfig.PRIMARY_KEY_MODE_FIELD), LOGGER::error))
+                .isFalse();
+    }
+
+    @Test
+    public void testNonDefaultDeleteEnabledPropertyWithPrimaryKeyModeRecordValue() {
         final Map<String, String> properties = new HashMap<>();
         properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
         properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_value");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.DELETE_ENABLED_FIELD, JdbcSinkConnectorConfig.PRIMARY_KEY_MODE_FIELD), LOGGER::error))
-                .isFalse();
+                .isTrue();
+        assertThat(config.isDeleteEnabled()).isTrue();
     }
 
     @Test
@@ -79,7 +96,19 @@ public class JdbcSinkConnectorConfigTest {
         properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
         properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_key");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+        assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.DELETE_ENABLED_FIELD, JdbcSinkConnectorConfig.PRIMARY_KEY_MODE_FIELD), LOGGER::error))
+                .isTrue();
+        assertThat(config.isDeleteEnabled()).isTrue();
+    }
+
+    @Test
+    public void testNonDefaultDeleteEnabledPropertyWithPrimaryKeyModeRecordHeader() {
+        final Map<String, String> properties = new HashMap<>();
+        properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_header");
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.DELETE_ENABLED_FIELD, JdbcSinkConnectorConfig.PRIMARY_KEY_MODE_FIELD), LOGGER::error))
                 .isTrue();
         assertThat(config.isDeleteEnabled()).isTrue();
@@ -90,7 +119,7 @@ public class JdbcSinkConnectorConfigTest {
         final Map<String, String> properties = new HashMap<>();
         properties.put(JdbcSinkConnectorConfig.COLLECTION_NAME_FORMAT, "e2e-${topic}");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.COLLECTION_NAME_FORMAT_FIELD), LOGGER::error)).isTrue();
         assertThat(config.getCollectionNameFormat()).isEqualTo("e2e-${topic}");
     }
@@ -100,7 +129,7 @@ public class JdbcSinkConnectorConfigTest {
         final Map<String, String> properties = new HashMap<>();
         properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_value");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE_FIELD), LOGGER::error)).isTrue();
         assertThat(config.getPrimaryKeyMode()).isEqualTo(PrimaryKeyMode.RECORD_VALUE);
     }
@@ -110,7 +139,7 @@ public class JdbcSinkConnectorConfigTest {
         final Map<String, String> properties = new HashMap<>();
         properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_FIELDS, "id,name");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.PRIMARY_KEY_FIELDS_FIELD), LOGGER::error)).isTrue();
         assertThat(config.getPrimaryKeyFields()).contains("id", "name");
     }
@@ -120,7 +149,7 @@ public class JdbcSinkConnectorConfigTest {
         final Map<String, String> properties = new HashMap<>();
         properties.put(JdbcSinkConnectorConfig.SQLSERVER_IDENTITY_INSERT, "true");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.SQLSERVER_IDENTITY_INSERT_FIELD), LOGGER::error)).isTrue();
         assertThat(config.isSqlServerIdentityInsert()).isTrue();
     }
@@ -134,13 +163,78 @@ public class JdbcSinkConnectorConfigTest {
         properties.put(JdbcSinkConnectorConfig.CONNECTION_USER, "user");
         properties.put(JdbcSinkConnectorConfig.CONNECTION_PASSWORD, "pass");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         final Properties ormProperties = config.getHibernateConfiguration().getProperties();
         assertThat(ormProperties).isNotNull();
         assertThat(ormProperties.get(AvailableSettings.CONNECTION_PROVIDER)).isEqualTo("io.debezium.AcmeConnectionProvider");
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_URL)).isEqualTo("jdbc://url");
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_USER)).isEqualTo("user");
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_PASSWORD)).isEqualTo("pass");
+    }
+
+    @Test
+    public void testStarRocksDialectResolverIsRegistered() {
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(connectionProperties());
+        final Properties ormProperties = config.getHibernateConfiguration().getProperties();
+        assertThat(ormProperties.get(AvailableSettings.DIALECT_RESOLVERS))
+                .isEqualTo("io.debezium.connector.jdbc.dialect.starrocks.StarRocksDialectResolver");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2909")
+    public void testSingleStoreGeometryRepairIsOptIn() {
+        final Map<String, String> properties = connectionProperties();
+        assertThat(new JdbcSinkConnectorConfig(properties).isSingleStoreGeometryRepairEnabled()).isFalse();
+
+        properties.put(JdbcSinkConnectorConfig.SINGLESTORE_GEOMETRY_REPAIR_ENABLED, "true");
+        assertThat(new JdbcSinkConnectorConfig(properties).isSingleStoreGeometryRepairEnabled()).isTrue();
+    }
+
+    @Test
+    public void testStarRocksCatalogNameConfiguresInitialSql() {
+        final Map<String, String> properties = connectionProperties();
+        properties.put(JdbcSinkConnectorConfig.STARROCKS_CATALOG_NAME, "external_catalog");
+
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final Properties ormProperties = config.getHibernateConfiguration().getProperties();
+        assertThat(ormProperties.get(AgroalSettings.AGROAL_CONFIG_PREFIX + ".initialSQL")).isEqualTo("SET CATALOG external_catalog");
+
+        final Properties defaultProperties = new JdbcSinkConnectorConfig(connectionProperties()).getHibernateConfiguration().getProperties();
+        assertThat(defaultProperties.get(AgroalSettings.AGROAL_CONFIG_PREFIX + ".initialSQL")).isNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "external_catalog", "_catalog", "Catalog1", "iceberg" })
+    public void testValidStarRocksCatalogNameIsAccepted(String catalogName) {
+        final Map<String, String> properties = connectionProperties();
+        properties.put(JdbcSinkConnectorConfig.STARROCKS_CATALOG_NAME, catalogName);
+
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.STARROCKS_CATALOG_NAME_FIELD), LOGGER::error)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "cat; DROP DATABASE important",
+            "cat`; DROP DATABASE important",
+            "1catalog",
+            "my-catalog",
+            "my catalog",
+            "cat.alog" })
+    public void testInvalidStarRocksCatalogNameIsRejected(String catalogName) {
+        final Map<String, String> properties = connectionProperties();
+        properties.put(JdbcSinkConnectorConfig.STARROCKS_CATALOG_NAME, catalogName);
+
+        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.STARROCKS_CATALOG_NAME_FIELD), LOGGER::error)).isFalse();
+    }
+
+    private static Map<String, String> connectionProperties() {
+        final Map<String, String> properties = new HashMap<>();
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_URL, "jdbc://url");
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_USER, "user");
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_PASSWORD, "pass");
+        return properties;
     }
 
     @Test
@@ -154,13 +248,13 @@ public class JdbcSinkConnectorConfigTest {
         properties.put(JdbcSinkConnectorConfig.INSERT_MODE, "upsert");
         properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, "record_value");
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.INSERT_MODE_FIELD), LOGGER::error)).isTrue();
     }
 
     @Test
     public void testDeprecatedDatabaseTimeZone() {
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(Map.of(JdbcSinkConnectorConfig.DEPRECATED_DATABASE_TIME_ZONE, "CEST"));
+        final JdbcSinkConnectorConfig config = getConfig(Map.of(JdbcSinkConnectorConfig.DEPRECATED_DATABASE_TIME_ZONE, "CEST"));
         AtomicReference<String> errorMessage = new AtomicReference<>();
         LogInterceptor logInterceptor = new LogInterceptor(Field.class.getName());
         assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.USE_TIME_ZONE_FIELD), errorMessage::set)).isTrue();
@@ -174,7 +268,7 @@ public class JdbcSinkConnectorConfigTest {
         var properties = Map.of(
                 JdbcSinkConnectorConfig.DEPRECATED_TABLE_NAMING_STRATEGY, DefaultTableNamingStrategy.class.getName(),
                 JdbcSinkConnectorConfig.DEPRECATED_TABLE_NAME_FORMAT, "kafkadepdep_${topic}");
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
 
         AtomicReference<String> errorMessage = new AtomicReference<>();
         LogInterceptor logInterceptor = new LogInterceptor(Field.class.getName());
@@ -188,7 +282,7 @@ public class JdbcSinkConnectorConfigTest {
         // testing the proxy
         TemporaryBackwardCompatibleCollectionNamingStrategyProxy collectionNamingStrategyProxy = (TemporaryBackwardCompatibleCollectionNamingStrategyProxy) config
                 .getCollectionNamingStrategy();
-        assertThat(collectionNamingStrategyProxy.resolveCollectionName(new DebeziumSinkRecordFactory().createRecord("database.schema.deptable"),
+        assertThat(collectionNamingStrategyProxy.resolveCollectionName(new DebeziumSinkRecordFactory().createRecord("database.schema.deptable", config),
                 config.getCollectionNameFormat()))
                 .isEqualTo("kafkadepdep_database_schema_deptable");
 
@@ -197,7 +291,7 @@ public class JdbcSinkConnectorConfigTest {
         assertThat(originalCollectionNamingStrategy).isInstanceOf(CollectionNamingStrategy.class);
         assertThat(
                 originalCollectionNamingStrategy.resolveCollectionName(
-                        new DebeziumSinkRecordFactory().createRecord("database.schema.deptable"),
+                        new DebeziumSinkRecordFactory().createRecord("database.schema.deptable", config),
                         config.getCollectionNameFormat()))
                 .isEqualTo("kafkadepdep_database_schema_deptable");
 
@@ -206,7 +300,8 @@ public class JdbcSinkConnectorConfigTest {
         final TableNamingStrategy tableNamingStrategy;
         if (originalCollectionNamingStrategy instanceof TableNamingStrategy) {
             tableNamingStrategy = (TableNamingStrategy) originalCollectionNamingStrategy;
-            assertThat(tableNamingStrategy.resolveTableName(config, new DebeziumSinkRecordFactory().createRecord("database.schema.deptable").getOriginalKafkaRecord()))
+            assertThat(tableNamingStrategy.resolveTableName(config,
+                    new DebeziumSinkRecordFactory().createRecord("database.schema.deptable", config).getOriginalKafkaRecord()))
                     .isEqualTo("kafkadepdep_database_schema_deptable");
         }
         else {
@@ -223,7 +318,7 @@ public class JdbcSinkConnectorConfigTest {
         properties.put(JdbcSinkConnectorConfig.CONNECTION_USER, "user");
         properties.put(JdbcSinkConnectorConfig.CONNECTION_PASSWORD, ""); // Empty password
 
-        final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+        final JdbcSinkConnectorConfig config = getConfig(properties);
         final Properties ormProperties = config.getHibernateConfiguration().getProperties();
         assertThat(ormProperties).isNotNull();
         assertThat(ormProperties.get(AvailableSettings.CONNECTION_PROVIDER)).isEqualTo("io.debezium.AcmeConnectionProvider");
@@ -232,12 +327,35 @@ public class JdbcSinkConnectorConfigTest {
         assertThat(ormProperties.get(AvailableSettings.JAKARTA_JDBC_PASSWORD)).isNull(); // Password should be null
     }
 
+    @Test
+    @FixFor("debezium/dbz#2950")
+    public void testDefaultConnectionPoolTimeoutIsInSeconds() {
+        final JdbcSinkConnectorConfig config = getConfig(connectionProperties());
+
+        final String timeout = config.getHibernateConfiguration().getProperty(AvailableSettings.AGROAL_IDLE_TIMEOUT);
+
+        assertThat(Duration.parse(timeout)).isEqualTo(Duration.ofSeconds(1800));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2950")
+    public void testConfiguredConnectionPoolTimeoutIsInSeconds() {
+        final Map<String, String> properties = connectionProperties();
+        properties.put(JdbcSinkConnectorConfig.CONNECTION_POOL_TIMEOUT, "60");
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+
+        final String timeout = config.getHibernateConfiguration().getProperty(AvailableSettings.AGROAL_IDLE_TIMEOUT);
+
+        assertThat(Duration.parse(timeout)).isEqualTo(Duration.ofSeconds(60));
+    }
+
     // @Test
     // public void testNonDefaultSchemaEvolutionProperty() {
     // final Map<String, String> properties = new HashMap<>();
     // properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, "advanced");
     //
-    // final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+    // final JdbcSinkConnectorConfig config = getConfig(properties);
     // assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION_FIELD), LOGGER::error)).isTrue();
     // assertThat(config.getSchemaEvolutionMode()).isEqualTo(SchemaEvolutionMode.ADVANCED);
     // }
@@ -247,7 +365,7 @@ public class JdbcSinkConnectorConfigTest {
     // final Map<String, String> properties = new HashMap<>();
     // properties.put(JdbcSinkConnectorConfig.DATA_TYPE_MAPPING, "table.column:GEOMETRY,table.column2:INT");
     //
-    // final JdbcSinkConnectorConfig config = new JdbcSinkConnectorConfig(properties);
+    // final JdbcSinkConnectorConfig config = getConfig(properties);
     // assertThat(config.validateAndRecord(List.of(JdbcSinkConnectorConfig.DATA_TYPE_MAPPING_FIELD), LOGGER::error)).isTrue();
     // assertThat(config.getDataTypeMapping()).contains("table.column:GEOMETRY", "table.column2:INT");
     // }

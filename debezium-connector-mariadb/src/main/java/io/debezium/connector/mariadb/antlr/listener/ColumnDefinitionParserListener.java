@@ -75,7 +75,7 @@ public class ColumnDefinitionParserListener extends MariaDBParserBaseListener {
         optionalColumn = new AtomicReference<>();
         resolveColumnDataType(ctx.dataType());
         parser.runIfNotNull(() -> {
-            defaultValueListener = new DefaultValueParserListener(columnEditor, optionalColumn);
+            defaultValueListener = new DefaultValueParserListener(columnEditor, optionalColumn, parser);
             listeners.add(defaultValueListener);
         }, tableEditor);
         super.enterColumnDefinition(ctx);
@@ -85,6 +85,11 @@ public class ColumnDefinitionParserListener extends MariaDBParserBaseListener {
     public void exitColumnDefinition(MariaDBParser.ColumnDefinitionContext ctx) {
         if (optionalColumn.get() != null) {
             columnEditor.optional(optionalColumn.get().booleanValue());
+        }
+        else {
+            // MariaDB default behavior: columns are nullable unless explicitly marked NOT NULL
+            // This handles implicit nullability in DDL like: ALTER TABLE ... CHANGE col col DATE DEFAULT NULL
+            columnEditor.optional(true);
         }
         if (uniqueColumn && !tableEditor.hasPrimaryKey()) {
             // take the first unique constrain if no primary key is set
@@ -128,6 +133,15 @@ public class ColumnDefinitionParserListener extends MariaDBParserBaseListener {
     public void enterNullNotnull(MariaDBParser.NullNotnullContext ctx) {
         optionalColumn.set(Boolean.valueOf(ctx.NOT() == null));
         super.enterNullNotnull(ctx);
+    }
+
+    @Override
+    public void enterCollateColumnConstraint(MariaDBParser.CollateColumnConstraintContext ctx) {
+        String charsetName = parser.extractCharset(null, ctx.collationName());
+        if (charsetName != null) {
+            columnEditor.charsetName(charsetName);
+        }
+        super.enterCollateColumnConstraint(ctx);
     }
 
     @Override
@@ -246,6 +260,7 @@ public class ColumnDefinitionParserListener extends MariaDBParserBaseListener {
 
             List<String> collectionOptions = collectionDataTypeContext.collectionOptions().collectionOption().stream()
                     .map(AntlrDdlParser::getText)
+                    .map(parser::normalizeStringLiteral)
                     .collect(Collectors.toList());
 
             columnEditor.type(dataTypeName);

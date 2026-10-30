@@ -22,6 +22,7 @@ import io.debezium.connector.binlog.converters.TinyIntOneToBooleanConverter;
 import io.debezium.connector.binlog.util.BinlogTestConnection;
 import io.debezium.connector.binlog.util.TestHelper;
 import io.debezium.connector.binlog.util.UniqueDatabase;
+import io.debezium.doc.FixFor;
 import io.debezium.jdbc.JdbcConnection;
 
 /**
@@ -31,6 +32,7 @@ public abstract class BinlogNonUtfDatabaseCharsetIT<C extends SourceConnector> e
 
     private static final Path SCHEMA_HISTORY_PATH = Files.createTestingPath("file-schema-history-connect.txt").toAbsolutePath();
     private final UniqueDatabase DATABASE = TestHelper.getUniqueDatabase("myServer1", "db_default_charset_noutf", "latin2")
+            .withBinlogMetadataKeyColumns("$DBNAME$\\.(DATA|DATASTREAM):MESSAGE")
             .withDbHistoryPath(SCHEMA_HISTORY_PATH);
 
     private Configuration config;
@@ -67,7 +69,7 @@ public abstract class BinlogNonUtfDatabaseCharsetIT<C extends SourceConnector> e
         final SourceRecord record = records.recordsForTopic(DATABASE.topicForTable("DATA")).get(0);
 
         assertThat(((Struct) record.value()).getStruct("after").getString("MESSAGE")).isEqualTo("Žluťoučký");
-        assertThat(((Struct) record.value()).getStruct("after").getInt16("FLAG")).isEqualTo((short) 1);
+        assertThat(((Struct) record.value()).getStruct("after").getInt8("FLAG")).isEqualTo((byte) 1);
 
         try (BinlogTestConnection db = getTestDatabaseConnection(DATABASE.getDatabaseName());) {
             try (JdbcConnection connection = db.connect()) {
@@ -80,7 +82,7 @@ public abstract class BinlogNonUtfDatabaseCharsetIT<C extends SourceConnector> e
         final SourceRecord recordStream = records.recordsForTopic(DATABASE.topicForTable("DATASTREAM")).get(0);
 
         assertThat(((Struct) recordStream.value()).getStruct("after").getString("MESSAGE")).isEqualTo("Žluťoučký");
-        assertThat(((Struct) record.value()).getStruct("after").getInt16("FLAG")).isEqualTo((short) 1);
+        assertThat(((Struct) record.value()).getStruct("after").getInt8("FLAG")).isEqualTo((byte) 1);
     }
 
     @Test
@@ -114,5 +116,43 @@ public abstract class BinlogNonUtfDatabaseCharsetIT<C extends SourceConnector> e
 
         assertThat(((Struct) recordStream.value()).getStruct("after").getString("MESSAGE")).isEqualTo("Žluťoučký");
         assertThat(((Struct) record.value()).getStruct("after").getBoolean("FLAG")).isEqualTo(true);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#373")
+    void shouldDecodeColumnAddedAfterTableDefaultCharsetChange() throws InterruptedException, SQLException {
+        assertColumnAddedAfterTableOptionIsDecoded("DEFAULT CHARACTER SET utf8mb4");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#373")
+    void shouldDecodeColumnAddedAfterTableCollationChange() throws InterruptedException, SQLException {
+        assertColumnAddedAfterTableOptionIsDecoded("COLLATE utf8mb4_bin");
+    }
+
+    private void assertColumnAddedAfterTableOptionIsDecoded(String tableOption) throws InterruptedException, SQLException {
+        config = DATABASE.defaultConfig()
+                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
+                .with(BinlogConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DATA") + "," + DATABASE.qualifiedTableName("DATASTREAM"))
+                .build();
+        start(getConnectorClass(), config);
+        consumeRecordsByTopic(7);
+
+        try (BinlogTestConnection db = getTestDatabaseConnection(DATABASE.getDatabaseName())) {
+            try (JdbcConnection connection = db.connect()) {
+                connection.execute("CREATE TABLE DATASTREAM (MESSAGE TEXT, FLAG TINYINT(1));");
+                connection.execute("ALTER TABLE DATASTREAM " + tableOption + ";");
+                connection.execute("ALTER TABLE DATASTREAM ADD COLUMN NOTE VARCHAR(20);");
+                connection.execute("INSERT INTO DATASTREAM VALUES ('Žluťoučký', 1, '한글😀');");
+            }
+        }
+
+        // CREATE TABLE, both ALTER TABLE statements, and the INSERT
+        final SourceRecords records = consumeRecordsByTopic(4);
+        final Struct after = ((Struct) records.recordsForTopic(DATABASE.topicForTable("DATASTREAM")).get(0).value()).getStruct("after");
+
+        // The existing column keeps the database charset (latin2), while the added column uses the new table default (utf8mb4)
+        assertThat(after.getString("MESSAGE")).isEqualTo("Žluťoučký");
+        assertThat(after.getString("NOTE")).isEqualTo("한글😀");
     }
 }

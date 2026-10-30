@@ -7,12 +7,14 @@ package io.debezium.embedded.async;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Future;
 
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.embedded.async.AbstractRecordProcessor.BatchProcessor.ObservableProcessor;
 import io.debezium.engine.DebeziumEngine;
 
 /**
@@ -24,12 +26,12 @@ import io.debezium.engine.DebeziumEngine;
 public class ParallelSmtBatchProcessor extends AbstractRecordProcessor<SourceRecord> {
     private static final Logger LOGGER = LoggerFactory.getLogger(ParallelSmtBatchProcessor.class);
 
-    final DebeziumEngine.RecordCommitter committer;
-    final DebeziumEngine.ChangeConsumer<SourceRecord> userHandler;
+    private final DebeziumEngine.RecordCommitter<SourceRecord> committer;
+    private final BatchProcessor<SourceRecord> processor;
 
-    ParallelSmtBatchProcessor(final DebeziumEngine.RecordCommitter committer, final DebeziumEngine.ChangeConsumer<SourceRecord> userHandler) {
+    public ParallelSmtBatchProcessor(DebeziumEngine.RecordCommitter<SourceRecord> committer, BatchProcessor<SourceRecord> processor) {
         this.committer = committer;
-        this.userHandler = userHandler;
+        this.processor = processor;
     }
 
     @Override
@@ -41,13 +43,30 @@ public class ParallelSmtBatchProcessor extends AbstractRecordProcessor<SourceRec
         LOGGER.trace("Thread {} is getting source records.", Thread.currentThread().getName());
         final List<SourceRecord> transformedRecords = new ArrayList<>(recordFutures.size());
         for (Future<SourceRecord> f : recordFutures) {
-            SourceRecord record = f.get(); // we need the whole batch, eventually wait forever
-            if (record != null) {
-                transformedRecords.add(record);
-            }
+            transformedRecords.add(f.get()); // we need the whole batch, eventually wait forever
         }
 
-        LOGGER.trace("Calling user handler.");
-        userHandler.handleBatch(transformedRecords, committer);
+        processBatch(processor, records, transformedRecords, committer, committer);
+    }
+
+    public static <R> ParallelSmtBatchProcessor create(DebeziumEngine.RecordCommitter<SourceRecord> committer,
+                                                       final DebeziumEngine.ChangeConsumer<R> userHandler,
+                                                       Watcher watcher,
+                                                       DebeziumEngine.Shutdown<R> shutdown,
+                                                       Runnable runner,
+                                                       Map<String, String> configuration) {
+
+        if (shutdown == null) {
+            return new ParallelSmtBatchProcessor(committer, new BatchProcessor.DirectProcessor(userHandler));
+        }
+
+        return new ParallelSmtBatchProcessor(
+                committer,
+                new ObservableProcessor(
+                        watcher,
+                        new ShutdownChangeConsumer<>(
+                                (ShutdownHandler<SourceRecord>) DefaultShutdownHandler.create(shutdown.before(), runner, committer, configuration),
+                                (ShutdownHandler<SourceRecord>) DefaultShutdownHandler.create(shutdown.after(), runner, committer, configuration),
+                                (DebeziumEngine.ChangeConsumer<SourceRecord>) userHandler, watcher)));
     }
 }

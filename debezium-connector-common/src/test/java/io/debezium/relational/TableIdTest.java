@@ -1,0 +1,152 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.relational;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import org.junit.jupiter.api.Test;
+
+import io.debezium.doc.FixFor;
+
+public class TableIdTest {
+
+    @Test
+    @FixFor("DBZ-3057")
+    public void shouldDoubleQuoteTableId() {
+        // Non-quoted table-id
+        TableId id = new TableId("catalog", "schema", "table");
+
+        TableId doubleQuoted = id.toDoubleQuoted();
+        assertThat(doubleQuoted.catalog()).isEqualTo("\"catalog\"");
+        assertThat(doubleQuoted.schema()).isEqualTo("\"schema\"");
+        assertThat(doubleQuoted.table()).isEqualTo("\"table\"");
+        assertThat(doubleQuoted.toString()).isEqualTo("\"catalog\".\"schema\".\"table\"");
+        assertThat(doubleQuoted.toDoubleQuotedString()).isEqualTo("\"catalog\".\"schema\".\"table\"");
+
+        // Quoted table-id
+        id = new TableId("\"catalog\"", "\"schema\"", "\"table\"");
+
+        doubleQuoted = id.toDoubleQuoted();
+        assertThat(doubleQuoted).isEqualTo(id);
+    }
+
+    @Test
+    @FixFor("DBZ-3057")
+    public void shouldQuoteTableIdWithGivenCharacter() {
+        // Non-quoted quoted table-id
+        TableId id = new TableId("catalog", "schema", "table");
+
+        TableId quoted = id.toQuoted('\'', '\'');
+        assertThat(quoted.catalog()).isEqualTo("'catalog'");
+        assertThat(quoted.schema()).isEqualTo("'schema'");
+        assertThat(quoted.table()).isEqualTo("'table'");
+        assertThat(quoted.toString()).isEqualTo("'catalog'.'schema'.'table'");
+        assertThat(quoted.toDoubleQuotedString()).isEqualTo("\"'catalog'\".\"'schema'\".\"'table'\"");
+
+        // Quoted table-id
+        id = new TableId("'catalog'", "'schema'", "'table'");
+
+        quoted = id.toQuoted('\'', '\'');
+        assertThat(quoted).isEqualTo(id);
+    }
+
+    @Test
+    public void shouldQuoteTableIdWithBracket() {
+        // Non-quoted quoted table-id
+        TableId id = new TableId("cata log", "sch ema", "ta b$le");
+
+        TableId quoted = id.toBracketQuoted();
+        assertThat(quoted.catalog()).isEqualTo("[cata log]");
+        assertThat(quoted.schema()).isEqualTo("[sch ema]");
+        assertThat(quoted.table()).isEqualTo("[ta b$le]");
+        assertThat(quoted.toString()).isEqualTo("[cata log].[sch ema].[ta b$le]");
+        assertThat(quoted.toDoubleQuotedString()).isEqualTo("\"[cata log]\".\"[sch ema]\".\"[ta "
+                + "b$le]\"");
+
+        // Quoted table-id
+        id = new TableId("[cata log]", "[sch ema]", "[ta b$le]");
+
+        quoted = id.toBracketQuoted();
+        assertThat(quoted).isEqualTo(id);
+    }
+
+    @Test
+    public void shouldQuoteTableWithApostrophe() {
+        TableId id = new TableId("special_characters_test_1vxxglz", "", "special\"[`]$']");
+
+        String quoted = id.toQuotedString('`');
+
+        assertThat(quoted).isEqualTo("`special_characters_test_1vxxglz`.`special\"[``]$']`");
+
+        // Quoted table-id
+        id = new TableId("`special_characters_test_1vxxglz`", "", "`special\"[``]$']`");
+
+        quoted = id.toQuotedString('`');
+        assertThat(quoted).isEqualTo(id.toString());
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1377")
+    public void shouldParseBackDoubleQuotedTableId() {
+        for (String tableName : new String[]{ "test''dd", "tab\"le", "a``b" }) {
+            TableId id = new TableId(null, "test_dd", tableName);
+            assertThat(TableId.parse(id.toDoubleQuotedString(), false)).isEqualTo(id);
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2841")
+    public void shouldParseBracketDelimitedTableId() {
+        TableIdPredicates predicates = new TableIdPredicates() {
+            @Override
+            public boolean isStartDelimiter(char c) {
+                return c == '[';
+            }
+
+            @Override
+            public boolean isEndDelimiter(char c) {
+                return c == ']';
+            }
+        };
+
+        TableId id = TableId.parse("[schema].[tab]]le]", false, predicates);
+        assertThat(id).isEqualTo(new TableId(null, "schema", "tab]le"));
+
+        TableId id2 = TableId.parse("[schema].[table]]]", false, predicates);
+        assertThat(id2).isEqualTo(new TableId(null, "schema", "table]"));
+
+        TableId id3 = TableId.parse("[db].[schema].[table]]]", false, predicates);
+        assertThat(id3).isEqualTo(new TableId("db", "schema", "table]"));
+
+        TableId id4 = new TableId(null, "schema", "tab]le");
+        assertThat(TableId.parse(id4.toBracketQuoted().toString(), false, predicates)).isEqualTo(id4);
+
+        TableId id5 = new TableId("db", "sch]ema", "tab]le");
+        assertThat(TableId.parse(id5.toBracketQuoted().toString(), false, predicates)).isEqualTo(id5);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2828")
+    public void shouldQuoteIdentifierPartStartingOrEndingWithQuoteChar() {
+        TableId trailingQuote = new TableId(null, "schema", "table\"");
+        assertThat(trailingQuote.toDoubleQuoted().table()).isEqualTo("\"table\"\"\"");
+        assertThat(trailingQuote.toDoubleQuotedString()).isEqualTo("\"schema\".\"table\"\"\"");
+
+        TableId leadingQuote = new TableId(null, "schema", "\"table");
+        assertThat(leadingQuote.toDoubleQuoted().table()).isEqualTo("\"\"\"table\"");
+        assertThat(leadingQuote.toDoubleQuotedString()).isEqualTo("\"schema\".\"\"\"table\"");
+
+        TableId singleQuote = new TableId(null, "schema", "\"");
+        assertThat(singleQuote.toDoubleQuoted().table()).isEqualTo("\"\"\"\"");
+        assertThat(singleQuote.toDoubleQuotedString()).isEqualTo("\"schema\".\"\"\"\"");
+
+        TableId bracketLeading = new TableId(null, "schema", "[table");
+        assertThat(bracketLeading.toBracketQuoted().table()).isEqualTo("[[table]");
+
+        TableId bracketTrailing = new TableId(null, "schema", "table]");
+        assertThat(bracketTrailing.toBracketQuoted().table()).isEqualTo("[table]]]");
+    }
+}

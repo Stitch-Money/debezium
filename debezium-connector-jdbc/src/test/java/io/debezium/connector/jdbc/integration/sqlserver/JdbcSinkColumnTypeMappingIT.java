@@ -11,12 +11,14 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
-import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
+import io.debezium.connector.jdbc.JdbcKafkaSinkRecord;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
 import io.debezium.connector.jdbc.integration.AbstractJdbcSinkTest;
 import io.debezium.connector.jdbc.junit.jupiter.Sink;
@@ -60,12 +62,14 @@ public class JdbcSinkColumnTypeMappingIT extends AbstractJdbcSinkTest {
         buffer.put((byte) 2);
         buffer.put((byte) 3);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecordWithSchemaValue(
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecordWithSchemaValue(
                 topicName,
                 (byte) 1,
                 "data",
                 Schema.OPTIONAL_BYTES_SCHEMA,
-                buffer);
+                buffer,
+                config);
 
         final String destinationTable = destinationTableName(createRecord);
         final String sql = "CREATE TABLE %s (id int not null, data varbinary(3),primary key(id))";
@@ -79,4 +83,43 @@ public class JdbcSinkColumnTypeMappingIT extends AbstractJdbcSinkTest {
             return null;
         });
     }
+
+    @ParameterizedTest
+    @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
+    @FixFor("debezium/dbz#2573")
+    public void testShouldWorkWithStructAsJsonText(SinkRecordFactory factory) throws Exception {
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, JdbcSinkConnectorConfig.SchemaEvolutionMode.BASIC.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, JdbcSinkConnectorConfig.PrimaryKeyMode.RECORD_KEY.getValue());
+        properties.put(JdbcSinkConnectorConfig.INSERT_MODE, JdbcSinkConnectorConfig.InsertMode.UPSERT.getValue());
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+
+        final String tableName = randomTableName();
+        final String topicName = topicName("server2", "schema", tableName);
+        final Schema structSchema = SchemaBuilder.struct()
+                .field("sku", Schema.STRING_SCHEMA)
+                .field("quantity", Schema.INT32_SCHEMA)
+                .optional()
+                .build();
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecordWithSchemaValue(
+                topicName,
+                (byte) 1,
+                "data",
+                structSchema,
+                new Struct(structSchema).put("sku", "A").put("quantity", 1),
+                config);
+
+        final String destinationTable = destinationTableName(createRecord);
+        consume(createRecord);
+
+        getSink().assertRows(destinationTable, rs -> {
+            assertThat(rs.getInt(1)).isEqualTo(1);
+            assertThat(rs.getString(2)).isEqualTo("{\"sku\":\"A\",\"quantity\":1}");
+            return null;
+        });
+    }
+
 }

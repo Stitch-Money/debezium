@@ -1,0 +1,551 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.transforms;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
+
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.junit.jupiter.api.Test;
+
+import io.debezium.data.Envelope;
+import io.debezium.data.geometry.Geometry;
+import io.debezium.doc.FixFor;
+import io.debezium.util.HexConverter;
+
+/**
+ * Unit test for the {@link GeometryFormatTransformer} transformation for Point, LineString, Polygon and MultiPoint geometries.
+ *
+ */
+public class GeometryFormatTransformerTest {
+
+    private static final Schema SOURCE_SCHEMA = SchemaBuilder.struct().optional()
+            .field("table", Schema.STRING_SCHEMA)
+            .field("lsn", Schema.INT32_SCHEMA)
+            .field("ts_ms", SchemaBuilder.OPTIONAL_INT32_SCHEMA)
+            .build();
+    private static final Schema RECORD_SCHEMA = SchemaBuilder.struct().optional()
+            .field("id", Schema.INT8_SCHEMA)
+            .field("geo", Geometry.schema())
+            .build();
+    private static final String POINT_GEO_WKB_HEX = "010100000000000000000020400000000000003340";
+    private static final String POINT_GEO_EWKB_HEX = "0101000020e610000000000000000020400000000000003340";
+    private static final String LINE_STRING_GEO_WKB_HEX = "0102000000030000000000000000003e40000000000000244000000000000024400000000000003e4000000000000044400000000000004440";
+    private static final String LINE_STRING_GEO_EWKB_HEX = "0102000020e6100000030000000000000000003e40000000000000244000000000000024400000000000003e4000000000000044400000000000004440";
+    private static final String POLYGON_GEO_WKB_HEX = "010300000001000000050000000000000000003e4000000000000024400000000000004440000000" +
+            "000000444000000000000034400000000000004440000000000000244000000000000034400000000000003e400000000000002440";
+    private static final String POLYGON_GEO_EWKB_HEX = "0103000020e610000001000000050000000000000000003e400000000000002440000000000000444000000000000044400000000000003440000000000000"
+            +
+            "4440000000000000244000000000000034400000000000003e400000000000002440";
+    private static final String POLYGON_MULTIPLE_RINGS_GEO_WKB_HEX = "01030000000200000005000000000000000080414000000000000024400000000000804640000000" +
+            "00008046400000000000002e40000000000000444000000000000024400000000000003440000000000080414000000000000024400400000000000000000034400000000000003e4000000000008041"
+            +
+            "4000000000008041400000000000003e40000000000000344000000000000034400000000000003e40";
+    private static final String POLYGON_MULTIPLE_RINGS_GEO_EWKB_HEX = "0103000020e6100000020000000500000000000000008041400000000000002440000000000080464000000000008046400000000000002e4"
+            +
+            "0000000000000444000000000000024400000000000003440000000000080414000000000000024400400000000000000000034400000000000003e40000000000080414000000000008041400000000000003e40000000000000344000000000000034400000000000003e40";
+    private static final String MULTI_POINT_GEO_WKB_HEX = "01040000000400000001010000000000000000002440000000000000444001010000000000000000" +
+            "0044400000000000003e4001010000000000000000003440000000000000344001010000000000000000003e400000000000002440";
+    private static final String MULTI_POINT_GEO_EWKB_HEX = "0104000020e610000004000000010100000000000000000024400000000000004440010100000000000000000044400000000000003e400101000000000000000000"
+            +
+            "3440000000000000344001010000000000000000003e400000000000002440";
+    private static final String MULTI_LINE_STRING_GEO_WKB_HEX = "0105000000020000000102000000030000000000000000002440000000000000244000000000000034400000000000003440000000000000244000000000000044400102000000040000000000000000"
+            +
+            "00444000000000000044400000000000003e400000000000003e40000000000000444000000000000034400000000000003e400000000000002440";
+    private static final String MULTI_LINE_STRING_GEO_EWKB_HEX = "0105000020e610000002000000010200000003000000000000000000244000000000000024400000000000003440000000000000344000000000000024400000000000004440010200000004000000000000000000"
+            +
+            "444000000000000044400000000000003e400000000000003e40000000000000444000000000000034400000000000003e400000000000002440";
+    private static final String GEOMETRY_COLLECTION_WKB_HEX = "0107000000070000000101000000000000000000204000000000000033400102000000030000000000000000003e40000000000000244000000000000024400000000000003e40000000000000444000"
+            +
+            "00000000004440010300000001000000050000000000000000003e4000000000000024400000000000004440000000000000444000000000000034400000000000004440000000000000244000000000000034400000000000003e4000000000000024400103000000020000000500000000000000008041"
+            +
+            "400000000000002440000000000080464000000000008046400000000000002e40000000000000444000000000000024400000000000003440000000000080414000000000000024400400000000000000000034400000000000003e40000000000080414000000000008041400000000000003e400000000"
+            +
+            "00000344000000000000034400000000000003e40010400000004000000010100000000000000000024400000000000004440010100000000000000000044400000000000003e4001010000000000000000003440000000000000344001010000000000000000003e4000000000000024400105000000020000"
+            +
+            "00010200000003000000000000000000244000000000000024400000000000003440000000000000344000000000000024400000000000004440010200000004000000000000000000444000000000000044400000000000003e400000000000003e40000000000000444000000000000034400000000000003e4"
+            +
+            "0000000000000244001060000000200000001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003e400000000000004440000000000000444001030000000200000006000000000000000000344000000000008041400"
+            +
+            "0000000000024400000000000003e40000000000000244000000000000024400000000000003e4000000000000014400000000000804640000000000000344000000000000034400000000000804140040000000000000000003e40000000000000344000000000000034400000000000002e40000000000000344000000000000039400000000000003e400000000000003440";
+    private static final String GEOMETRY_COLLECTION_EWKB_HEX = "0107000020e6100000070000000101000000000000000000204000000000000033400102000000030000000000000000003e40000000000000244000000000000024400000000000003e4000000000000044400000000000004440010300000001"
+            +
+            "000000050000000000000000003e4000000000000024400000000000004440000000000000444000000000000034400000000000004440000000000000244000000000000034400000000000003e4000000000000024400103000000020000000500000000000000008041400000000000002440000000000080464"
+            +
+            "000000000008046400000000000002e40000000000000444000000000000024400000000000003440000000000080414000000000000024400400000000000000000034400000000000003e40000000000080414000000000008041400000000000003e40000000000000344000000000000034400000000000003e4"
+            +
+            "0010400000004000000010100000000000000000024400000000000004440010100000000000000000044400000000000003e4001010000000000000000003440000000000000344001010000000000000000003e4000000000000024400105000000020000000102000000030000000000000000002440000000000000"
+            +
+            "24400000000000003440000000000000344000000000000024400000000000004440010200000004000000000000000000444000000000000044400000000000003e400000000000003e40000000000000444000000000000034400000000000003e40000000000000244001060000000200000001030000000100000004"
+            +
+            "000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003e4000000000000044400000000000004440010300000002000000060000000000000000003440000000000080414000000000000024400000000000003e400000000000002440000000000000244"
+            +
+            "00000000000003e4000000000000014400000000000804640000000000000344000000000000034400000000000804140040000000000000000003e40000000000000344000000000000034400000000000002e40000000000000344000000000000039400000000000003e400000000000003440";
+    private static final String MULTI_POLYGON_GEO_WKB_HEX = "01060000000200000001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003e4000000000000044400000"
+            +
+            "000000004440010300000002000000060000000000000000003440000000000080414000000000000024400000000000003e40000000000000244000000000000024400000000000003e4000000000000014400000000000804640000000000000344000000000000034400000000000804140040000000000000000003e4"
+            +
+            "0000000000000344000000000000034400000000000002e40000000000000344000000000000039400000000000003e400000000000003440";
+    private static final String MULTI_POLYGON_GEO_EWKB_HEX = "0106000020e61000000200000001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003e4000000000000044400000000000004440010300000002000000060000000"
+            +
+            "000000000003440000000000080414000000000000024400000000000003e40000000000000244000000000000024400000000000003e4000000000000014400000000000804640000000000000344000000000000034400000000000804140040000000000000000003e4000000000000034400000000000003440000000000000"
+            +
+            "2e40000000000000344000000000000039400000000000003e400000000000003440";
+    private static final String EMPTY_GEOMETRY_WKB_HEX = "010700000000000000";
+    private static final String EMPTY_GEOMETRY_EWKB_HEX = "0107000020e610000000000000";
+
+    private final GeometryFormatTransformer<SourceRecord> geometryFormatTransformer = new GeometryFormatTransformer<>();
+
+    /**
+     * Test transforming Point geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformPointGeometryWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, POINT_GEO_WKB_HEX, POINT_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", POINT_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming Point geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformPointGeometryEwkbToWkb() {
+
+        assertFormatTransformation(null, 4326, POINT_GEO_EWKB_HEX, POINT_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming LineString geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformLineStringWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, LINE_STRING_GEO_WKB_HEX, LINE_STRING_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", LINE_STRING_GEO_WKB_HEX);
+    }
+
+    /**
+     * Test transforming LineString geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformLineStringEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, LINE_STRING_GEO_EWKB_HEX, LINE_STRING_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming Polygon geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformPolygonWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, POLYGON_GEO_WKB_HEX, POLYGON_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", POLYGON_GEO_WKB_HEX);
+    }
+
+    /**
+     * Test transforming Polygon geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformPolygonEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, POLYGON_GEO_EWKB_HEX, POLYGON_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming MultiPolygon geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformMultiPolygonWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, MULTI_POLYGON_GEO_WKB_HEX, MULTI_POLYGON_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", MULTI_POLYGON_GEO_WKB_HEX);
+    }
+
+    /**
+     * Test transforming MultiPolygon geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformMultiPolygonEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, MULTI_POLYGON_GEO_EWKB_HEX, MULTI_POLYGON_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming Polygon with multiple rings geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformPolygonWithMultipleRingsWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, POLYGON_MULTIPLE_RINGS_GEO_WKB_HEX, POLYGON_MULTIPLE_RINGS_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", POLYGON_MULTIPLE_RINGS_GEO_WKB_HEX);
+    }
+
+    /**
+     * Test transforming Polygon with multiple rings geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformPolygonWithMultipleRingsEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, POLYGON_MULTIPLE_RINGS_GEO_EWKB_HEX, POLYGON_MULTIPLE_RINGS_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming Multi Line String geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformMultiLineStringWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, MULTI_LINE_STRING_GEO_WKB_HEX, MULTI_LINE_STRING_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", MULTI_LINE_STRING_GEO_WKB_HEX);
+    }
+
+    /**
+     * Test transforming Multi Line String geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformMultiLineStringEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, MULTI_LINE_STRING_GEO_EWKB_HEX, MULTI_LINE_STRING_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming geometry collection from WKB to EWKB.
+     */
+    @Test
+    public void testTransformGeometryCollectionWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, GEOMETRY_COLLECTION_WKB_HEX, GEOMETRY_COLLECTION_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", GEOMETRY_COLLECTION_WKB_HEX);
+    }
+
+    /**
+     * Test transforming geometry collection from EWKB to WKB.
+     */
+    @Test
+    public void testTransformGeometryCollectionEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, GEOMETRY_COLLECTION_EWKB_HEX, GEOMETRY_COLLECTION_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming MultiPoint geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformMultiPointWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, MULTI_POINT_GEO_WKB_HEX, MULTI_POINT_GEO_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", MULTI_POINT_GEO_WKB_HEX);
+    }
+
+    /**
+     * Test transforming MultiPoint geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformMultiPointEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, MULTI_POINT_GEO_EWKB_HEX, MULTI_POINT_GEO_WKB_HEX);
+
+    }
+
+    /**
+     * Test transforming Empty geometry from WKB to EWKB.
+     */
+    @Test
+    public void testTransformEmptyGeometryWkbToEwkb() {
+
+        assertFormatTransformation("ewkb", 4326, EMPTY_GEOMETRY_WKB_HEX, EMPTY_GEOMETRY_EWKB_HEX);
+
+        assertNullSridLeftUnchanged("ewkb", EMPTY_GEOMETRY_WKB_HEX);
+    }
+
+    /**
+     * Test transforming Empty geometry from EWKB to WKB.
+     */
+    @Test
+    public void testTransformEmptyGeometryEWkbToWkb() {
+
+        assertFormatTransformation(null, 4326, EMPTY_GEOMETRY_EWKB_HEX, EMPTY_GEOMETRY_WKB_HEX);
+
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2904")
+    public void testWkbLeftUnchangedWithDefaultFormat() {
+        assertFormatTransformation(null, 4326, POINT_GEO_WKB_HEX, POINT_GEO_WKB_HEX);
+        assertFormatTransformation(null, 4326, MULTI_POLYGON_GEO_WKB_HEX, MULTI_POLYGON_GEO_WKB_HEX);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2904")
+    public void testWkbLeftUnchangedWithWkbFormat() {
+        assertFormatTransformation("wkb", 4326, POINT_GEO_WKB_HEX, POINT_GEO_WKB_HEX);
+        assertFormatTransformation("wkb", 4326, POINT_GEO_EWKB_HEX, POINT_GEO_WKB_HEX);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2904")
+    public void testEwkbLeftUnchangedWithEwkbFormat() {
+        assertFormatTransformation("EWKB", 4326, POINT_GEO_EWKB_HEX, POINT_GEO_EWKB_HEX);
+        assertFormatTransformation("EWKB", 4326, MULTI_POLYGON_GEO_EWKB_HEX, MULTI_POLYGON_GEO_EWKB_HEX);
+        assertFormatTransformation("EWKB", 4326, POINT_GEO_WKB_HEX, POINT_GEO_EWKB_HEX);
+    }
+
+    /**
+     * Helper method to assert that the geometry WKB is converted to EWKB and vice versa for envelop payloads and flattened payloads.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param srid spacial reference id
+     * @param inputFormatValue  can be WKB or EWKB
+     * @param outputFormatValue  can be WKB or EWKB
+     */
+    private void assertFormatTransformation(String format, Integer srid, String inputFormatValue, String outputFormatValue) {
+        applyTransformEnvelopePayload(format, srid, inputFormatValue, outputFormatValue);
+        applyTransformFlattenedPayload(format, srid, inputFormatValue, outputFormatValue);
+
+    }
+
+    /**
+     * Helper method to assert that a WKB->EWKB transformation of a geometry with no SRID leaves the value
+     * unchanged. Native (non-PostGIS) geometric types carry a null SRID, which EWKB cannot represent, so
+     * the transform is a no-op rather than a hard failure.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param wkb well-known-binary
+     */
+    private void assertNullSridLeftUnchanged(String format, String wkb) {
+        applyTransformEnvelopePayloadUnchanged(format, wkb);
+        applyTransformFlattenedPayloadUnchanged(format, wkb);
+    }
+
+    /**
+     * Configures the transformer with the given target format.
+     * @param format the configured target format, or {@code null} to use the default
+     */
+    private void configureTransformer(String format) {
+        final Map<String, String> properties = new HashMap<>();
+        if (format != null) {
+            properties.put("format", format);
+        }
+        geometryFormatTransformer.configure(properties);
+    }
+
+    /**
+     * Helper method to create a SourceRecord with flattened payload.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param srid spatial reference id
+     * @param inputFormatValue can be WKB or EWKB
+     * @return SourceRecord
+     */
+    private SourceRecord getFlattenedPayload(String format, Integer srid, String inputFormatValue) {
+        configureTransformer(format);
+
+        final byte[] wkbBytes = HexConverter.convertFromHex(inputFormatValue);
+        final Struct payload = new Struct(RECORD_SCHEMA);
+        payload.put("id", (byte) 1);
+        payload.put("geo", Geometry.createValue(Geometry.schema(), wkbBytes, srid));
+
+        final SourceRecord record = new SourceRecord(
+                new HashMap<>(),
+                new HashMap<>(),
+                "db.server1.table1",
+                payload.schema(),
+                payload);
+        return record;
+    }
+
+    /**
+     * Helper method to create a SourceRecord with envelope payload.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param srid spatial reference id
+     * @param wkb well-known-binary
+     * @return SourceRecord
+     */
+    private SourceRecord getEnvelopPayload(String format, Integer srid, String wkb) {
+        configureTransformer(format);
+
+        final byte[] wkbBytes = HexConverter.convertFromHex(wkb);
+
+        final Struct after = new Struct(RECORD_SCHEMA);
+        after.put("id", (byte) 1);
+        after.put("geo", Geometry.createValue(Geometry.schema(), wkbBytes, srid));
+
+        final Struct source = new Struct(SOURCE_SCHEMA);
+        source.put("table", "geos");
+        source.put("lsn", 1);
+        source.put("ts_ms", 123456789);
+
+        final Envelope envelope = Envelope.defineSchema()
+                .withName("dummy.Envelope")
+                .withRecord(RECORD_SCHEMA)
+                .withSource(SOURCE_SCHEMA)
+                .build();
+
+        final Struct payload = envelope.create(after, source, Instant.now());
+
+        return new SourceRecord(
+                new HashMap<>(),
+                new HashMap<>(),
+                "db.server1.table1",
+                envelope.schema(),
+                payload);
+    }
+
+    /**
+     * Applies the geometry format transformation to a SourceRecord with flattened payload and asserts the result.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param srid spacial reference id
+     * @param inputFormatValue can be WKB or EWKB
+     * @param expectedOutputFormatValue can be WKB or EWKB
+     */
+    private void applyTransformFlattenedPayload(String format, Integer srid, String inputFormatValue, String expectedOutputFormatValue) {
+
+        final SourceRecord record = getFlattenedPayload(format, srid, inputFormatValue);
+
+        final SourceRecord transformedRecord = geometryFormatTransformer.apply(record);
+
+        final Struct transformedValue = requireStruct(transformedRecord.value(), "value should be a struct");
+
+        final byte[] outputHexValue = HexConverter.convertFromHex(expectedOutputFormatValue);
+
+        final Struct geo = transformedValue.getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo.getBytes(Geometry.WKB_FIELD))).isEqualTo(expectedOutputFormatValue);
+        assertThat(geo.get(Geometry.SRID_FIELD)).isEqualTo(srid);
+
+        assertThat(geo).isEqualTo(Geometry.createValue(Geometry.schema(), outputHexValue, srid));
+
+    }
+
+    /**
+     * Applies the geometry format transformation to a SourceRecord with envelope payload and asserts the result.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param srid spacial reference id
+     * @param inputFormatValue can be WKB or EWKB
+     * @param outputFormatValue can be WKB or EWKB
+     */
+    private void applyTransformEnvelopePayload(String format, Integer srid, String inputFormatValue, String outputFormatValue) {
+
+        SourceRecord record = getEnvelopPayload(format, srid, inputFormatValue);
+
+        final SourceRecord transformedRecord = geometryFormatTransformer.apply(record);
+
+        final Struct transformedValue = requireStruct(transformedRecord.value(), "value should be a struct");
+        final Struct transformedAfter = transformedValue.getStruct(Envelope.FieldName.AFTER);
+
+        final byte[] newEkb = HexConverter.convertFromHex(outputFormatValue);
+
+        final Struct geo = transformedAfter.getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo.getBytes(Geometry.WKB_FIELD))).isEqualTo(outputFormatValue);
+        assertThat(geo.get(Geometry.SRID_FIELD)).isEqualTo(srid);
+
+        assertThat(geo).isEqualTo(Geometry.createValue(Geometry.schema(), newEkb, srid));
+    }
+
+    /**
+     * Applies the geometry format transformation to a flattened payload whose geometry has no SRID and
+     * asserts the WKB is returned unchanged.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param wkb well-known-binary
+     */
+    private void applyTransformFlattenedPayloadUnchanged(String format, String wkb) {
+        final SourceRecord record = getFlattenedPayload(format, null, wkb);
+
+        final SourceRecord transformedRecord = geometryFormatTransformer.apply(record);
+        final Struct transformedValue = requireStruct(transformedRecord.value(), "value should be a struct");
+
+        final Struct geo = transformedValue.getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo.getBytes(Geometry.WKB_FIELD))).isEqualTo(wkb);
+        assertThat(geo.get(Geometry.SRID_FIELD)).isNull();
+    }
+
+    /**
+     * Applies the geometry format transformation to an envelope payload whose geometry has no SRID and
+     * asserts the WKB is returned unchanged.
+     * @param format the configured target format, or {@code null} to use the default
+     * @param wkb well-known-binary
+     */
+    private void applyTransformEnvelopePayloadUnchanged(String format, String wkb) {
+        final SourceRecord record = getEnvelopPayload(format, null, wkb);
+
+        final SourceRecord transformedRecord = geometryFormatTransformer.apply(record);
+        final Struct transformedValue = requireStruct(transformedRecord.value(), "value should be a struct");
+        final Struct transformedAfter = transformedValue.getStruct(Envelope.FieldName.AFTER);
+
+        final Struct geo = transformedAfter.getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo.getBytes(Geometry.WKB_FIELD))).isEqualTo(wkb);
+        assertThat(geo.get(Geometry.SRID_FIELD)).isNull();
+    }
+
+    /**
+     * Test that transforming multiple sequential records with alternating formats (EWKB and WKB)
+     * using a single configured transformer instance correctly converts each record without
+     * mutating transformer state.
+     */
+    @Test
+    @FixFor("debezium/dbz#2706")
+    public void testSequentialInterleavedRecords() {
+        final GeometryFormatTransformer<SourceRecord> transformer = new GeometryFormatTransformer<>();
+        transformer.configure(new HashMap<>());
+
+        // Record 1: EWKB -> should be converted to WKB
+        final byte[] ewkbBytes1 = HexConverter.convertFromHex(POINT_GEO_EWKB_HEX);
+        final Struct payload1 = new Struct(RECORD_SCHEMA);
+        payload1.put("id", (byte) 1);
+        payload1.put("geo", Geometry.createValue(Geometry.schema(), ewkbBytes1, 4326));
+        final SourceRecord record1 = new SourceRecord(
+                new HashMap<>(), new HashMap<>(), "db.server1.table1", payload1.schema(), payload1);
+
+        final SourceRecord transformed1 = transformer.apply(record1);
+        final Struct geo1 = requireStruct(transformed1.value(), "value should be a struct").getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo1.getBytes(Geometry.WKB_FIELD))).isEqualTo(POINT_GEO_WKB_HEX);
+
+        // Record 2: WKB -> should be left unchanged, as WKB is the configured format
+        final byte[] wkbBytes2 = HexConverter.convertFromHex(POINT_GEO_WKB_HEX);
+        final Struct payload2 = new Struct(RECORD_SCHEMA);
+        payload2.put("id", (byte) 2);
+        payload2.put("geo", Geometry.createValue(Geometry.schema(), wkbBytes2, 4326));
+        final SourceRecord record2 = new SourceRecord(
+                new HashMap<>(), new HashMap<>(), "db.server1.table1", payload2.schema(), payload2);
+
+        final SourceRecord transformed2 = transformer.apply(record2);
+        final Struct geo2 = requireStruct(transformed2.value(), "value should be a struct").getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo2.getBytes(Geometry.WKB_FIELD))).isEqualTo(POINT_GEO_WKB_HEX);
+
+        // Record 3: EWKB -> should be converted to WKB again
+        final byte[] ewkbBytes3 = HexConverter.convertFromHex(POINT_GEO_EWKB_HEX);
+        final Struct payload3 = new Struct(RECORD_SCHEMA);
+        payload3.put("id", (byte) 3);
+        payload3.put("geo", Geometry.createValue(Geometry.schema(), ewkbBytes3, 4326));
+        final SourceRecord record3 = new SourceRecord(
+                new HashMap<>(), new HashMap<>(), "db.server1.table1", payload3.schema(), payload3);
+
+        final SourceRecord transformed3 = transformer.apply(record3);
+        final Struct geo3 = requireStruct(transformed3.value(), "value should be a struct").getStruct("geo");
+        assertThat(HexConverter.convertToHexString(geo3.getBytes(Geometry.WKB_FIELD))).isEqualTo(POINT_GEO_WKB_HEX);
+    }
+}

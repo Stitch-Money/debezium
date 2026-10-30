@@ -14,7 +14,7 @@ import org.assertj.db.type.ValueType;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
-import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
+import io.debezium.connector.jdbc.JdbcKafkaSinkRecord;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig.SchemaEvolutionMode;
 import io.debezium.connector.jdbc.junit.TestHelper;
@@ -48,9 +48,11 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
-        consume(factory.deleteRecord(topicName));
+        consume(factory.deleteRecord(topicName, config));
+        stopSinkConnector();
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(1).hasNumberOfColumns(3);
@@ -73,9 +75,10 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
-        consume(factory.deleteRecord(topicName));
+        consume(factory.deleteRecord(topicName, config));
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
@@ -99,9 +102,10 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecordMultipleKeyColumns(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecordMultipleKeyColumns(topicName, config);
         consume(createRecord);
-        consume(factory.deleteRecordMultipleKeyColumns(topicName));
+        consume(factory.deleteRecordMultipleKeyColumns(topicName, config));
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
@@ -109,6 +113,137 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         getSink().assertColumnType(tableAssert, "id1", ValueType.NUMBER);
         getSink().assertColumnType(tableAssert, "id2", ValueType.NUMBER);
         getSink().assertColumnType(tableAssert, "name", ValueType.TEXT);
+    }
+
+    @ParameterizedTest
+    @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
+    @FixFor("debezium/dbz#1421")
+    public void testShouldDeleteRowWhenDeletesEnabledUsingRecordValuePrimaryKeyMode(SinkRecordFactory factory) {
+        // A flattened delete event carries no value, so the primary key can only be
+        // resolved from the record value for a full change event.
+        if (factory.isFlattened()) {
+            return;
+        }
+
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.BASIC.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, PrimaryKeyMode.RECORD_VALUE.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_FIELDS, "id");
+        properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
+        consume(createRecord);
+        consume(factory.deleteRecord(topicName, config));
+
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
+        tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
+
+        getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
+        getSink().assertColumnType(tableAssert, "name", ValueType.TEXT);
+        getSink().assertColumnType(tableAssert, "nick_name$", ValueType.TEXT);
+    }
+
+    @ParameterizedTest
+    @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
+    @FixFor("debezium/dbz#1421")
+    public void testShouldDeleteRowWhenDeletesEnabledUsingRecordHeaderPrimaryKeyMode(SinkRecordFactory factory) {
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.BASIC.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, PrimaryKeyMode.RECORD_HEADER.getValue());
+        properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
+        createRecord.getOriginalKafkaRecord().headers().addInt("id", 1);
+        consume(createRecord);
+
+        final JdbcKafkaSinkRecord deleteRecord = factory.deleteRecord(topicName, config);
+        deleteRecord.getOriginalKafkaRecord().headers().addInt("id", 1);
+        consume(deleteRecord);
+
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
+        tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
+
+        getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
+        getSink().assertColumnType(tableAssert, "name", ValueType.TEXT);
+        getSink().assertColumnType(tableAssert, "nick_name$", ValueType.TEXT);
+    }
+
+    @ParameterizedTest
+    @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
+    @FixFor("debezium/dbz#1421")
+    public void testTombstoneShouldBeSkippedWhenUsingRecordValuePrimaryKeyMode(SinkRecordFactory factory) {
+        if (factory.isFlattened()) {
+            return;
+        }
+
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.BASIC.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, PrimaryKeyMode.RECORD_VALUE.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_FIELDS, "id");
+        properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
+        consume(createRecord);
+        consume(factory.deleteRecord(topicName, config));
+        consume(factory.tombstoneRecord(topicName, config));
+
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
+        tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
+
+        getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
+        getSink().assertColumnType(tableAssert, "name", ValueType.TEXT);
+        getSink().assertColumnType(tableAssert, "nick_name$", ValueType.TEXT);
+    }
+
+    @ParameterizedTest
+    @ArgumentsSource(SinkRecordFactoryArgumentsProvider.class)
+    @FixFor("debezium/dbz#1421")
+    public void testTombstoneShouldBeSkippedWhenUsingRecordHeaderPrimaryKeyMode(SinkRecordFactory factory) {
+        final Map<String, String> properties = getDefaultSinkConfig();
+        properties.put(JdbcSinkConnectorConfig.SCHEMA_EVOLUTION, SchemaEvolutionMode.BASIC.getValue());
+        properties.put(JdbcSinkConnectorConfig.PRIMARY_KEY_MODE, PrimaryKeyMode.RECORD_HEADER.getValue());
+        properties.put(JdbcSinkConnectorConfig.DELETE_ENABLED, "true");
+        startSinkConnector(properties);
+        assertSinkConnectorIsRunning();
+
+        final String tableName = randomTableName();
+        final String topicName = topicName("server1", "schema", tableName);
+
+        final JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
+        createRecord.getOriginalKafkaRecord().headers().addInt("id", 1);
+        consume(createRecord);
+
+        final JdbcKafkaSinkRecord deleteRecord = factory.deleteRecord(topicName, config);
+        deleteRecord.getOriginalKafkaRecord().headers().addInt("id", 1);
+        consume(deleteRecord);
+
+        consume(factory.tombstoneRecord(topicName, config));
+
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
+        tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
+
+        getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
+        getSink().assertColumnType(tableAssert, "name", ValueType.TEXT);
+        getSink().assertColumnType(tableAssert, "nick_name$", ValueType.TEXT);
     }
 
     @ParameterizedTest
@@ -124,7 +259,7 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord deleteRecord = factory.deleteRecord(topicName);
+        final JdbcKafkaSinkRecord deleteRecord = factory.deleteRecord(topicName, getConfig(properties));
         consume(deleteRecord);
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(deleteRecord));
@@ -149,7 +284,7 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord deleteRecord = factory.deleteRecordMultipleKeyColumns(topicName);
+        final JdbcKafkaSinkRecord deleteRecord = factory.deleteRecordMultipleKeyColumns(topicName, getConfig(properties));
         consume(deleteRecord);
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(deleteRecord));
@@ -174,7 +309,8 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
 
         TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
@@ -185,11 +321,11 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
 
         if (factory.isFlattened()) {
             // When flattened, expect that tombstone alone deletes the row
-            consume(factory.tombstoneRecord(topicName));
+            consume(factory.tombstoneRecord(topicName, config));
         }
         else {
             // When not flattened, expect delete operations deletes the row
-            consume(factory.deleteRecord(topicName));
+            consume(factory.deleteRecord(topicName, config));
 
             // Given that tombstones are optional, we'll skip for testing purposes.
             // This makes sure that legacy behavior is retained
@@ -216,9 +352,10 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
-        consume(factory.truncateRecord(topicName));
+        consume(factory.truncateRecord(topicName, config));
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(1).hasNumberOfColumns(3);
@@ -242,9 +379,10 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord createRecord = factory.createRecord(topicName, config);
         consume(createRecord);
-        consume(factory.truncateRecord(topicName));
+        consume(factory.truncateRecord(topicName, config));
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         // will skip truncate event since there is no operation "t" in flatten value
@@ -273,9 +411,10 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        KafkaDebeziumSinkRecord firstRecord = factory.createRecord(topicName, (byte) 1);
-        KafkaDebeziumSinkRecord truncateRecord = factory.truncateRecord(topicName);
-        KafkaDebeziumSinkRecord secondRecord = factory.createRecord(topicName, (byte) 2);
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        JdbcKafkaSinkRecord firstRecord = factory.createRecord(topicName, (byte) 1, config);
+        JdbcKafkaSinkRecord truncateRecord = factory.truncateRecord(topicName, config);
+        JdbcKafkaSinkRecord secondRecord = factory.createRecord(topicName, (byte) 2, config);
 
         consume(firstRecord);
         consume(truncateRecord);
@@ -306,14 +445,15 @@ public abstract class AbstractJdbcSinkDeleteEnabledTest extends AbstractJdbcSink
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final KafkaDebeziumSinkRecord deleteRecord = factory.deleteRecord(topicName);
-        List<KafkaDebeziumSinkRecord> records = new ArrayList<>();
+        JdbcSinkConnectorConfig config = getConfig(properties);
+        final JdbcKafkaSinkRecord deleteRecord = factory.deleteRecord(topicName, config);
+        List<JdbcKafkaSinkRecord> records = new ArrayList<>();
 
-        records.add(factory.createRecord(topicName, (byte) 2));
-        records.add(factory.createRecord(topicName, (byte) 1));
+        records.add(factory.createRecord(topicName, (byte) 2, config));
+        records.add(factory.createRecord(topicName, (byte) 1, config));
         records.add(deleteRecord);
         // should insert success (not violate primary key constraint)
-        records.add(factory.createRecord(topicName, (byte) 1));
+        records.add(factory.createRecord(topicName, (byte) 1, config));
         consume(records);
 
         final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(deleteRecord));

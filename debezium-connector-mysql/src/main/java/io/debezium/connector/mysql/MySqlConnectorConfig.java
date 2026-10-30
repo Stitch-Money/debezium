@@ -33,6 +33,7 @@ import io.debezium.connector.mysql.gtid.MySqlGtidSetFactory;
 import io.debezium.connector.mysql.history.MySqlHistoryRecordComparator;
 import io.debezium.function.Predicates;
 import io.debezium.relational.history.HistoryRecordComparator;
+import io.debezium.util.Strings;
 
 /**
  * The configuration properties.
@@ -40,6 +41,59 @@ import io.debezium.relational.history.HistoryRecordComparator;
 public class MySqlConnectorConfig extends BinlogConnectorConfig {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MySqlConnectorConfig.class);
+
+    /**
+     * The set of predefined DDL Parser Type options for MySQL DDL parsing.
+     *
+     * Determines which ANTLR grammar to use when parsing MySQL DDL statements.
+     */
+    public enum DdlParserType implements EnumeratedValue {
+
+        /**
+         * Oracle MySQL ANTLR grammar (default, recommended).
+         *
+         * Actively maintained grammar that supports MySQL 8.0+ features.
+         * Based on the official MySQL grammar specification.
+         */
+        DEFAULT("default"),
+
+        /**
+         * Positive Technologies (PT) MySQL ANTLR grammar (legacy).
+         *
+         * Provided for backward compatibility with existing deployments.
+         */
+        LEGACY("legacy");
+
+        private final String value;
+
+        DdlParserType(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public static DdlParserType parse(String value) {
+            if (value == null) {
+                return null;
+            }
+
+            String normalizedValue = value.trim();
+            for (DdlParserType type : values()) {
+                if (type.getValue().equalsIgnoreCase(normalizedValue)) {
+                    return type;
+                }
+            }
+            return null;
+        }
+
+        public static DdlParserType parse(String value, String defaultValue) {
+            DdlParserType parsed = parse(value);
+            return parsed != null ? parsed : parse(defaultValue);
+        }
+    }
 
     /**
      * The set of predefined Snapshot Locking Mode options.
@@ -240,7 +294,7 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
     public static final Field JDBC_DRIVER = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "jdbc.driver")
             .withDisplayName("JDBC Driver Class Name")
             .withType(Type.CLASS)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 41))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(Width.MEDIUM)
             .withDefault(com.mysql.cj.jdbc.Driver.class.getName())
             .withImportance(Importance.LOW)
@@ -250,7 +304,7 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
     public static final Field JDBC_PROTOCOL = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "protocol")
             .withDisplayName("JDBC Protocol")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 42))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(Width.MEDIUM)
             .withDefault("jdbc:mysql")
             .withImportance(Importance.LOW)
@@ -279,7 +333,7 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
     public static final Field SNAPSHOT_LOCKING_MODE = Field.create(SNAPSHOT_LOCKING_MODE_PROPERTY_NAME)
             .withDisplayName("Snapshot locking mode")
             .withEnum(SnapshotLockingMode.class, SnapshotLockingMode.MINIMAL)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("Controls how long the connector holds onto the global read lock while it is performing a snapshot. The default is 'minimal', "
@@ -297,7 +351,7 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
             .withEnum(MySqlSecureConnectionMode.class, MySqlSecureConnectionMode.PREFERRED)
             .withWidth(ConfigDef.Width.MEDIUM)
             .withImportance(ConfigDef.Importance.MEDIUM)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withDescription("Whether to use an encrypted connection to the database. Options include: "
                     + "'disabled' to use an unencrypted connection; "
                     + "'preferred' (the default) to establish a secure (encrypted) connection if the server supports "
@@ -311,20 +365,24 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
     public static final Field SOURCE_INFO_STRUCT_MAKER = CommonConnectorConfig.SOURCE_INFO_STRUCT_MAKER
             .withDefault(MySqlSourceInfoStructMaker.class.getName());
 
+    public static final Field DDL_PARSER_TYPE = Field.create("ddl.parser.type")
+            .withDisplayName("DDL Parser Type")
+            .withEnum(DdlParserType.class, DdlParserType.DEFAULT)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDescription("Specifies which ANTLR grammar to use for parsing MySQL DDL statements. " +
+                    "'default' uses the Oracle MySQL grammar, which is actively maintained and supports MySQL 8.0+ features. " +
+                    "'legacy' uses the Positive Technologies grammar for backward compatibility with existing deployments.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = BinlogConnectorConfig.CONFIG_DEFINITION.edit()
             .name("MySQL")
             .excluding(
                     BinlogConnectorConfig.GTID_SOURCE_INCLUDES,
                     BinlogConnectorConfig.GTID_SOURCE_EXCLUDES)
-            .type(
-                    JDBC_DRIVER,
-                    JDBC_PROTOCOL,
-                    SSL_MODE)
-            .connector(SNAPSHOT_LOCKING_MODE)
-            .events(
-                    GTID_SOURCE_INCLUDES,
-                    GTID_SOURCE_EXCLUDES,
-                    SOURCE_INFO_STRUCT_MAKER)
+            .group(Field.Group.CONNECTION, JDBC_DRIVER, JDBC_PROTOCOL)
+            .group(Field.Group.CONNECTION_ADVANCED_SSL, SSL_MODE)
+            .group(Field.Group.CONNECTOR_SNAPSHOT, SNAPSHOT_LOCKING_MODE)
+            .group(Field.Group.CONNECTOR, GTID_SOURCE_INCLUDES, GTID_SOURCE_EXCLUDES, SOURCE_INFO_STRUCT_MAKER)
             .create();
 
     protected static ConfigDef configDef() {
@@ -341,6 +399,7 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
     private final SnapshotLockingMode snapshotLockingMode;
     private final SnapshotLockingStrategy snapshotLockingStrategy;
     private final SecureConnectionMode secureConnectionMode;
+    private final DdlParserType ddlParserType;
 
     public MySqlConnectorConfig(Configuration config) {
         super(MySqlConnector.class, config, DEFAULT_SNAPSHOT_FETCH_SIZE);
@@ -350,6 +409,8 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
         this.snapshotLockingStrategy = new MySqlSnapshotLockingStrategy(snapshotLockingMode);
 
         this.secureConnectionMode = MySqlSecureConnectionMode.parse(config.getString(SSL_MODE));
+
+        this.ddlParserType = DdlParserType.parse(config.getString(DDL_PARSER_TYPE), DDL_PARSER_TYPE.defaultValueAsString());
 
         // Set up the GTID filter ...
         final String gtidSetIncludes = config.getString(GTID_SOURCE_INCLUDES);
@@ -362,6 +423,15 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
 
     public Optional<SnapshotLockingMode> getSnapshotLockingMode() {
         return Optional.of(this.snapshotLockingMode);
+    }
+
+    @Override
+    public byte[] getUnavailableValuePlaceholder() {
+        String placeholder = getConfig().getString(UNAVAILABLE_VALUE_PLACEHOLDER);
+        if (placeholder.startsWith("hex:")) {
+            return Strings.hexStringToByteArray(placeholder.substring(4));
+        }
+        return placeholder.getBytes();
     }
 
     @Override
@@ -407,6 +477,10 @@ public class MySqlConnectorConfig extends BinlogConnectorConfig {
     @Override
     public boolean isSslModeEnabled() {
         return secureConnectionMode != MySqlSecureConnectionMode.DISABLED;
+    }
+
+    public DdlParserType getDdlParserType() {
+        return ddlParserType;
     }
 
     /**

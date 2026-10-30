@@ -18,27 +18,25 @@ import java.util.Map;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
-import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.mongodb.client.MongoClient;
 import com.mongodb.internal.VisibleForTesting;
 
-import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.DebeziumTaskState;
 import io.debezium.connector.common.UUIDUtils;
 import io.debezium.connector.mongodb.connection.MongoDbConnectionContext;
+import io.debezium.connector.mongodb.connection.client.MongoDbClient;
 import io.debezium.dlq.ErrorReporter;
+import io.debezium.dlq.ErrorReporters;
 import io.debezium.openlineage.ConnectorContext;
 import io.debezium.openlineage.DebeziumOpenLineageEmitter;
 import io.debezium.openlineage.dataset.DatasetDataExtractor;
 import io.debezium.openlineage.dataset.DatasetMetadata;
-import io.debezium.sink.DebeziumSinkRecord;
 
 public class MongoDbSinkConnectorTask extends SinkTask {
     static final Logger LOGGER = LoggerFactory.getLogger(MongoDbSinkConnectorTask.class);
@@ -46,6 +44,7 @@ public class MongoDbSinkConnectorTask extends SinkTask {
     private MongoDbChangeEventSink mongoSink;
     private ConnectorContext connectorContext;
     private DatasetDataExtractor datasetDataExtractor;
+    private MongoDbConnectionContext connectionContext;
 
     @Override
     public String version() {
@@ -63,10 +62,10 @@ public class MongoDbSinkConnectorTask extends SinkTask {
         LOGGER.info("Starting MongoDB sink task");
         var config = Configuration.from(props);
         final MongoDbSinkConnectorConfig sinkConfig = new MongoDbSinkConnectorConfig(config);
-        MongoClient client = null;
+        MongoDbClient client = null;
         try {
-            MongoDbConnectionContext connectionContext = new MongoDbConnectionContext(config);
-            client = connectionContext.getMongoClient();
+            connectionContext = new MongoDbConnectionContext(config);
+            client = connectionContext.openClient();
 
             datasetDataExtractor = new DatasetDataExtractor();
             String connectorName = props.get(CONNECTOR_NAME_PROPERTY);
@@ -75,21 +74,23 @@ public class MongoDbSinkConnectorTask extends SinkTask {
                     getMaskedConfigurationMap(props));
 
             DebeziumOpenLineageEmitter.emit(connectorContext, DebeziumTaskState.INITIAL);
-            mongoSink = new MongoDbChangeEventSink(sinkConfig, client, createErrorReporter(), connectorContext);
+            mongoSink = new MongoDbChangeEventSink(sinkConfig, client, ErrorReporters.fromContext(context), connectorContext);
+            DebeziumOpenLineageEmitter.emit(connectorContext, DebeziumTaskState.RUNNING);
         }
-        catch (RuntimeException taskStartingException) {
+        catch (RuntimeException | Error taskStartingException) {
             // noinspection EmptyTryBlock
-            try (MongoClient autoCloseableClient = client) {
+            try (var ownedContext = connectionContext; var autoCloseableClient = client) {
                 // just using try-with-resources to ensure they all get closed, even in the case of
                 // exceptions
             }
-            catch (RuntimeException resourceReleasingException) {
+            catch (RuntimeException | Error resourceReleasingException) {
                 taskStartingException.addSuppressed(resourceReleasingException);
             }
+            connectionContext = null;
+            mongoSink = null;
             throw new ConnectException("Failed to start MongoDB sink task", taskStartingException);
         }
 
-        DebeziumOpenLineageEmitter.emit(connectorContext, DebeziumTaskState.RUNNING);
         LOGGER.debug("Started MongoDB sink task");
     }
 
@@ -140,35 +141,19 @@ public class MongoDbSinkConnectorTask extends SinkTask {
     @Override
     public void stop() {
         LOGGER.info("Stopping MongoDB sink task");
-        if (mongoSink != null) {
-            mongoSink.close();
-            DebeziumOpenLineageEmitter.emit(connectorContext, DebeziumTaskState.STOPPED);
-            DebeziumOpenLineageEmitter.cleanup(connectorContext);
-        }
-    }
-
-    private ErrorReporter createErrorReporter() {
-        ErrorReporter result = nopErrorReporter();
-        if (context != null) {
-            try {
-                ErrantRecordReporter errantRecordReporter = context.errantRecordReporter();
-                if (errantRecordReporter != null) {
-                    result = (DebeziumSinkRecord record, Exception e) -> {
-                        if (record instanceof KafkaDebeziumSinkRecord kafkaRecord) {
-                            errantRecordReporter.report(kafkaRecord.getOriginalKafkaRecord(), e);
-                        }
-                    };
-                }
-                else {
-                    LOGGER.info("Errant record reporter not configured.");
-                }
-            }
-            catch (NoClassDefFoundError | NoSuchMethodError e) {
-                // Will occur in Connect runtimes earlier than 2.6
-                LOGGER.info("Kafka versions prior to 2.6 do not support the errant record reporter.");
+        try (var ownedContext = connectionContext) {
+            if (mongoSink != null) {
+                mongoSink.close();
+                DebeziumOpenLineageEmitter.emit(connectorContext, DebeziumTaskState.STOPPED);
             }
         }
-        return result;
+        finally {
+            connectionContext = null;
+            mongoSink = null;
+            if (connectorContext != null) {
+                DebeziumOpenLineageEmitter.cleanup(connectorContext);
+            }
+        }
     }
 
     private Map<String, String> getMaskedConfigurationMap(Map<String, String> props) {
@@ -177,7 +162,6 @@ public class MongoDbSinkConnectorTask extends SinkTask {
 
     @VisibleForTesting(otherwise = VisibleForTesting.AccessModifier.PRIVATE)
     static ErrorReporter nopErrorReporter() {
-        return (record, e) -> {
-            /* do nothing */ };
+        return ErrorReporters.nop();
     }
 }

@@ -7,6 +7,7 @@ package io.debezium.connector.mongodb;
 
 import static java.util.Comparator.comparing;
 
+import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -16,9 +17,14 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.mongodb.MongoCommandException;
+import com.mongodb.MongoException;
+import com.mongodb.MongoSecurityException;
 
 import io.debezium.DebeziumException;
 import io.debezium.annotation.ThreadSafe;
@@ -27,14 +33,17 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
-import io.debezium.connector.base.DefaultQueueProvider;
+import io.debezium.connector.base.QueueProviderService;
 import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.common.DebeziumHeaderProducer;
+import io.debezium.connector.mongodb.MongoDbConnectorConfig.CaptureScope;
+import io.debezium.connector.mongodb.MongoDbConnectorConfig.CursorPipelineOrder;
 import io.debezium.connector.mongodb.connection.ConnectionStrings;
 import io.debezium.connector.mongodb.connection.MongoDbConnection;
 import io.debezium.connector.mongodb.connection.MongoDbConnectionContext;
 import io.debezium.connector.mongodb.connection.MongoDbConnections;
+import io.debezium.connector.mongodb.connection.client.MongoDbClient;
 import io.debezium.connector.mongodb.metrics.MongoDbChangeEventSourceMetricsFactory;
 import io.debezium.document.DocumentReader;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
@@ -94,12 +103,29 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
 
     @Override
     public ChangeEventSourceCoordinator<MongoDbPartition, MongoDbOffsetContext> start(Configuration config) {
+        try {
+            return startTask(config);
+        }
+        catch (RuntimeException | Error initializationException) {
+            try {
+                closeResources();
+            }
+            catch (RuntimeException | Error resourceReleasingException) {
+                initializationException.addSuppressed(resourceReleasingException);
+            }
+            throw initializationException;
+        }
+    }
+
+    private ChangeEventSourceCoordinator<MongoDbPartition, MongoDbOffsetContext> startTask(Configuration config) {
         final MongoDbConnectorConfig connectorConfig = new MongoDbConnectorConfig(config);
         final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
 
         this.taskName = "task" + config.getInteger(MongoDbConnectorConfig.TASK_ID);
 
-        this.connectionContext = new MongoDbConnectionContext(config);
+        this.connectionContext = taskContext.getConnectionContext();
+
+        validateSignalDataCollection(connectorConfig);
 
         final Schema structSchema = connectorConfig.getSourceInfoStructMaker().schema();
         this.schema = new MongoDbSchema(connectorConfig, taskContext, connectorConfig.getTopicNamingStrategy(MongoDbConnectorConfig.TOPIC_NAMING_STRATEGY),
@@ -111,12 +137,35 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
         PreviousContext previousLogContext = taskContext.configureLoggingContext(taskName);
 
         try {
+            final var captureScope = connectorConfig.getCaptureScope();
+            if ((connectorConfig.getCaptureModePreImage().isRequired() || connectorConfig.getCaptureModePostImage().isRequired())
+                    && (captureScope == CaptureScope.DEPLOYMENT || captureScope == CaptureScope.DATABASE)
+                    && connectorConfig.getCursorPipelineOrder() == CursorPipelineOrder.USER_FIRST
+                    && !taskContext.getFilters().getConfig().getUserPipeline().getStages().isEmpty()) {
+                // User stages run before the namespace filters. MongoDB can check required images before these
+                // filters remove excluded events, including when validating a saved resume token.
+                LOGGER.warn("Required images are enabled with cursor.pipeline.order=user_first and capture.scope={}. "
+                        + "Events excluded by the namespace filters can still cause missing-image errors. "
+                        + "Ensure that required images are recorded and retained within the change stream scope, "
+                        + "or consider capture.scope=collection or cursor.pipeline.order=internal_first.", captureScope.getValue());
+            }
+
+            // Service providers
+            registerServiceProviders(connectorConfig.getServiceRegistry());
+
+            // Manually Register Beans
+            connectorConfig.getBeanRegistry().add(StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
+            connectorConfig.getBeanRegistry().add(StandardBeanNames.DATABASE_SCHEMA, schema);
+            connectorConfig.getBeanRegistry().add(StandardBeanNames.OFFSETS, previousOffsets);
+            connectorConfig.getBeanRegistry().add(StandardBeanNames.CDC_SOURCE_TASK_CONTEXT, taskContext);
+
             this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                     .pollInterval(connectorConfig.getPollInterval())
+                    .pollDispatchInterval(connectorConfig.getPollDispatchInterval())
                     .maxBatchSize(connectorConfig.getMaxBatchSize())
                     .maxQueueSize(connectorConfig.getMaxQueueSize())
                     .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
-                    .queueProvider(new DefaultQueueProvider<>(connectorConfig.getMaxQueueSize()))
+                    .queueProvider(connectorConfig.getServiceRegistry().tryGetService(QueueProviderService.class).getQueueProvider())
                     .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                     .build();
 
@@ -130,38 +179,34 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
                     DocumentReader.defaultReader(),
                     previousOffsets);
 
-            // Manually Register Beans
-            connectorConfig.getBeanRegistry().add(StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
-            connectorConfig.getBeanRegistry().add(StandardBeanNames.DATABASE_SCHEMA, schema);
-            connectorConfig.getBeanRegistry().add(StandardBeanNames.OFFSETS, previousOffsets);
-            connectorConfig.getBeanRegistry().add(StandardBeanNames.CDC_SOURCE_TASK_CONTEXT, taskContext);
-
-            // Service providers
-            registerServiceProviders(connectorConfig.getServiceRegistry());
-
             final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry().tryGetService(SnapshotterService.class);
 
+            // Requires explicit mapping and typecasting in filter lambda due to Eclipse compiler bug
+            @SuppressWarnings("unchecked")
             final EventDispatcher<MongoDbPartition, CollectionId> dispatcher = new EventDispatcher<>(
                     connectorConfig,
                     connectorConfig.getTopicNamingStrategy(MongoDbConnectorConfig.TOPIC_NAMING_STRATEGY),
                     schema,
                     queue,
-                    taskContext.getFilters().collectionFilter()::test,
+                    x -> taskContext.getFilters().collectionFilter().test((CollectionId) x),
                     DataChangeEvent::new,
                     metadataProvider,
                     schemaNameAdjuster,
                     signalProcessor,
                     connectorConfig.getServiceRegistry().tryGetService(DebeziumHeaderProducer.class));
 
-            validate(connectorConfig, MongoDbConnections.create(config, dispatcher, previousOffsets.getTheOnlyPartition()), previousOffsets,
-                    snapshotterService.getSnapshotter());
+            try (var connection = MongoDbConnections.create(connectionContext, dispatcher, previousOffsets.getTheOnlyPartition())) {
+                validate(connectorConfig, connection, previousOffsets, snapshotterService.getSnapshotter());
+            }
 
             // Validate guardrail limits for captured collections to prevent loading excessive collection schemas into memory
             if (connectorConfig.getGuardrailCollectionsMax() <= 0) {
                 LOGGER.info("Guardrail validation skipped");
             }
             else {
-                validateGuardrailLimits(connectorConfig, MongoDbConnections.create(config, dispatcher, previousOffsets.getTheOnlyPartition()));
+                try (var connection = MongoDbConnections.create(connectionContext, dispatcher, previousOffsets.getTheOnlyPartition())) {
+                    validateGuardrailLimits(connectorConfig, connection);
+                }
             }
 
             NotificationService<MongoDbPartition, MongoDbOffsetContext> notificationService = new NotificationService<>(getNotificationChannels(),
@@ -268,8 +313,7 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
 
     @Override
     public List<SourceRecord> doPoll() throws InterruptedException {
-        List<DataChangeEvent> records = queue.poll();
-        return records.stream().map(DataChangeEvent::getRecord).collect(Collectors.toList());
+        return pollRecords(queue);
     }
 
     @Override
@@ -281,12 +325,24 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
     public void doStop() {
         PreviousContext previousLogContext = this.taskContext.configureLoggingContext(taskName);
         try {
-            if (schema != null) {
-                schema.close();
-            }
+            closeResources();
         }
         finally {
             previousLogContext.restore();
+        }
+    }
+
+    @SuppressWarnings("try")
+    private void closeResources() {
+        try (var ownedContext = taskContext; var ownedSchema = schema) {
+            if (queue != null) {
+                queue.close();
+            }
+        }
+        finally {
+            schema = null;
+            queue = null;
+            connectionContext = null;
         }
     }
 
@@ -300,8 +356,9 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
         return super.withMaskedSensitiveOptions(config).withMasked(MongoDbConnectorConfig.CONNECTION_STRING.name());
     }
 
-    private void validate(MongoDbConnectorConfig connectorConfig, MongoDbConnection mongoDbConnection, Offsets<MongoDbPartition, MongoDbOffsetContext> previousOffsets,
-                          Snapshotter snapshotter) {
+    // Package-private for testing.
+    void validate(MongoDbConnectorConfig connectorConfig, MongoDbConnection mongoDbConnection, Offsets<MongoDbPartition, MongoDbOffsetContext> previousOffsets,
+                  Snapshotter snapshotter) {
 
         for (Map.Entry<MongoDbPartition, MongoDbOffsetContext> previousOffset : previousOffsets) {
 
@@ -309,7 +366,6 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
 
             if (offset == null) {
                 LOGGER.info("Connector started for the first time.");
-                LOGGER.info("No previous offset has been found");
                 return;
             }
 
@@ -326,7 +382,18 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
             }
 
             if (connectorConfig.isLogPositionCheckEnabled()) {
-                boolean logPositionAvailable = mongoDbConnection.validateLogPosition(offset, taskContext);
+                boolean logPositionAvailable;
+                try {
+                    logPositionAvailable = mongoDbConnection.validateLogPosition(offset, taskContext);
+                }
+                catch (DebeziumException e) {
+                    // A communication failure (an invalid resume token instead returns false) must be retriable so
+                    // the task restarts and reconnects, consistent with the streaming path, rather than failing.
+                    if (isCommunicationFailure(e)) {
+                        throw new RetriableException("Failed to validate the resume token because of a connection failure; will retry", e);
+                    }
+                    throw e;
+                }
 
                 if (!logPositionAvailable) {
                     LOGGER.warn("Last recorded offset is no longer available on the server.");
@@ -342,12 +409,40 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
                         return;
                     }
 
-                    String sourceInfo = offset.getSourceInfo() != null ? offset.getSourceInfo().toString() : "unknown offset";
-                    throw new DebeziumException("The connector is trying to read change stream starting at " + sourceInfo + ", but this is no longer "
+                    String offsetInfo = offset.getOffset() != null ? offset.getOffset().toString() : "unknown offset";
+                    throw new DebeziumException("The connector is trying to read change stream starting at " + offsetInfo + ", but this is no longer "
                             + "available on the server. Reconfigure the connector to use a snapshot mode when needed.");
                 }
             }
         }
+    }
+
+    // Mirrors the exception types the streaming MongoDbErrorHandler treats as retriable, but excludes
+    // authentication/authorization failures: those are permanent misconfigurations that would otherwise spin on
+    // every restart until retries are exhausted (cf. debezium/dbz#2139).
+    private static boolean isCommunicationFailure(Throwable throwable) {
+        if (MongoUtils.isRequiredImageMissing(throwable)) {
+            return false;
+        }
+        boolean communicationFailure = false;
+        for (Throwable cause = throwable; cause != null; cause = cause.getCause()) {
+            if (isAuthenticationFailure(cause)) {
+                return false;
+            }
+            if (cause instanceof IOException || cause instanceof MongoException) {
+                communicationFailure = true;
+            }
+        }
+        return communicationFailure;
+    }
+
+    private static boolean isAuthenticationFailure(Throwable throwable) {
+        if (throwable instanceof MongoSecurityException) {
+            return true;
+        }
+        // 18 = AuthenticationFailed, 13 = Unauthorized
+        return throwable instanceof MongoCommandException commandException
+                && (commandException.getErrorCode() == 18 || commandException.getErrorCode() == 13);
     }
 
     private void validateGuardrailLimits(MongoDbConnectorConfig connectorConfig, MongoDbConnection connection) {
@@ -363,6 +458,20 @@ public final class MongoDbConnectorTask extends BaseSourceTask<MongoDbPartition,
         catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new DebeziumException("Interrupted while validating guardrail limits", e);
+        }
+        catch (DebeziumException e) {
+            LOGGER.error("Failed to validate guardrail limits! " + e.getMessage(), e);
+            throw new DebeziumException("Failed to validate guardrail limits", e);
+        }
+    }
+
+    private void validateSignalDataCollection(MongoDbConnectorConfig connectorConfig) {
+        try (MongoDbClient client = connectionContext.openClient()) {
+            SignalDataCollectionValidationResult result = SignalDataCollectionValidator.validate(client.getClient(),
+                    SignalDataCollectionValidationRequest.forConnector(connectorConfig));
+            if (!result.isValid()) {
+                throw new DebeziumException(String.join("; ", result.errors()));
+            }
         }
     }
 }

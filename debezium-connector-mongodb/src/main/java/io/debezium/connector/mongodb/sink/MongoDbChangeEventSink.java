@@ -12,7 +12,6 @@ import static io.debezium.openlineage.dataset.DatasetMetadata.DatasetKind.OUTPUT
 
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.stream.Collectors;
 
@@ -24,12 +23,12 @@ import org.bson.BsonDocument;
 import com.mongodb.MongoBulkWriteException;
 import com.mongodb.MongoNamespace;
 import com.mongodb.bulk.BulkWriteResult;
-import com.mongodb.client.MongoClient;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.WriteModel;
 
 import io.debezium.DebeziumException;
 import io.debezium.connector.common.DebeziumTaskState;
+import io.debezium.connector.mongodb.connection.client.MongoDbClient;
 import io.debezium.connector.mongodb.sink.converters.SinkDocument;
 import io.debezium.connector.mongodb.sink.eventhandler.relational.RelationalEventHandler;
 import io.debezium.dlq.ErrorReporter;
@@ -38,18 +37,19 @@ import io.debezium.openlineage.ConnectorContext;
 import io.debezium.openlineage.DebeziumOpenLineageEmitter;
 import io.debezium.openlineage.dataset.DatasetMetadata;
 import io.debezium.sink.DebeziumSinkRecord;
+import io.debezium.sink.batch.Batch;
 import io.debezium.sink.spi.ChangeEventSink;
 
 final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
 
     private final MongoDbSinkConnectorConfig sinkConfig;
-    private final MongoClient mongoClient;
+    private final MongoDbClient mongoClient;
     private final ErrorReporter errorReporter;
     private final ConnectorContext connectorContext;
 
     MongoDbChangeEventSink(
                            final MongoDbSinkConnectorConfig sinkConfig,
-                           final MongoClient mongoClient,
+                           final MongoDbClient mongoClient,
                            final ErrorReporter errorReporter, ConnectorContext connectorContext) {
         this.sinkConfig = sinkConfig;
         this.mongoClient = mongoClient;
@@ -57,17 +57,13 @@ final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
         this.connectorContext = connectorContext;
     }
 
-    @SuppressWarnings("try")
     @Override
     public void close() {
-        try (MongoClient autoCloseable = mongoClient) {
-            // just using try-with-resources to ensure they all get closed, even in the case of
-            // exceptions
-        }
+        mongoClient.close();
     }
 
-    public Optional<CollectionId> getCollectionId(String collectionName) {
-        return Optional.of(new CollectionId(collectionName));
+    public CollectionId getCollectionId(String collectionName) {
+        return new CollectionId(collectionName);
     }
 
     public void execute(final Collection<SinkRecord> records) {
@@ -118,7 +114,7 @@ final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
                     writeModels.size(),
                     namespace.getFullName(),
                     bulkWriteOrdered ? "ordered" : "unordered");
-            BulkWriteResult result = mongoClient
+            BulkWriteResult result = mongoClient.getClient()
                     .getDatabase(namespace.getDatabaseName())
                     .getCollection(namespace.getCollectionName(), BsonDocument.class)
                     .bulkWrite(writeModels, new BulkWriteOptions().ordered(bulkWriteOrdered));
@@ -172,4 +168,17 @@ final class MongoDbChangeEventSink implements ChangeEventSink, AutoCloseable {
                 .toList();
         return new DatasetMetadata(collectionId, OUTPUT, TABLE_DATASET_TYPE, DATABASE, fieldDefinitions);
     }
+
+    @Override
+    public List<Batch> put(Collection<SinkRecord> records) {
+        // NOP for now
+        return List.of();
+    }
+
+    @Override
+    public List<Batch> forcePoll() {
+        // NOP for now
+        return List.of();
+    }
+
 }

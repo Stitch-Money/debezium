@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Test;
 import org.postgresql.jdbc.PgConnection;
 
 import io.debezium.connector.postgresql.TestHelper;
+import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.doc.FixFor;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
@@ -142,6 +143,16 @@ public class PostgresConnectionIT {
     }
 
     @Test
+    @FixFor("debezium/dbz#2924")
+    void shouldNotConnectWhenCreatedWithTypeRegistryAndNoValueConverterBuilder() throws Exception {
+        final TypeRegistry typeRegistry = TestHelper.getTypeRegistry();
+        try (PostgresConnection connection = new PostgresConnection(TestHelper.defaultJdbcConfig(), typeRegistry, null, TestHelper.CONNECTION_TEST)) {
+            assertFalse(connection.isConnected());
+            assertThat(connection.getTypeRegistry()).isSameAs(typeRegistry);
+        }
+    }
+
+    @Test
     @FixFor("DBZ-934")
     @Disabled
     // Temporary slots no longer supported due to DBZ-2338
@@ -168,7 +179,7 @@ public class PostgresConnectionIT {
         Field connField = JdbcConnection.class.getDeclaredField("conn");
         connField.setAccessible(true);
 
-        return (PgConnection) connField.get(connection);
+        return ((Connection) connField.get(connection)).unwrap(PgConnection.class);
     }
 
     @Test

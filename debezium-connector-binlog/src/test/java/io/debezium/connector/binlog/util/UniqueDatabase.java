@@ -47,6 +47,14 @@ import io.debezium.storage.file.history.FileSchemaHistory;
  */
 public abstract class UniqueDatabase {
 
+    /**
+     * System property that, when set to {@code true}, runs the testsuite with the binlog-metadata-based
+     * schema mode ({@link BinlogConnectorConfig#BINLOG_METADATA_BASED_SCHEMA}) enabled for every connector
+     * configuration built through this class, so the whole suite can be executed either with or without a
+     * schema history.
+     */
+    public static final String BINLOG_METADATA_BASED_SCHEMA_PROPERTY = "use.binlog.metadata.based.schema";
+
     private static final String DEFAULT_DATABASE = "mysql";
     private static final String[] CREATE_DATABASE_DDL = new String[]{
             "CREATE DATABASE `$DBNAME$`;",
@@ -63,6 +71,7 @@ public abstract class UniqueDatabase {
     private final String templateName;
     private final String serverName;
     private Path dbHistoryPath;
+    private String binlogMetadataKeyColumns;
     private final String identifier;
 
     public UniqueDatabase(final String serverName, final String databaseName, final String identifier, final String charset) {
@@ -96,7 +105,7 @@ public abstract class UniqueDatabase {
     /**
      * Creates an instance with given Debezium logical name and database name and id suffix same
      * as another database. This is handy for tests that need multpli databases and can use regex
-     * based whitelisting.
+     * based include listing.
 
      * @param serverName - logical Debezium server name
      * @param databaseName - the name of the database (prix)
@@ -140,6 +149,25 @@ public abstract class UniqueDatabase {
     }
 
     /**
+     * @return true when the testsuite runs with the binlog-metadata-based schema mode enabled
+     *         (see {@link #BINLOG_METADATA_BASED_SCHEMA_PROPERTY})
+     */
+    public static boolean isBinlogMetadataBasedSchemaTestsuite() {
+        return Boolean.getBoolean(BINLOG_METADATA_BASED_SCHEMA_PROPERTY);
+    }
+
+    /**
+     * The binlog-metadata-based schema mode requires {@code binlog_row_metadata=FULL}. The variable is
+     * dynamic, so enable it before the test tables are created; their {@code TABLE_MAP} events then always
+     * carry the FULL metadata.
+     */
+    private static void ensureFullBinlogRowMetadata(JdbcConnection connection) throws Exception {
+        if (isBinlogMetadataBasedSchemaTestsuite()) {
+            connection.execute("SET GLOBAL binlog_row_metadata = 'FULL'");
+        }
+    }
+
+    /**
      * Creates the database and populates it with initialization SQL script. To use multiline
      * statements for stored procedures definition use delimiter $$ to delimit statements in the procedure.
      * See fnDbz162 procedure in reqression_test.sql for example of usage.
@@ -161,6 +189,7 @@ public abstract class UniqueDatabase {
         assertNotNull(ddlTestFile, "Cannot locate " + ddlFile);
         try {
             try (JdbcConnection connection = forTestDatabase(DEFAULT_DATABASE, urlProperties)) {
+                ensureFullBinlogRowMetadata(connection);
                 final List<String> statements = readFileContents(ddlTestFile.toURI(), (data) -> Arrays.stream(
                         Stream.concat(
                                 Arrays.stream(charset != null ? CREATE_DATABASE_WITH_CHARSET_DDL : CREATE_DATABASE_DDL),
@@ -181,6 +210,64 @@ public abstract class UniqueDatabase {
         catch (final Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    public void create(Map<String, Object> urlProperties) {
+        try (JdbcConnection connection = forTestDatabase(DEFAULT_DATABASE, urlProperties)) {
+            ensureFullBinlogRowMetadata(connection);
+            String[] ddl = charset != null ? CREATE_DATABASE_WITH_CHARSET_DDL : CREATE_DATABASE_DDL;
+
+            String[] statements = Arrays.stream(ddl)
+                    .map(String::trim)
+                    .filter(x -> !x.startsWith("--") && !x.isEmpty())
+                    .map(x -> {
+                        Matcher m = COMMENT_PATTERN.matcher(x);
+                        return m.matches() ? m.group(1) : x;
+                    })
+                    .map(this::convertSQL)
+                    .toArray(String[]::new);
+
+            connection.execute(statements);
+        }
+        catch (final Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public void create() {
+        create(Collections.emptyMap());
+    }
+
+    public void initialize(Map<String, Object> urlProperties) {
+        final String ddlFile = String.format("ddl/%s.sql", templateName);
+        final URL ddlTestFile = UniqueDatabase.class.getClassLoader().getResource(ddlFile);
+        assertNotNull(ddlTestFile, "Cannot locate " + ddlFile);
+        try (JdbcConnection connection = forTestDatabase(DEFAULT_DATABASE, urlProperties)) {
+            ensureFullBinlogRowMetadata(connection);
+            final List<String> statements = readFileContents(ddlTestFile.toURI(), (data) -> Arrays.stream(
+                    Stream.concat(
+                            Arrays.stream(new String[]{ "USE `$DBNAME$`;" }),
+                            data)
+                            .map(String::trim)
+                            .filter(x -> !x.startsWith("--") && !x.isEmpty())
+                            .map(x -> {
+                                final Matcher m = COMMENT_PATTERN.matcher(x);
+                                return m.matches() ? m.group(1) : x;
+                            })
+                            .map(this::convertSQL)
+                            .collect(Collectors.joining("\n"))
+                            .split(";"))
+                    .map(x -> x.replace("$$", ";"))
+                    .collect(Collectors.toList()));
+            connection.execute(statements.toArray(new String[0]));
+        }
+        catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public void initialize() {
+        initialize(Collections.emptyMap());
     }
 
     /**
@@ -260,12 +347,32 @@ public abstract class UniqueDatabase {
      * database not filtered by default
      */
     public Configuration.Builder defaultConfigWithoutDatabaseFilter() {
-        return defaultJdbcConfigBuilder()
+        final Builder builder = defaultJdbcConfigBuilder()
                 .with(BinlogConnectorConfig.SERVER_ID, 18765)
                 .with(BinlogConnectorConfig.POLL_INTERVAL_MS, 10)
                 .with(BinlogConnectorConfig.SCHEMA_HISTORY, FileSchemaHistory.class)
                 .with(BinlogConnectorConfig.BUFFER_SIZE_FOR_BINLOG_READER, 10_000)
                 .with(CommonConnectorConfig.TOPIC_PREFIX, getServerName());
+        if (isBinlogMetadataBasedSchemaTestsuite()) {
+            // Run the testsuite with the schema reconstructed from the binlog TABLE_MAP metadata instead
+            // of from the schema history, so that the suite verifies both modes are compatible. The schema
+            // history configured above is ignored by the connector in this mode.
+            builder.with(BinlogConnectorConfig.BINLOG_METADATA_BASED_SCHEMA, true);
+            if (binlogMetadataKeyColumns != null) {
+                builder.with(BinlogConnectorConfig.MSG_KEY_COLUMNS, convertSQL(binlogMetadataKeyColumns));
+            }
+        }
+        return builder;
+    }
+
+    /**
+     * Supplies explicit message keys for keyless test tables when running the metadata-based suite.
+     * The mapping uses the message.key.columns syntax; $DBNAME$ is replaced with this database's unique name.
+     * Tests that exercise missing-key validation must leave this unset.
+     */
+    public UniqueDatabase withBinlogMetadataKeyColumns(String keyColumns) {
+        this.binlogMetadataKeyColumns = keyColumns;
+        return this;
     }
 
     /**

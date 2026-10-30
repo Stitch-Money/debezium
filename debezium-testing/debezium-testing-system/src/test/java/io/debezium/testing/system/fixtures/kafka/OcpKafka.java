@@ -28,6 +28,7 @@ import io.debezium.testing.system.tools.kafka.OcpKafkaDeployer;
 import io.debezium.testing.system.tools.kafka.StrimziOperatorController;
 import io.debezium.testing.system.tools.kafka.builders.FabricKafkaBuilder;
 import io.debezium.testing.system.tools.kafka.builders.FabricKafkaConnectBuilder;
+import io.debezium.util.Strings;
 import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.openshift.client.OpenShiftClient;
 
@@ -45,6 +46,7 @@ public class OcpKafka extends TestFixture {
 
     // Kafka resources
     String KAFKA_CONNECT_LOGGING = "/kafka-resources/020-kafka-connect-cfg.yaml";
+    String KAFKA_CONNECT_LOGGING_LOG4J1 = "/kafka-resources/020-kafka-connect-cfg-log4j1.yaml";
     // Artifact Server resources
     String ARTIFACT_SERVER_DEPLOYMENT = "/artifact-server/010-deployment.yaml";
     String ARTIFACT_SERVER_SERVICE = "/artifact-server/020-service.yaml";
@@ -88,9 +90,16 @@ public class OcpKafka extends TestFixture {
         return controller;
     }
 
-    private void deployConnectCluster(StrimziOperatorController operatorController, OcpKafkaController kafkaController) throws Exception {
-        ConfigMap configMap = YAML.fromResource(KAFKA_CONNECT_LOGGING, ConfigMap.class);
+    private String selectLoggingConfig() {
+        var kafkaVersion = ConfigProperties.VERSION_KAFKA;
+        if (!Strings.isNullOrEmpty(kafkaVersion) && kafkaVersion.startsWith("3.")) {
+            return KAFKA_CONNECT_LOGGING_LOG4J1;
+        }
+        return KAFKA_CONNECT_LOGGING;
+    }
 
+    private void deployConnectCluster(StrimziOperatorController operatorController, OcpKafkaController kafkaController) throws Exception {
+        ConfigMap configMap = YAML.fromResource(selectLoggingConfig(), ConfigMap.class);
         OcpArtifactServerController artifactServerController = deployArtifactServer();
 
         FabricKafkaConnectBuilder builder = FabricKafkaConnectBuilder
@@ -100,6 +109,12 @@ public class OcpKafka extends TestFixture {
                 .withConnectorResources(STRIMZI_OPERATOR_CONNECTORS)
                 .withBuild(artifactServerController)
                 .withPullSecret(operatorController.getPullSecret());
+
+        String kafkaVersion = ConfigProperties.VERSION_KAFKA;
+        if (!Strings.isNullOrEmpty(kafkaVersion)) {
+            builder.withVersion(kafkaVersion);
+        }
+
         if (ConfigProperties.DATABASE_MONGO_USE_TLS) {
             OcpMongoCertGenerator.generateMongoTestCerts(ocp);
             builder.withMongoCerts();

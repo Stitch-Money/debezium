@@ -12,16 +12,19 @@ import java.util.Map;
 import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.Task;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkConnector;
 
 import io.debezium.annotation.Immutable;
 import io.debezium.config.Configuration;
+import io.debezium.config.Field;
+import io.debezium.connector.mongodb.connection.MongoDbConnectionContext;
 import io.debezium.connector.mongodb.sink.Module;
 import io.debezium.connector.mongodb.sink.MongoDbSinkConnectorConfig;
 import io.debezium.connector.mongodb.sink.MongoDbSinkConnectorTask;
-import io.debezium.connector.mongodb.sink.SinkConnection;
+import io.debezium.metadata.ConfigDescriptor;
 
-public class MongoDbSinkConnector extends SinkConnector {
+public class MongoDbSinkConnector extends SinkConnector implements ConfigDescriptor {
 
     @Immutable
     private Map<String, String> properties;
@@ -60,6 +63,11 @@ public class MongoDbSinkConnector extends SinkConnector {
     }
 
     @Override
+    public Field.Set getConfigFields() {
+        return MongoDbSinkConnectorConfig.ALL_FIELDS;
+    }
+
+    @Override
     public Config validate(Map<String, String> connectorConfigs) {
         Config config = super.validate(connectorConfigs);
 
@@ -72,7 +80,23 @@ public class MongoDbSinkConnector extends SinkConnector {
             return config;
         }
 
-        SinkConnection.canConnect(config, MongoDbSinkConnectorConfig.CONNECTION_STRING);
+        final var connectionStringValidation = config.configValues().stream()
+                .filter(value -> value.name().equals(MongoDbSinkConnectorConfig.CONNECTION_STRING.name()))
+                .findFirst().orElseThrow();
+        if (connectionStringValidation.errorMessages().isEmpty()) {
+            try (var connectionContext = new MongoDbConnectionContext(Configuration.from(connectorConfigs))) {
+                if (!connectionContext.canConnect()) {
+                    connectionStringValidation.addErrorMessage("Unable to connect to the server.");
+                }
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ConnectException(e);
+            }
+            catch (RuntimeException e) {
+                connectionStringValidation.addErrorMessage("Error during connection validation: " + e.getMessage());
+            }
+        }
 
         return config;
     }

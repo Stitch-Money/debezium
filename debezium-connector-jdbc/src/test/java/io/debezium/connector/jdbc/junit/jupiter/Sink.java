@@ -72,14 +72,14 @@ public class Sink extends JdbcConnectionProvider {
     }
 
     public String formatTableName(String tableName) {
-        if (type.is(SinkType.ORACLE, SinkType.DB2)) {
+        if (type.is(SinkType.ORACLE, SinkType.DB2, SinkType.DB2I)) {
             return tableName.toUpperCase();
         }
         return tableName;
     }
 
     public String formatColumnName(String columnName) {
-        if (type.is(SinkType.ORACLE, SinkType.DB2)) {
+        if (type.is(SinkType.ORACLE, SinkType.DB2, SinkType.DB2I)) {
             return columnName.toUpperCase();
         }
         return columnName;
@@ -199,6 +199,15 @@ public class Sink extends JdbcConnectionProvider {
                 commands.add("-c");
                 commands.add("show time zone; select * from public." + tableName);
                 break;
+            case COCKROACHDB:
+                commands.add("/cockroach/cockroach");
+                commands.add("sql");
+                commands.add("--insecure");
+                commands.add("-d");
+                commands.add("test");
+                commands.add("-e");
+                commands.add("show time zone; select * from public." + tableName);
+                break;
             case ORACLE:
                 commands.add("bash");
                 commands.add("-c");
@@ -237,6 +246,11 @@ public class Sink extends JdbcConnectionProvider {
             if (SinkType.SQLSERVER.is(type)) {
                 try (Statement statement = connection.createStatement()) {
                     statement.execute("USE testDB");
+                }
+            }
+            if (SinkType.SINGLESTORE.is(type)) {
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute("SET vector_type_project_format = JSON");
                 }
             }
         }

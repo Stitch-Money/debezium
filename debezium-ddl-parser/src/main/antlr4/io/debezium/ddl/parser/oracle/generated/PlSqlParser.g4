@@ -1615,8 +1615,9 @@ index_expr
     ;
 
 index_properties
-    : (global_partitioned_index | local_partitioned_index | index_attributes)+
-    | INDEXTYPE IS (domain_index_clause | xmlindex_clause)
+    : ( (global_partitioned_index | local_partitioned_index | index_attributes)+
+        | INDEXTYPE IS (domain_index_clause | xmlindex_clause)
+    )*
     ;
 
 domain_index_clause
@@ -1844,11 +1845,7 @@ index_partition_description
     ;
 
 modify_index_subpartition
-    : MODIFY SUBPARTITION subpartition_name (
-        UNUSABLE
-        | allocate_extent_clause
-        | deallocate_unused_clause
-    )
+    : MODIFY SUBPARTITION subpartition_name (UNUSABLE | modify_index_partitions_ops)
     ;
 
 partition_name_old
@@ -3126,8 +3123,8 @@ create_materialized_view_log
     // table_partitioning_clauses TODO
     (
         WITH (','? ( OBJECT ID | PRIMARY KEY | ROWID | SEQUENCE | COMMIT SCN))* (
-            '(' ( ','? regular_id)+ ')' new_values_clause?
-        )? mv_log_purge_clause?
+            '(' ( ','? regular_id)+ ')'
+        )? new_values_clause? mv_log_purge_clause?
     )*
     ;
 
@@ -3421,9 +3418,7 @@ xmltype_storage
     ;
 
 xmlschema_spec
-    : (XMLSCHEMA DELIMITED_ID)? ELEMENT DELIMITED_ID (allow_or_disallow NONSCHEMA)? (
-        allow_or_disallow ANYSCHEMA
-    )?
+    : ((XMLSCHEMA DELIMITED_ID)? ELEMENT id_expression)? (allow_or_disallow (NONSCHEMA | ANYSCHEMA))*
     ;
 
 object_table
@@ -3621,9 +3616,13 @@ range_partitions
     ;
 
 list_partitions
-    : PARTITION BY LIST '(' column_name ')' '(' PARTITION partition_name? list_values_clause table_partition_description (
-        ',' PARTITION partition_name? list_values_clause table_partition_description
-    )* ')'
+    : PARTITION BY LIST '(' column_name (',' column_name)* ')' (
+        AUTOMATIC (STORE IN '(' tablespace (',' tablespace)* ')')?
+    )? (
+        '(' PARTITION partition_name? list_values_clause table_partition_description (
+            ',' PARTITION partition_name? list_values_clause table_partition_description
+        )* ')'
+    )?
     ;
 
 hash_partitions
@@ -3779,7 +3778,10 @@ range_values_list
     ;
 
 list_values_clause
-    : VALUES '(' (literal (',' literal)* | TIMESTAMP literal (',' TIMESTAMP literal)* | DEFAULT) ')'
+    : VALUES '(' (
+        (literal (',' literal)* | TIMESTAMP literal (',' TIMESTAMP literal)* | DEFAULT)
+        | '(' (literal (',' literal*) | TIMESTAMP literal (',' TIMESTAMP literal)* | DEFAULT) ')'
+    ) ')'
     ;
 
 table_partition_description
@@ -4997,6 +4999,7 @@ alter_table
         | alter_table_partitioning
         //TODO      | alter_external_table
         | move_table_clause
+        | modify_to_partitioned
     ) ((enable_disable_clause | enable_or_disable (TABLE LOCK | ALL TRIGGERS))+)?
     ;
 
@@ -5011,6 +5014,7 @@ alter_table_properties
     | READ ONLY
     | READ WRITE
     | REKEY CHAR_STRING
+    | NO? ROW ARCHIVAL
     | annotations_clause? // todo: not upstream
     ;
 
@@ -5047,12 +5051,9 @@ merge_table_partition
     ;
 
 modify_table_partition
-    : MODIFY (
-        (PARTITION | SUBPARTITION) partition_name ((ADD | DROP) list_values_clause)? (ADD range_subpartition_desc)? (
-            REBUILD? UNUSABLE LOCAL INDEXES
-        )? shrink_clause?
-        | range_partitions
-    )
+    : MODIFY (PARTITION | SUBPARTITION) partition_name ((ADD | DROP) list_values_clause)? (
+        ADD range_subpartition_desc
+    )? (REBUILD? UNUSABLE LOCAL INDEXES)? shrink_clause?
     ;
 
 split_table_partition
@@ -5212,6 +5213,7 @@ index_attributes
     : (
         physical_attributes_clause
         | logging_clause
+        | ONLINE
         | TABLESPACE (tablespace | DEFAULT)
         | key_compression
         | sort_or_nosort
@@ -5235,6 +5237,10 @@ move_table_clause
         lob_storage_clause
         | varray_col_properties
     )* parallel_clause?
+    ;
+
+modify_to_partitioned
+    : MODIFY (table_partitioning_clauses | NONPARTITIONED) filter_condition? ONLINE? update_index_clauses?
     ;
 
 index_org_table_clause
@@ -5310,7 +5316,11 @@ modify_column_clauses
     ;
 
 modify_col_properties
-    : column_name datatype? (DEFAULT (ON NULL_)? expression)? (ENCRYPT encryption_spec | DECRYPT)? inline_constraint* lob_storage_clause? annotations_clause?
+    : column_name datatype? (
+        DEFAULT (ON NULL_)? expression
+        | identity_clause
+        | DROP IDENTITY
+    )? (ENCRYPT encryption_spec | DECRYPT)? inline_constraint* lob_storage_clause? annotations_clause?
     //TODO alter_xmlschema_clause
     ;
 
@@ -5322,10 +5332,14 @@ modify_col_substitutable
     : COLUMN column_name NOT? SUBSTITUTABLE AT ALL LEVELS FORCE?
     ;
 
+// The documented BNF only permits column definitions here, but the server also accepts
+// out-of-line (ref) constraints mixed into the list, as in CREATE TABLE's relational_properties.
+// Constraints must precede column_definition so that "CONSTRAINT name ..." is not parsed as
+// a column named CONSTRAINT with a type of the constraint's name.
 add_column_clause
     : ADD (
-        '(' (column_definition | virtual_column_definition) (
-            ',' (column_definition | virtual_column_definition)
+        '(' (out_of_line_constraint | out_of_line_ref_constraint | column_definition | virtual_column_definition) (
+            ',' (out_of_line_constraint | out_of_line_ref_constraint | column_definition | virtual_column_definition)
         )* ')'
         | ( column_definition | virtual_column_definition)
     ) column_properties?
@@ -5347,6 +5361,7 @@ varray_storage_clause
 
 lob_segname
     : regular_id
+    | DELIMITED_ID
     ;
 
 lob_item
@@ -5399,7 +5414,7 @@ modify_lob_parameters
 
 lob_parameters
     : (
-        (ENABLE | DISABLE) STORAGE IN ROW
+        (ENABLE | DISABLE) STORAGE IN ROW UNSIGNED_INTEGER?
         | CHUNK UNSIGNED_INTEGER
         | PCTVERSION UNSIGNED_INTEGER
         | FREEPOOLS UNSIGNED_INTEGER
@@ -9189,6 +9204,7 @@ non_reserved_keywords_pre12c
     | OVERFLOW_NOMOVE
     | OVERLAPS
     | OVER
+    | OVERRIDE
     | OWNER
     | OWNERSHIP
     | OWN

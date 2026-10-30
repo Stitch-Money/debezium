@@ -10,10 +10,16 @@ import static io.debezium.connector.postgresql.TestHelper.PK_FIELD;
 import static io.debezium.connector.postgresql.TestHelper.topicName;
 import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -23,17 +29,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.config.Configuration;
@@ -49,10 +59,14 @@ import io.debezium.doc.FixFor;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.junit.SkipWhenDatabaseVersion;
-import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.RelationalDatabaseConnectorConfig.DecimalHandlingMode;
 import io.debezium.spi.converter.CustomConverter;
 import io.debezium.spi.converter.RelationalColumn;
+import io.debezium.time.Date;
+import io.debezium.time.IsoTime;
+import io.debezium.time.MicroTimestamp;
+import io.debezium.time.ZonedTime;
+import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.Collect;
 
 /**
@@ -93,6 +107,39 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
                     totalCount.incrementAndGet(), expectedValuesByTopicName.size(),
                     1, 1);
             assertRecordOffsetAndSnapshotSource(record, expected);
+        });
+    }
+
+    @Test
+    @FixFor({ "debezium/dbz#2025", "debezium/dbz#2772" })
+    public void shouldGenerateSnapshotForVarbit1Datatype() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+
+        TestHelper.execute(INSERT_BIN_TYPES_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig());
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        consumer.process(record -> {
+            assertReadRecord(record, schemaAndValuesByTopicName());
+            assertSourceInfo(record);
+            assertRecordOffsetAndSnapshotSource(record, SnapshotRecord.LAST);
+
+            Struct value = (Struct) record.value();
+            Struct after = value.getStruct(Envelope.FieldName.AFTER);
+
+            // Verify bv1 (varbit(1)) field exists and has the correct value and type
+            byte[] varbit1Value = after.getBytes("bv1");
+            assertNotNull(varbit1Value, "varbit(1) field 'bv1' should not be NULL in snapshot");
+            assertArrayEquals(new byte[]{ 1 }, varbit1Value, "varbit(1) field 'bv1' should be bytes {1}");
+
+            // Verify bit(1) field works
+            Boolean bit1Value = after.getBoolean("bol");
+            assertNotNull(bit1Value, "bit(1) field 'bol' should not be NULL in snapshot");
+            assertFalse(bit1Value, "bit(1) field 'bol' should be false");
         });
     }
 
@@ -292,8 +339,6 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
     @Test
     void shouldStreamAfterSnapshot() throws Exception {
-
-        LogInterceptor logInterceptor = new LogInterceptor(PostgresStreamingChangeEventSource.class);
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
 
@@ -316,7 +361,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         consumer.await(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS);
         consumer.clear();
 
-        assertThat(logInterceptor.containsMessage("Processing messages")).isTrue();
+        waitForStreamingToStart();
     }
 
     @Test
@@ -617,6 +662,49 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     }
 
     @Test
+    @FixFor("debezium/dbz#2100")
+    public void shouldGenerateSnapshotForTwentyFourHourTimeWithTimeZone() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.execute("CREATE TABLE timetz_boundary_table (pk SERIAL, ttz0 TIME(0) WITH TIME ZONE, ttz6 TIME(6) WITH TIME ZONE, PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO timetz_boundary_table (ttz0, ttz6) VALUES ('23:59:59.999999+00'::TIMETZ, '24:00:00+00'::TIMETZ);");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.timetz_boundary_table"));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.timetz_boundary_table",
+                Arrays.asList(
+                        new SchemaAndValueField("ttz0", ZonedTime.builder().optional().build(), "24:00:00Z"),
+                        new SchemaAndValueField("ttz6", ZonedTime.builder().optional().build(), "24:00:00Z")));
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2100")
+    public void shouldGenerateSnapshotForTwentyFourHourTimeWithTimeZoneArray() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.execute("CREATE TABLE timetz_boundary_array_table (pk SERIAL, ttz TIMETZ[] NOT NULL, PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO timetz_boundary_array_table (ttz) VALUES ("
+                + "ARRAY['23:59:59.999999+00'::TIMETZ(0), '24:00:00+00'::TIMETZ, '00:00:00+00'::TIMETZ, NULL::TIMETZ]);");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.timetz_boundary_array_table"));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.timetz_boundary_array_table",
+                Collections.singletonList(new SchemaAndValueField("ttz",
+                        SchemaBuilder.array(ZonedTime.builder().optional().build()).build(),
+                        Arrays.asList("24:00:00Z", "24:00:00Z", "00:00:00Z", null))));
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
     @FixFor("DBZ-1345")
     public void shouldNotSnapshotMaterializedViews() throws Exception {
         TestHelper.dropAllSchemas();
@@ -688,6 +776,23 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
         final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.cash_table", schemaAndValuesForNullMoneyTypes());
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2100")
+    public void shouldGenerateSnapshotForLargeNegativeMoneyWithoutPrecisionLoss() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute("INSERT INTO cash_table (csh) VALUES ('-92233720368547758.08'::money)");
+
+        buildNoStreamProducer(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.cash_table"));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final List<SchemaAndValueField> expected = Collections.singletonList(new SchemaAndValueField("csh", Decimal.builder(2).optional().build(),
+                new BigDecimal("-92233720368547758.08")));
+        consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.cash_table", expected)));
     }
 
     @Test
@@ -986,7 +1091,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
         List<SchemaAndValueField> expected = Collections.singletonList(
-                new SchemaAndValueField("value", SchemaBuilder.array(Enum.builder("V1,V2"))
+                new SchemaAndValueField("value", SchemaBuilder.array(Enum.builder("V1,V2").optional().build())
                         .parameter(TestHelper.TYPE_NAME_PARAMETER_KEY, "_TEST_TYPE")
                         .parameter(TestHelper.TYPE_LENGTH_PARAMETER_KEY, String.valueOf(Integer.MAX_VALUE))
                         .parameter(TestHelper.TYPE_SCALE_PARAMETER_KEY, "0")
@@ -1019,6 +1124,48 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
         consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.time_array_table", schemaAndValuesForTimeArrayTypes())));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2559")
+    public void shouldSnapshotFractionalTimeArrayIndependentOfJvmZone() throws Exception {
+        TimeZone original = TimeZone.getDefault();
+        TimeZone.setDefault(TimeZone.getTimeZone("GMT+3"));
+        try {
+            TestHelper.execute("CREATE TABLE time_precision_array_table (pk SERIAL, timea time(6)[] NOT NULL, primary key(pk));");
+            TestHelper.execute("INSERT INTO time_precision_array_table (timea) VALUES "
+                    + "('{\"02:59:59.999999\", \"02:59:59.999999\"}'), "
+                    + "('{\"03:00:00.000000\", \"03:00:00.000000\"}'), "
+                    + "('{\"03:00:00.123456\", \"03:00:00.123456\"}')");
+
+            buildNoStreamProducer(TestHelper.defaultConfig()
+                    .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, false)
+                    .with(PostgresConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.ISOSTRING)
+                    .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.time_precision_array_table"));
+
+            final TestConsumer consumer = testConsumer(3, "public");
+            consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+            final List<SourceRecord> records = new ArrayList<>();
+            consumer.process(records::add);
+            assertThat(records).hasSize(3);
+
+            assertRecordSchemaAndValues(List.of(timeArrayField(
+                    List.of("02:59:59.999999Z", "02:59:59.999999Z"))), records.get(0), Envelope.FieldName.AFTER);
+            assertRecordSchemaAndValues(List.of(timeArrayField(
+                    List.of("03:00:00Z", "03:00:00Z"))), records.get(1), Envelope.FieldName.AFTER);
+            assertRecordSchemaAndValues(List.of(timeArrayField(
+                    List.of("03:00:00.123456Z", "03:00:00.123456Z"))), records.get(2), Envelope.FieldName.AFTER);
+        }
+        finally {
+            TimeZone.setDefault(original);
+        }
+    }
+
+    private static SchemaAndValueField timeArrayField(List<String> values) {
+        return new SchemaAndValueField("timea",
+                SchemaBuilder.array(IsoTime.builder().optional().build()).build(),
+                values);
     }
 
     @Test
@@ -1168,7 +1315,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsBytes() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true));
@@ -1176,7 +1323,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBytes());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table", schemaAndValueForUnknownColumnBytes());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1186,7 +1333,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsBase64() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
@@ -1195,7 +1342,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBase64());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table", schemaAndValueForUnknownColumnBase64());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1205,7 +1352,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsBase64UrlSafe() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
@@ -1214,7 +1361,8 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBase64UrlSafe());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table",
+                schemaAndValueForUnknownColumnBase64UrlSafe());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1224,7 +1372,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     public void shouldGenerateSnapshotForUnknownColumnAsHex() throws Exception {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
-        TestHelper.execute(INSERT_CIRCLE_STMT);
+        TestHelper.execute(INSERT_UNKNOWN_TYPE_STMT);
 
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
@@ -1233,7 +1381,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
-        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnHex());
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.unknown_type_table", schemaAndValueForUnknownColumnHex());
 
         consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
@@ -1321,6 +1469,273 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         buildWithStreamProducer(TestHelper.defaultConfig());
         waitForSnapshotToBeCompleted();
         waitForStreamingToStart();
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1916")
+    public void shouldSnapshotPre1582TimestampCorrectly() throws Exception {
+        TestHelper.execute("CREATE TABLE pre1582_ts_table (pk SERIAL, "
+                + "ts TIMESTAMP NOT NULL, "
+                + "tstz TIMESTAMPTZ NOT NULL, "
+                + "PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO pre1582_ts_table (ts, tstz) VALUES ("
+                + "'0001-01-31T00:00:00'::TIMESTAMP, "
+                + "'0001-01-31T00:00:00+00'::TIMESTAMPTZ)");
+        TestHelper.execute("INSERT INTO pre1582_ts_table (ts, tstz) VALUES ("
+                + "'1000-06-15T12:30:45.123456'::TIMESTAMP, "
+                + "'1000-06-15T12:30:45.123456+00'::TIMESTAMPTZ)");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.pre1582_ts_table"));
+
+        final TestConsumer consumer = testConsumer(2, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final long expectedTsMicros1 = java.time.LocalDateTime.of(1, 1, 31, 0, 0, 0)
+                .toInstant(java.time.ZoneOffset.UTC).getEpochSecond() * 1_000_000;
+        final String expectedTstz1 = "0001-01-31T00:00:00.000000Z";
+
+        final long expectedTsMicros2 = java.time.LocalDateTime.of(1000, 6, 15, 12, 30, 45, 123456000)
+                .toInstant(java.time.ZoneOffset.UTC).getEpochSecond() * 1_000_000 + 123456;
+        final String expectedTstz2 = "1000-06-15T12:30:45.123456Z";
+
+        final List<SchemaAndValueField> expected1 = Arrays.asList(
+                new SchemaAndValueField("ts", MicroTimestamp.builder().build(), expectedTsMicros1),
+                new SchemaAndValueField("tstz", ZonedTimestamp.builder().build(), expectedTstz1));
+
+        final List<SchemaAndValueField> expected2 = Arrays.asList(
+                new SchemaAndValueField("ts", MicroTimestamp.builder().build(), expectedTsMicros2),
+                new SchemaAndValueField("tstz", ZonedTimestamp.builder().build(), expectedTstz2));
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(2);
+        VerifyRecord.isValidRead(records.get(0), PK_FIELD, 1);
+        assertRecordSchemaAndValues(expected1, records.get(0), Envelope.FieldName.AFTER);
+        VerifyRecord.isValidRead(records.get(1), PK_FIELD, 2);
+        assertRecordSchemaAndValues(expected2, records.get(1), Envelope.FieldName.AFTER);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2686")
+    public void shouldSnapshotBcLeapDayTimestamp() throws Exception {
+        TestHelper.execute("CREATE TABLE bc_leap_ts_table (pk SERIAL, ts TIMESTAMP, tstz TIMESTAMPTZ, PRIMARY KEY(pk));");
+        // February 29 of a BC leap year: pgjdbc rejects it in the typed read, so it must fall back to the text form
+        TestHelper.execute("INSERT INTO bc_leap_ts_table (ts, tstz) VALUES "
+                + "('0005-02-29 12:34:56 BC'::TIMESTAMP, NULL), "
+                + "(NULL, '0005-02-29 12:34:56+00 BC'::TIMESTAMPTZ), "
+                + "('0001-02-29 00:00:00.5 BC'::TIMESTAMP, '0001-02-29 00:00:00.5+00 BC'::TIMESTAMPTZ)");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.bc_leap_ts_table"));
+
+        final TestConsumer consumer = testConsumer(3, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        // 5 BC is year -4 and 1 BC is year 0 in proleptic ISO
+        final long fiveBcMicros = LocalDateTime.of(-4, 2, 29, 12, 34, 56).toInstant(ZoneOffset.UTC).getEpochSecond() * 1_000_000;
+        final long oneBcMicros = LocalDateTime.of(0, 2, 29, 0, 0, 0).toInstant(ZoneOffset.UTC).getEpochSecond() * 1_000_000 + 500_000;
+
+        final List<List<SchemaAndValueField>> expected = Arrays.asList(
+                Arrays.asList(
+                        new SchemaAndValueField("ts", MicroTimestamp.builder().optional().build(), fiveBcMicros),
+                        new SchemaAndValueField("tstz", ZonedTimestamp.builder().optional().build(), null)),
+                Arrays.asList(
+                        new SchemaAndValueField("ts", MicroTimestamp.builder().optional().build(), null),
+                        new SchemaAndValueField("tstz", ZonedTimestamp.builder().optional().build(), "-0004-02-29T12:34:56.000000Z")),
+                Arrays.asList(
+                        new SchemaAndValueField("ts", MicroTimestamp.builder().optional().build(), oneBcMicros),
+                        new SchemaAndValueField("tstz", ZonedTimestamp.builder().optional().build(), "0000-02-29T00:00:00.500000Z")));
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(3);
+        for (int i = 0; i < expected.size(); i++) {
+            VerifyRecord.isValidRead(records.get(i), PK_FIELD, i + 1);
+            assertRecordSchemaAndValues(expected.get(i), records.get(i), Envelope.FieldName.AFTER);
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2664")
+    public void shouldSnapshotDatePreservingEra() throws Exception {
+        TestHelper.execute("CREATE TABLE era_date_table (pk SERIAL, d DATE, PRIMARY KEY(pk));");
+        // a BC date, a pre-cutover AD date, the first Gregorian day, and an ordinary one. Only the
+        // first is era-sensitive; the others must be left exactly as they are.
+        TestHelper.execute("INSERT INTO era_date_table (d) VALUES "
+                + "('0001-03-07 BC'), ('1582-10-04'), ('1582-10-15'), ('2024-02-29'), (NULL)");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.era_date_table"));
+
+        final TestConsumer consumer = testConsumer(5, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        // io.debezium.time.Date is epoch days. LocalDate.of(0, ...) is 1 BC in proleptic ISO.
+        final Integer[] expectedEpochDays = {
+                (int) LocalDate.of(0, 3, 7).toEpochDay(),
+                (int) LocalDate.of(1582, 10, 4).toEpochDay(),
+                (int) LocalDate.of(1582, 10, 15).toEpochDay(),
+                (int) LocalDate.of(2024, 2, 29).toEpochDay(),
+                null
+        };
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(5);
+        for (int i = 0; i < expectedEpochDays.length; i++) {
+            VerifyRecord.isValidRead(records.get(i), PK_FIELD, i + 1);
+            assertRecordSchemaAndValues(
+                    Arrays.asList(new SchemaAndValueField("d", Date.builder().optional().build(), expectedEpochDays[i])),
+                    records.get(i), Envelope.FieldName.AFTER);
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2721")
+    public void shouldSnapshotBcLeapDayDate() throws Exception {
+        TestHelper.execute("CREATE TABLE bc_leap_date_table (pk SERIAL, d DATE, PRIMARY KEY(pk));");
+        // February 29 of a BC leap year: pgjdbc rejects it in the typed read, so it must fall back to the text form
+        TestHelper.execute("INSERT INTO bc_leap_date_table (d) VALUES ('0005-02-29 BC'), ('0001-02-29 BC')");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.bc_leap_date_table"));
+
+        final TestConsumer consumer = testConsumer(2, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        // 5 BC is year -4 and 1 BC is year 0 in proleptic ISO
+        final Integer[] expectedEpochDays = {
+                (int) LocalDate.of(-4, 2, 29).toEpochDay(),
+                (int) LocalDate.of(0, 2, 29).toEpochDay()
+        };
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(2);
+        for (int i = 0; i < expectedEpochDays.length; i++) {
+            VerifyRecord.isValidRead(records.get(i), PK_FIELD, i + 1);
+            assertRecordSchemaAndValues(
+                    Arrays.asList(new SchemaAndValueField("d", Date.builder().optional().build(), expectedEpochDays[i])),
+                    records.get(i), Envelope.FieldName.AFTER);
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2664")
+    public void shouldSnapshotTemporalArraysPreservingEra() throws Exception {
+        TestHelper.execute("CREATE TABLE era_array_table (pk SERIAL, "
+                + "ts_arr TIMESTAMP[], tstz_arr TIMESTAMPTZ[], d_arr DATE[], PRIMARY KEY(pk));");
+        // each array pairs a BC element with a pre-cutover one; the three element types fail
+        // differently without the fix, so each needs its own assertion.
+        TestHelper.execute("INSERT INTO era_array_table (ts_arr, tstz_arr, d_arr) VALUES ("
+                + "'{0001-03-07 10:30:59 BC,1582-10-04 23:59:59}', "
+                + "'{0001-03-07 10:30:59+00 BC,1582-10-04 23:59:59+00}', "
+                + "'{0001-03-07 BC,1582-10-04}')");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.era_array_table"));
+
+        final TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final long bcMicros = LocalDateTime.of(0, 3, 7, 10, 30, 59).toInstant(ZoneOffset.UTC).getEpochSecond() * 1_000_000;
+        final long cutoverMicros = LocalDateTime.of(1582, 10, 4, 23, 59, 59).toInstant(ZoneOffset.UTC).getEpochSecond() * 1_000_000;
+
+        final List<SchemaAndValueField> expected = Arrays.asList(
+                new SchemaAndValueField("ts_arr",
+                        SchemaBuilder.array(MicroTimestamp.builder().optional().build()).optional().build(),
+                        Arrays.asList(bcMicros, cutoverMicros)),
+                new SchemaAndValueField("tstz_arr",
+                        SchemaBuilder.array(ZonedTimestamp.builder().optional().build()).optional().build(),
+                        // 0000 is 1 BC in proleptic ISO, and the cutover day must not shift by 10 days
+                        Arrays.asList("0000-03-07T10:30:59.000000Z", "1582-10-04T23:59:59.000000Z")),
+                new SchemaAndValueField("d_arr",
+                        SchemaBuilder.array(Date.builder().optional().build()).optional().build(),
+                        Arrays.asList((int) LocalDate.of(0, 3, 7).toEpochDay(), (int) LocalDate.of(1582, 10, 4).toEpochDay())));
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(1);
+        VerifyRecord.isValidRead(records.get(0), PK_FIELD, 1);
+        assertRecordSchemaAndValues(expected, records.get(0), Envelope.FieldName.AFTER);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = TemporalPrecisionMode.class, names = { "ADAPTIVE", "CONNECT", "ISOSTRING", "STRUCTURED" })
+    @FixFor("debezium/dbz#2664")
+    public void shouldSnapshotInfinityTemporalArraysMatchingScalars(TemporalPrecisionMode mode) throws Exception {
+        TestHelper.execute("DROP TABLE IF EXISTS inf_array_table;");
+        TestHelper.execute("CREATE TABLE inf_array_table (pk SERIAL, "
+                + "d DATE, d_arr DATE[], "
+                + "ts TIMESTAMP, ts_arr TIMESTAMP[], "
+                + "tstz TIMESTAMPTZ, tstz_arr TIMESTAMPTZ[], PRIMARY KEY(pk));");
+        // Reading date[]/timestamp[] elements as text (this fix) sends an infinity element down a
+        // different path than the matching scalar column. It must still emit exactly what the scalar
+        // emits, in every precision mode -- assert that invariant rather than pinning each mode's
+        // sentinel encoding, so the test documents equivalence without hard-coding overflow values.
+        TestHelper.execute("INSERT INTO inf_array_table (d, d_arr, ts, ts_arr, tstz, tstz_arr) VALUES "
+                + "('infinity','{infinity}','infinity','{infinity}','infinity','{infinity}'), "
+                + "('-infinity','{-infinity}','-infinity','{-infinity}','-infinity','{-infinity}')");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.inf_array_table")
+                .with(PostgresConnectorConfig.TIME_PRECISION_MODE, mode));
+
+        final TestConsumer consumer = testConsumer(2, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(2);
+        for (int i = 0; i < records.size(); i++) {
+            VerifyRecord.isValidRead(records.get(i), PK_FIELD, i + 1);
+            final Struct after = ((Struct) records.get(i).value()).getStruct(Envelope.FieldName.AFTER);
+            assertArrayElementMatchesScalar(after, "d_arr", "d");
+            assertArrayElementMatchesScalar(after, "ts_arr", "ts");
+            assertArrayElementMatchesScalar(after, "tstz_arr", "tstz");
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = TemporalPrecisionMode.class, names = { "ADAPTIVE", "CONNECT", "ISOSTRING", "STRUCTURED" })
+    @FixFor("debezium/dbz#2721")
+    public void shouldSnapshotInfinityDateAsConnectorSentinel(TemporalPrecisionMode mode) throws Exception {
+        TestHelper.execute("DROP TABLE IF EXISTS inf_date_table;");
+        TestHelper.execute("CREATE TABLE inf_date_table (pk SERIAL, d DATE, d_arr DATE[], PRIMARY KEY(pk));");
+        TestHelper.execute("INSERT INTO inf_date_table (d, d_arr) VALUES ('infinity', '{infinity}'), ('-infinity', '{-infinity}')");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.inf_date_table")
+                .with(PostgresConnectorConfig.TIME_PRECISION_MODE, mode));
+
+        final TestConsumer consumer = testConsumer(2, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final var records = new ArrayList<SourceRecord>();
+        consumer.process(records::add);
+
+        assertThat(records).hasSize(2);
+        for (int i = 0; i < records.size(); i++) {
+            VerifyRecord.isValidRead(records.get(i), PK_FIELD, i + 1);
+            final Struct after = ((Struct) records.get(i).value()).getStruct(Envelope.FieldName.AFTER);
+            final boolean positive = i == 0;
+            assertInfinityDate(after.get("d"), mode, positive);
+            assertThat(after.getArray("d_arr")).hasSize(1);
+            assertInfinityDate(after.getArray("d_arr").get(0), mode, positive);
+        }
+    }
+
+    private static void assertArrayElementMatchesScalar(Struct after, String arrayField, String scalarField) {
+        final List<?> array = after.getArray(arrayField);
+        assertThat(array).as(arrayField).hasSize(1);
+        assertThat(array.get(0)).as(arrayField + " element vs scalar " + scalarField).isEqualTo(after.get(scalarField));
     }
 
     private void buildNoStreamProducer(Configuration.Builder config) {

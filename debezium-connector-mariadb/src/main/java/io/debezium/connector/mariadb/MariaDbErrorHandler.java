@@ -9,6 +9,8 @@ import java.io.IOException;
 import java.sql.SQLException;
 import java.util.Set;
 
+import com.github.shyiko.mysql.binlog.network.ServerException;
+
 import io.debezium.annotation.Immutable;
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.pipeline.ErrorHandler;
@@ -37,13 +39,18 @@ public class MariaDbErrorHandler extends ErrorHandler {
 
     @Override
     protected boolean isRetriable(Throwable throwable) {
-        while (throwable != null) {
-            if (throwable instanceof SQLException sqlException) {
+        for (Throwable cause = throwable; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SQLException sqlException) {
                 if (NON_RETRIABLE_ERROR_CODES.contains(sqlException.getErrorCode())) {
                     return false;
                 }
             }
-            throwable = throwable.getCause();
+            // An error that the server sends while streaming the binlog arrives as a ServerException, which is an IOException
+            else if (cause instanceof ServerException serverException) {
+                if (NON_RETRIABLE_ERROR_CODES.contains(serverException.getErrorCode())) {
+                    return false;
+                }
+            }
         }
         return super.isRetriable(throwable);
     }

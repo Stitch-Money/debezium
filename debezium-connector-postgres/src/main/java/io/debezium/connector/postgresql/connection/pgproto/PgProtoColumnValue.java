@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.postgresql.PgOid;
 import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
+import io.debezium.connector.postgresql.PostgresTimeBoundary;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.PostgresValueConverter;
 import io.debezium.connector.postgresql.TypeRegistry;
@@ -53,6 +54,19 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
      * Defined in timestamp.h
      */
     private static final long TIMESTAMP_MAX = 9223371331200000000L;
+
+    /**
+     * Days between the PostgreSQL epoch (2000-01-01) and the Unix epoch.
+     */
+    private static final int POSTGRES_EPOCH_OFFSET_DAYS = 10957;
+
+    /**
+     * decoderbufs shifts a {@code date} from the PostgreSQL epoch to the Unix epoch without checking for infinity,
+     * so {@code DATEVAL_NOEND} ({@code INT32_MAX}) and {@code DATEVAL_NOBEGIN} ({@code INT32_MIN}) arrive wrapped
+     * around. Both are far outside the range of a real PostgreSQL date.
+     */
+    private static final int DECODERBUFS_POSITIVE_INFINITY_DATE = Integer.MAX_VALUE + POSTGRES_EPOCH_OFFSET_DAYS;
+    private static final int DECODERBUFS_NEGATIVE_INFINITY_DATE = Integer.MIN_VALUE + POSTGRES_EPOCH_OFFSET_DAYS;
 
     private PgProto.DatumMessage value;
 
@@ -160,7 +174,14 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
     @Override
     public LocalDate asLocalDate() {
         if (value.hasDatumInt32()) {
-            return LocalDate.ofEpochDay(value.getDatumInt32());
+            final int epochDay = value.getDatumInt32();
+            if (epochDay == DECODERBUFS_POSITIVE_INFINITY_DATE) {
+                return PostgresValueConverter.POSITIVE_INFINITY_LOCAL_DATE;
+            }
+            if (epochDay == DECODERBUFS_NEGATIVE_INFINITY_DATE) {
+                return PostgresValueConverter.NEGATIVE_INFINITY_LOCAL_DATE;
+            }
+            return LocalDate.ofEpochDay(epochDay);
         }
 
         final String s = asString();
@@ -188,6 +209,19 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
 
         final String s = asString();
         return s != null ? DateTimeFormat.get().timeWithTimeZone(s) : null;
+    }
+
+    @Override
+    public Object asTimeWithTimeZone() {
+        if (value.hasDatumDouble()) {
+            final long micros = (long) value.getDatumDouble();
+            if (PostgresTimeBoundary.isBoundaryMicroseconds(micros)) {
+                return PostgresTimeBoundary.TIME_WITH_TIMEZONE_BOUNDARY_AT_UTC;
+            }
+            return Conversions.toInstantFromMicros(micros).atOffset(ZoneOffset.UTC).toOffsetTime();
+        }
+
+        return super.asTimeWithTimeZone();
     }
 
     @Override
@@ -244,7 +278,7 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
     @Override
     public BigDecimal asMoney() {
         if (value.hasDatumInt64()) {
-            return new BigDecimal(value.getDatumInt64()).divide(new BigDecimal(100.0));
+            return BigDecimal.valueOf(value.getDatumInt64(), 2);
         }
         return super.asMoney();
     }
@@ -327,6 +361,13 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
             }
             String dataString = new String(data, Charset.forName("UTF-8"));
             PgArray arrayData = new PgArray(connection.get(), (int) value.getColumnType(), dataString);
+            if (PostgresValueConverter.isReadAsTextElementType(type.getElementType().getOid())) {
+                // Hand over the array rather than its deserialized elements. Array#getArray() materializes
+                // them as java.sql.Timestamp/java.sql.Date, which drops the era and applies a
+                // Julian-Gregorian conversion below 1582-10-15; the converter reads them as text instead.
+                return arrayData;
+            }
+
             Object deserializedArray = arrayData.getArray();
             return Arrays.asList((Object[]) deserializedArray);
         }

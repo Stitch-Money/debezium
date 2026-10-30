@@ -8,13 +8,11 @@ package io.debezium.connector.postgresql;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Struct;
@@ -26,7 +24,6 @@ import org.slf4j.LoggerFactory;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationMessage;
 import io.debezium.data.Envelope.Operation;
-import io.debezium.function.Predicates;
 import io.debezium.pipeline.spi.ChangeRecordEmitter;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.pipeline.spi.Partition;
@@ -40,7 +37,6 @@ import io.debezium.relational.TableSchema;
 import io.debezium.schema.DataCollectionSchema;
 import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
-import io.debezium.util.Strings;
 
 /**
  * Emits change data based on a logical decoding event coming as protobuf or JSON message.
@@ -139,20 +135,60 @@ public class PostgresChangeRecordEmitter extends RelationalChangeRecordEmitter<P
     }
 
     private DataCollectionSchema synchronizeTableSchema(DataCollectionSchema tableSchema) {
-        if (getOperation() == Operation.DELETE || !message.shouldSchemaBeSynchronized()) {
+        if (getOperation() == Operation.DELETE) {
             return tableSchema;
         }
         final TableId tableId = (TableId) tableSchema.id();
-        final Table table = schema.tableFor(tableId);
         final List<ReplicationMessage.Column> columns = message.getNewTupleList();
+        // dbz#304 ALTER TYPE ... ADD VALUE keeps the column's type OID, so the added value is invisible
+        // both to schemaChanged() and to the pgoutput RELATION messages. Refresh the stale enum metadata
+        // regardless of the decoder's shouldSchemaBeSynchronized() so the rebuilt schema exposes it.
+        final boolean enumRefreshed = refreshStaleEnumTypes(columns);
+        if (!message.shouldSchemaBeSynchronized()) {
+            if (enumRefreshed) {
+                refreshTableFromDatabase(tableId);
+                return schema.schemaFor(tableId);
+            }
+            return tableSchema;
+        }
+        final Table table = schema.tableFor(tableId);
         // check if we need to refresh our local schema due to DB schema changes for this table
-        if (schemaChanged(columns, table)) {
+        if (enumRefreshed || schemaChanged(columns, table)) {
             // Refresh the schema so we get information about primary keys
             refreshTableFromDatabase(tableId);
             // Update the schema with metadata coming from decoder message
             schema.refresh(tableFromFromMessage(columns, schema.tableFor(tableId)));
         }
         return schema.schemaFor(tableId);
+    }
+
+    /**
+     * Detects enum columns whose incoming value is missing from the cached enum type metadata
+     * (the result of an {@code ALTER TYPE ... ADD VALUE}) and refreshes those types from the
+     * database so the rebuilt schema exposes the up-to-date list of allowed values.
+     *
+     * @param columns the columns of the current replication message
+     * @return {@code true} if at least one enum type was refreshed
+     */
+    private boolean refreshStaleEnumTypes(List<ReplicationMessage.Column> columns) {
+        if (columns == null) {
+            return false;
+        }
+        boolean refreshed = false;
+        for (ReplicationMessage.Column column : columns) {
+            final PostgresType type = column.getType();
+            if (!type.isEnumType()) {
+                continue;
+            }
+            final Object value = column.getValue(() -> connection.connection().unwrap(BaseConnection.class),
+                    connectorConfig.includeUnknownDatatypes());
+            if (value instanceof String && !type.getEnumValues().contains(value)) {
+                LOGGER.info("Detected new value '{}' for enum type '{}'; refreshing type metadata", value, type.getName());
+                connection.getTypeRegistry().refresh(type.getOid());
+                refreshed = true;
+            }
+        }
+        return refreshed;
     }
 
     private Object[] columnValues(List<ReplicationMessage.Column> columns, TableId tableId, boolean refreshSchemaIfChanged,
@@ -166,17 +202,19 @@ public class PostgresChangeRecordEmitter extends RelationalChangeRecordEmitter<P
 
         // based on the schema columns, create the values on the same position as the columns
         List<Column> schemaColumns = table.columns();
-        // based on the replication message without toasted columns for now
-        List<ReplicationMessage.Column> columnsWithoutToasted = columns.stream().filter(Predicates.not(ReplicationMessage.Column::isToastedColumn))
-                .collect(Collectors.toList());
-        // JSON does not deliver a list of all columns for REPLICA IDENTITY DEFAULT
-        Object[] values = new Object[columnsWithoutToasted.size() < schemaColumns.size() ? schemaColumns.size() : columnsWithoutToasted.size()];
-
-        final Set<String> undeliveredToastableColumns = new HashSet<>(schema.getToastableColumnsForTableId(table.id()));
+        // count the replication message columns without toasted columns for now
+        int columnsWithoutToasted = 0;
         for (ReplicationMessage.Column column : columns) {
-            // DBZ-298 Quoted column names will be sent like that in messages, but stored unquoted in the column names
-            final String columnName = Strings.unquoteIdentifierPart(column.getName());
-            undeliveredToastableColumns.remove(columnName);
+            if (!column.isToastedColumn()) {
+                columnsWithoutToasted++;
+            }
+        }
+        // JSON does not deliver a list of all columns for REPLICA IDENTITY DEFAULT
+        Object[] values = new Object[Math.max(schemaColumns.size(), columnsWithoutToasted)];
+
+        for (ReplicationMessage.Column column : columns) {
+            // Decoders deliver the name unquoted; unquoting again mangles names that look quoted
+            final String columnName = column.getName();
 
             int position = getPosition(columnName, table, values);
             if (position != -1) {
@@ -185,10 +223,21 @@ public class PostgresChangeRecordEmitter extends RelationalChangeRecordEmitter<P
                     cachedOldToastedValues.put(columnName, value);
                 }
                 else {
-                    if (UnchangedToastedReplicationMessageColumn.isUnchangedToastedValue(value)) {
-                        final Object candidate = cachedOldToastedValues.get(columnName);
-                        if (candidate != null) {
-                            value = candidate;
+                    // DBZ-1258 handle toasted column: recover from cache or fall back to sentinel to avoid null
+                    boolean isExplicitToastMarker = UnchangedToastedReplicationMessageColumn.isUnchangedToastedValue(value);
+                    boolean isNullOnToastedColumn = (value == null) && column.isToastedColumn();
+
+                    if (isExplicitToastMarker || isNullOnToastedColumn) {
+                        final Object cachedOldValue = cachedOldToastedValues.get(columnName);
+                        if (cachedOldValue != null) {
+                            // Best case: we have the real value from the old tuple; use it.
+                            value = cachedOldValue;
+                        }
+                        else if (isNullOnToastedColumn) {
+                            // No cache hit — use the type-specific sentinel for this column so that
+                            // converters produce the correct placeholder format (string, array, hstore, etc.)
+                            value = new UnchangedToastedReplicationMessageColumn(column.getName(), column.getType(),
+                                    column.getType().getName(), column.isOptional()).getValue(null, false);
                         }
                     }
                 }

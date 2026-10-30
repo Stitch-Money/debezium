@@ -14,7 +14,6 @@ import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.debezium.storage.jdbc.offset.JdbcOffsetBackingStore;
 import io.debezium.util.DelayStrategy;
 
 /**
@@ -32,7 +31,7 @@ import io.debezium.util.DelayStrategy;
  */
 public class RetriableConnection implements AutoCloseable {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(JdbcOffsetBackingStore.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(RetriableConnection.class);
     private final String url;
     private final String user;
     private final String pwd;
@@ -113,6 +112,7 @@ public class RetriableConnection implements AutoCloseable {
     private synchronized <T> T executeWithRetry(ConnectionFunction<T> func, ConnectionConsumer consumer, String name, boolean rollback)
             throws SQLException {
         int attempt = 1;
+        DelayStrategy delayStrategy = DelayStrategy.constant(waitRetryDelay);
         while (true) {
             if (!isOpen()) {
                 LOGGER.debug("Trying to reconnect (attempt {}).", attempt);
@@ -127,7 +127,6 @@ public class RetriableConnection implements AutoCloseable {
                     }
                     attempt++;
                     LOGGER.debug("Waiting for reconnect for {} ms.", waitRetryDelay);
-                    DelayStrategy delayStrategy = DelayStrategy.constant(waitRetryDelay);
                     delayStrategy.sleepWhen(true);
                     continue;
                 }
@@ -153,6 +152,17 @@ public class RetriableConnection implements AutoCloseable {
                     }
                 }
                 close();
+                // The connection may be healthy while the operation itself keeps failing (e.g. a
+                // constraint violation or a value that does not fit the target column). Without
+                // bounding the retries here the loop would reconnect and re-run the same failing
+                // operation forever, so honor maxRetryCount and the retry delay as the reconnect
+                // branch above does.
+                if (attempt >= maxRetryCount) {
+                    throw e;
+                }
+                attempt++;
+                LOGGER.debug("Waiting for retry for {} ms.", waitRetryDelay);
+                delayStrategy.sleepWhen(true);
             }
         }
     }

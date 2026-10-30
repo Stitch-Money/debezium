@@ -31,11 +31,13 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -45,6 +47,7 @@ import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.storage.FileOffsetBackingStore;
@@ -63,10 +66,12 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode;
 import io.debezium.config.Configuration;
 import io.debezium.connector.SnapshotType;
 import io.debezium.connector.oracle.OracleConnectorConfig.ConnectorAdapter;
 import io.debezium.connector.oracle.OracleConnectorConfig.LogMiningStrategy;
+import io.debezium.connector.oracle.OracleConnectorConfig.SnapshotLockingMode;
 import io.debezium.connector.oracle.OracleConnectorConfig.SnapshotMode;
 import io.debezium.connector.oracle.OracleConnectorConfig.TransactionSnapshotBoundaryMode;
 import io.debezium.connector.oracle.junit.SkipOnDatabaseOption;
@@ -95,7 +100,10 @@ import io.debezium.junit.Flaky;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
+import io.debezium.relational.TableSchemaBuilder;
 import io.debezium.relational.history.MemorySchemaHistory;
+import io.debezium.spi.converter.CustomConverter;
+import io.debezium.spi.converter.RelationalColumn;
 import io.debezium.storage.file.history.FileSchemaHistory;
 import io.debezium.util.Strings;
 import io.debezium.util.Testing;
@@ -2665,11 +2673,13 @@ public class OracleConnectorIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    @FixFor({ "DBZ-3712", "DBZ-4879" })
+    @FixFor({ "DBZ-3712", "DBZ-4879", "debezium/dbz#2296" })
     @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Tests archive log support for LogMiner only")
     public void shouldStartWithArchiveLogOnlyModeAndStreamWhenRecordsBecomeAvailable() throws Exception {
         TestHelper.dropTable(connection, "dbz3712");
         try {
+            final LogInterceptor logInterceptor = TestHelper.getAbstractEventProcessorLogInterceptor();
+
             connection.execute("CREATE TABLE dbz3712 (id number(9,0), data varchar2(50))");
             TestHelper.streamTable(connection, "dbz3712");
 
@@ -2688,10 +2698,16 @@ public class OracleConnectorIT extends AbstractAsyncEngineConnectorTest {
             waitForAvailableRecords(waitTimeForRecords(), TimeUnit.SECONDS);
             assertNoRecordsToConsume();
 
+            Awaitility.await().atMost(Duration.ofMinutes(1))
+                    .until(() -> logInterceptor.containsMessage("is not yet in archive logs, waiting for log switch."));
+
             // We will insert a new record but this record won't be emitted right away and will
             // require that a log switch happen so that it can be emitted.
             connection.execute("INSERT INTO dbz3712 (id,data) values (1, 'Test')");
             waitForLogSwitchOrForceOneAfterTimeout();
+
+            Awaitility.await().atMost(Duration.ofMinutes(1))
+                    .until(() -> logInterceptor.containsMessage("is now available in archive logs, log mining session resumed."));
 
             // We should now be able to consume a record
             SourceRecords records = consumeRecordsByTopic(1);
@@ -5478,9 +5494,6 @@ public class OracleConnectorIT extends AbstractAsyncEngineConnectorTest {
             Configuration config = TestHelper.defaultConfig()
                     .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ6660")
                     .with(OracleConnectorConfig.LOG_MINING_MAX_SCN_DEVIATION_MS, deviationMs.toString())
-                    .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_MAX, "100")
-                    .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_DEFAULT, "100")
-                    .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_MIN, "100")
                     .build();
 
             final LogInterceptor sourceLogging = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
@@ -5551,9 +5564,6 @@ public class OracleConnectorIT extends AbstractAsyncEngineConnectorTest {
             Configuration config = TestHelper.defaultConfig()
                     .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ6660")
                     .with(OracleConnectorConfig.LOG_MINING_MAX_SCN_DEVIATION_MS, deviationMs.toString())
-                    .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_MAX, "100")
-                    .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_DEFAULT, "100")
-                    .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_MIN, "100")
                     .build();
 
             final LogInterceptor sourceLogging = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
@@ -6264,6 +6274,304 @@ public class OracleConnectorIT extends AbstractAsyncEngineConnectorTest {
         }
         finally {
             TestHelper.dropTable(connection, "dbz9660");
+        }
+    }
+
+    @Test
+    @FixFor("dbz#1508")
+    public void shouldFailWhenConverterThrowsExceptionForValue() throws Exception {
+        TestHelper.dropTable(connection, "dbz1508");
+        try {
+            connection.execute("CREATE TABLE dbz1508 (id numeric(9,0) primary key, data varchar2(50))");
+            TestHelper.streamTable(connection, "dbz1508");
+
+            LogInterceptor logInterceptor = new LogInterceptor(TableSchemaBuilder.class);
+
+            // Intentionally test that if the converter failure handling is set to FAIL, the connector
+            // will fail and not emit any messages.
+            Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ1508")
+                    .with(OracleConnectorConfig.EVENT_CONVERTING_FAILURE_HANDLING_MODE, EventConvertingFailureHandlingMode.FAIL)
+                    .with("converters", "fail-error")
+                    .with("fail-error.type", ErrorCausingCustomConverter.class.getName())
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            connection.executeWithoutCommitting("INSERT INTO dbz1508 (id,data) values (1, 'test')");
+            connection.executeWithoutCommitting("INSERT INTO dbz1508 (id,data) values (2, 'test')");
+            connection.commit();
+
+            Awaitility.await()
+                    .atMost(waitTimeForRecords(), TimeUnit.MINUTES)
+                    .until(() -> logInterceptor.containsErrorMessage(
+                            "Failed to properly convert data value for '%s.DEBEZIUM.DBZ1508.DATA' of type VARCHAR2".formatted(
+                                    TestHelper.getDatabaseName())));
+
+            assertNoRecordsToConsume();
+            waitForEngineShutdown();
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz1508");
+        }
+    }
+
+    @Test
+    @FixFor("dbz#1676")
+    public void testOracleRowArchivalColumnAtEndOfTable() throws Exception {
+        TestHelper.dropTable(connection, "dbz1676");
+        try {
+            connection.execute("""
+                    CREATE TABLE dbz1676 (
+                        LAST_NAME VARCHAR2(50),
+                        FIRST_NAME VARCHAR2(50),
+                        AGE NUMBER,
+                        ADDRESS VARCHAR2(256),
+                        EMAIL VARCHAR(256),
+                        UPDATED_AT TIMESTAMP(6),
+                        USER_ID NUMBER(9,0),
+                        PRIMARY KEY (USER_ID))
+                    """);
+            // This adds the ORA_ARCHIVE_STATE column and SYS_NC00009$ raw column (both hidden)
+            connection.execute("ALTER TABLE dbz1676 row archival");
+            TestHelper.streamTable(connection, "dbz1676");
+
+            connection.execute("INSERT INTO dbz1676 values ('doe','john',21,'123 Main St', 'john@doe.com', sysdate, 1)");
+
+            final Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM.DBZ1676")
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            connection.execute("INSERT INTO dbz1676 values ('doe','jane',21,'987 Main St', 'jane@doe.com', sysdate, 2)");
+
+            SourceRecords allRecords = consumeRecordsByTopic(2);
+
+            List<SourceRecord> records = allRecords.recordsForTopic("server1.DEBEZIUM.DBZ1676");
+            assertThat(records).hasSize(2);
+
+            SourceRecord record = records.get(0);
+            assertThat(getAfter(record).get("USER_ID")).isEqualTo(1);
+            assertThat(getAfter(record).schema().fields()).hasSize(7);
+            assertThat(getAfter(record).schema().field("ORA_ARCHIVE_STATE")).isNull();
+
+            record = records.get(1);
+            assertThat(getAfter(record).get("USER_ID")).isEqualTo(2);
+            assertThat(getAfter(record).schema().fields()).hasSize(7);
+            assertThat(getAfter(record).schema().field("ORA_ARCHIVE_STATE")).isNull();
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz1676");
+        }
+    }
+
+    @Test
+    @FixFor("dbz#1676")
+    public void testOracleRowArchivalColumnInMiddleOfTable() throws Exception {
+        TestHelper.dropTable(connection, "dbz1676");
+        try {
+            connection.execute("""
+                    CREATE TABLE dbz1676 (
+                        LAST_NAME VARCHAR2(50),
+                        FIRST_NAME VARCHAR2(50),
+                        AGE NUMBER,
+                        ADDRESS VARCHAR2(256),
+                        EMAIL VARCHAR(256),
+                        UPDATED_AT TIMESTAMP(6),
+                        USER_ID NUMBER(9,0),
+                        PRIMARY KEY (USER_ID))
+                    """);
+            // This adds the ORA_ARCHIVE_STATE column and SYS_NC00009$ raw column (both hidden)
+            connection.execute("ALTER TABLE dbz1676 row archival");
+            connection.execute("ALTER TABLE dbz1676 add preferred_name varchar2(100)");
+            TestHelper.streamTable(connection, "dbz1676");
+
+            connection.execute("INSERT INTO dbz1676 values ('doe','john',21,'123 Main St', 'john@doe.com', sysdate, 1, 'john')");
+
+            final Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM.DBZ1676")
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            connection.execute("INSERT INTO dbz1676 values ('doe','jane',21,'987 Main St', 'jane@doe.com', sysdate, 2, 'jane')");
+
+            SourceRecords allRecords = consumeRecordsByTopic(2);
+
+            List<SourceRecord> records = allRecords.recordsForTopic("server1.DEBEZIUM.DBZ1676");
+            assertThat(records).hasSize(2);
+
+            SourceRecord record = records.get(0);
+            assertThat(getAfter(record).get("USER_ID")).isEqualTo(1);
+            assertThat(getAfter(record).get("PREFERRED_NAME")).isEqualTo("john");
+            assertThat(getAfter(record).schema().fields()).hasSize(8);
+            assertThat(getAfter(record).schema().field("ORA_ARCHIVE_STATE")).isNull();
+
+            record = records.get(1);
+            assertThat(getAfter(record).get("USER_ID")).isEqualTo(2);
+            assertThat(getAfter(record).get("PREFERRED_NAME")).isEqualTo("jane");
+            assertThat(getAfter(record).schema().fields()).hasSize(8);
+            assertThat(getAfter(record).schema().field("ORA_ARCHIVE_STATE")).isNull();
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz1676");
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2787")
+    public void shouldHoldSharedTableLockUntilDataSnapshotCompletes() throws Exception {
+        TestHelper.dropTable(connection, "dbz2787");
+        try {
+            final int rowCount = createAndPopulateSnapshotLockTestTable("dbz2787");
+
+            Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                    .with(OracleConnectorConfig.SNAPSHOT_LOCKING_MODE, SnapshotLockingMode.SHARED)
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ2787")
+                    .with(CommonConnectorConfig.MAX_BATCH_SIZE, 2)
+                    .with(CommonConnectorConfig.MAX_QUEUE_SIZE, 4)
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForSnapshotToBlockOnBackPressure();
+
+            try (OracleConnection otherSession = TestHelper.testConnection()) {
+                // Modifying a column requires an exclusive table lock, which the held ROW SHARE lock denies (ORA-00054).
+                // Note that ALTER TABLE ADD COLUMN is a non-blocking DDL in Oracle 23.3+ and is not prevented by the
+                // ROW SHARE lock; preventing it requires the EXTENDED locking mode, see the test below.
+                assertDdlFailsWithResourceBusy(otherSession, "ALTER TABLE dbz2787 MODIFY (data VARCHAR2(100))");
+
+                // DML is not affected by the held lock
+                otherSession.execute("INSERT INTO dbz2787 VALUES (" + (rowCount + 1) + ", 'written during snapshot')");
+            }
+
+            SourceRecords records = consumeRecordsByTopic(rowCount + 1);
+            assertThat(records.recordsForTopic("server1.DEBEZIUM.DBZ2787")).hasSize(rowCount + 1);
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            // Once the data snapshot has completed the locks are released and the DDL goes through
+            try (OracleConnection otherSession = TestHelper.testConnection()) {
+                Awaitility.await().atMost(60, TimeUnit.SECONDS).ignoreExceptions()
+                        .untilAsserted(() -> otherSession.execute("ALTER TABLE dbz2787 MODIFY (data VARCHAR2(100))"));
+            }
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz2787");
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2787")
+    public void shouldHoldExtendedTableLockUntilDataSnapshotCompletes() throws Exception {
+        TestHelper.dropTable(connection, "dbz2787");
+        try {
+            final int rowCount = createAndPopulateSnapshotLockTestTable("dbz2787");
+
+            Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                    .with(OracleConnectorConfig.SNAPSHOT_LOCKING_MODE, SnapshotLockingMode.EXTENDED)
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ2787")
+                    .with(CommonConnectorConfig.MAX_BATCH_SIZE, 2)
+                    .with(CommonConnectorConfig.MAX_QUEUE_SIZE, 4)
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForSnapshotToBlockOnBackPressure();
+
+            final ExecutorService executor = Executors.newSingleThreadExecutor();
+            try (OracleConnection ddlSession = TestHelper.testConnection();
+                    OracleConnection dmlSession = TestHelper.testConnection()) {
+                // The SHARE lock prevents all DDL, including ALTER TABLE ADD COLUMN, which is a non-blocking DDL
+                // in Oracle 23.3+ that only the SHARE lock prevents (ORA-00054)
+                assertDdlFailsWithResourceBusy(ddlSession, "ALTER TABLE dbz2787 ADD (extra NUMBER)");
+                assertDdlFailsWithResourceBusy(ddlSession, "ALTER TABLE dbz2787 MODIFY (data VARCHAR2(100))");
+
+                // Writes require a ROW EXCLUSIVE lock that is incompatible with the SHARE lock, so they wait until the snapshot completes
+                final Future<?> insert = executor.submit(() -> {
+                    dmlSession.execute("INSERT INTO dbz2787 VALUES (" + (rowCount + 1) + ", 'written after snapshot')");
+                    return null;
+                });
+                assertThatThrownBy(() -> insert.get(5, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+                assertThat(consumedLines.remainingCapacity()).isEqualTo(0);
+
+                SourceRecords records = consumeRecordsByTopic(rowCount);
+                assertThat(records.recordsForTopic("server1.DEBEZIUM.DBZ2787")).hasSize(rowCount);
+                assertThat(records.recordsForTopic("server1.DEBEZIUM.DBZ2787")).allSatisfy(VerifyRecord::isValidRead);
+                waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+                // Once the data snapshot has completed the locks are released and the blocked write is applied and streamed
+                insert.get(60, TimeUnit.SECONDS);
+                records = consumeRecordsByTopic(1);
+                assertThat(records.recordsForTopic("server1.DEBEZIUM.DBZ2787")).hasSize(1);
+                VerifyRecord.isValidInsert(records.recordsForTopic("server1.DEBEZIUM.DBZ2787").get(0), "ID", rowCount + 1);
+
+                Awaitility.await().atMost(60, TimeUnit.SECONDS).ignoreExceptions()
+                        .untilAsserted(() -> ddlSession.execute("ALTER TABLE dbz2787 ADD (extra NUMBER)"));
+            }
+            finally {
+                executor.shutdownNow();
+            }
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz2787");
+        }
+    }
+
+    private static int createAndPopulateSnapshotLockTestTable(String tableName) throws SQLException {
+        connection.execute("CREATE TABLE " + tableName + " (id NUMERIC(9,0) NOT NULL, data VARCHAR2(50), PRIMARY KEY (id))");
+        TestHelper.streamTable(connection, tableName);
+        // More rows than the test's record buffer plus the connector queue can hold, so that the
+        // snapshot blocks on back pressure while it still holds the table locks
+        final int rowCount = 2000;
+        for (int i = 1; i <= rowCount; i++) {
+            connection.executeWithoutCommitting("INSERT INTO " + tableName + " VALUES (" + i + ", 'row " + i + "')");
+        }
+        connection.commit();
+        return rowCount;
+    }
+
+    private void waitForSnapshotToBlockOnBackPressure() {
+        // Once the record buffer is full the snapshot is in the data phase and cannot complete until
+        // the records are consumed, so the locks taken before the SCN was read are still held
+        Awaitility.await().atMost(60, TimeUnit.SECONDS).until(() -> consumedLines.remainingCapacity() == 0);
+    }
+
+    private static void assertDdlFailsWithResourceBusy(OracleConnection session, String ddl) {
+        // DDL fails immediately with ORA-00054 when the required exclusive table lock cannot be acquired
+        assertThatThrownBy(() -> session.execute(ddl))
+                .isInstanceOf(SQLException.class)
+                .satisfies(e -> LOGGER.info("DDL '{}' during the snapshot failed as expected: {}", ddl, e.getMessage()))
+                .extracting(e -> ((SQLException) e).getErrorCode())
+                .isEqualTo(54);
+    }
+
+    public static class ErrorCausingCustomConverter implements CustomConverter<SchemaBuilder, RelationalColumn> {
+        @Override
+        public void configure(Properties props) {
+        }
+
+        @Override
+        public void converterFor(RelationalColumn field, ConverterRegistration<SchemaBuilder> registration) {
+            if ("DATA".equals(field.name())) {
+                registration.register(SchemaBuilder.string(), (x) -> {
+                    throw new IllegalStateException("This should fail");
+                });
+            }
         }
     }
 }

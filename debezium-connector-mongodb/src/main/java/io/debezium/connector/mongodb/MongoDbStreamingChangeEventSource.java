@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.mongodb;
 
+import java.time.Duration;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import org.bson.BsonDocument;
@@ -12,11 +14,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.mongodb.MongoException;
+import com.mongodb.ReadPreference;
 import com.mongodb.client.ChangeStreamIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
-import com.mongodb.client.model.changestream.FullDocument;
-import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 
 import io.debezium.connector.mongodb.connection.MongoDbConnection;
 import io.debezium.connector.mongodb.connection.MongoDbConnections;
@@ -28,9 +29,12 @@ import io.debezium.connector.mongodb.recordemitter.MongoDbChangeRecordEmitter;
 import io.debezium.function.BlockingRunnable;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
+import io.debezium.pipeline.monitor.OffsetActivityMonitor;
+import io.debezium.pipeline.monitor.OffsetActivityMonitorService;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.snapshot.SnapshotterService;
 import io.debezium.util.Clock;
+import io.debezium.util.Metronome;
 
 /**
  * @author Chris Cranford
@@ -47,7 +51,9 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
     private final MongoDbTaskContext taskContext;
     private final MongoDbStreamingChangeEventSourceMetrics streamingMetrics;
     private final SnapshotterService snapshotterService;
+    private final OffsetActivityMonitorService offsetActivityMonitorService;
     private MongoDbOffsetContext effectiveOffset;
+    private OffsetActivityMonitor<MongoDbPartition, MongoDbOffsetContext> offsetActivityMonitor;
 
     public MongoDbStreamingChangeEventSource(MongoDbConnectorConfig connectorConfig, MongoDbTaskContext taskContext,
                                              EventDispatcher<MongoDbPartition, CollectionId> dispatcher,
@@ -60,6 +66,7 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
         this.taskContext = taskContext;
         this.streamingMetrics = streamingMetrics;
         this.snapshotterService = snapshotterService;
+        this.offsetActivityMonitorService = OffsetActivityMonitorService.lookup(connectorConfig.getServiceRegistry());
     }
 
     @Override
@@ -81,7 +88,7 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
             return;
         }
 
-        try (MongoDbConnection mongo = MongoDbConnections.create(taskContext.getRawConfig(), dispatcher, partition)) {
+        try (MongoDbConnection mongo = MongoDbConnections.create(taskContext.getConnectionContext(), dispatcher, partition)) {
             mongo.execute("Reading change stream", client -> {
                 readChangeStream(client, context, partition);
             });
@@ -97,31 +104,115 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
         return effectiveOffset;
     }
 
+    @Override
+    public Optional<OffsetActivityMonitor<MongoDbPartition, MongoDbOffsetContext>> getOffsetActivityMonitor() {
+        if (offsetActivityMonitor == null) {
+            offsetActivityMonitor = new MongoDbOffsetActivityMonitor(connectorConfig.getOffsetActivityMonitorInterval());
+        }
+        return Optional.of(offsetActivityMonitor);
+    }
+
     private void readChangeStream(MongoClient client, ChangeEventSourceContext context, MongoDbPartition partition) {
         LOGGER.info("Reading change stream");
         final SplitEventHandler<BsonDocument> splitHandler = new SplitEventHandler<>();
-        final ChangeStreamIterable<BsonDocument> stream = initChangeStream(client, effectiveOffset);
+        final ReadPreference readPreference = Optional.ofNullable(connectorConfig.getConnectionString().getReadPreference())
+                .orElse(ReadPreference.primary());
+        final MongoDbReadPreferenceMonitor readPreferenceMonitor = new MongoDbReadPreferenceMonitor(
+                readPreference, connectorConfig.getHeartbeatFrequencyMs(), clock);
 
-        try (var cursor = BufferingChangeStreamCursor.fromIterable(stream, taskContext, streamingMetrics, clock).start()) {
+        try {
             while (context.isRunning()) {
-                waitWhenStreamingPaused(context, cursor);
-                var resumableEvent = cursor.tryNext();
-                if (resumableEvent == null) {
-                    continue;
+                // The buffering cursor may have fetched beyond this point, so always resume from the last dispatched offset.
+                final ChangeStreamIterable<BsonDocument> stream = initChangeStream(client, effectiveOffset);
+                var nextAction = MongoDbReadPreferenceMonitor.Status.SATISFIED;
+
+                try (var cursor = BufferingChangeStreamCursor.fromIterable(stream, taskContext, streamingMetrics, clock).start()) {
+                    while (context.isRunning()) {
+                        waitWhenStreamingPaused(context, cursor);
+                        var resumableEvent = cursor.tryNextInterruptibly();
+                        if (resumableEvent != null) {
+                            var result = resumableEvent.document
+                                    .map(doc -> processChangeStreamDocument(doc, splitHandler, partition, effectiveOffset))
+                                    .orElseGet(() -> errorHandled(() -> dispatchHeartbeatEvent(resumableEvent, partition, effectiveOffset)));
+
+                            if (result == StreamStatus.ERROR) {
+                                return;
+                            }
+                        }
+
+                        offsetActivityMonitorService.pulse(partition, effectiveOffset);
+
+                        if (effectiveOffset.hasOffset() && splitHandler.isEmpty() && readPreferenceMonitor.isCheckDue()) {
+                            var cursorAddress = cursor.getCurrentServerAddress();
+                            if (cursorAddress.isPresent()) {
+                                nextAction = readPreferenceMonitor.evaluate(client.getClusterDescription(), cursorAddress.get());
+                                if (nextAction == MongoDbReadPreferenceMonitor.Status.UNVERIFIED) {
+                                    LOGGER.debug("Unable to verify whether change stream server '{}' satisfies read preference '{}'; "
+                                            + "the topology will be checked again at the next monitoring interval",
+                                            cursorAddress.get(), readPreferenceMonitor.getReadPreference());
+                                }
+                                if (nextAction == MongoDbReadPreferenceMonitor.Status.RELOCATE) {
+                                    LOGGER.info("Change stream server '{}' no longer matches read preference '{}'; reopening from offset '{}'",
+                                            cursorAddress.get(), readPreferenceMonitor.getReadPreference(), effectiveOffset.getOffset());
+                                    break;
+                                }
+                                if (nextAction == MongoDbReadPreferenceMonitor.Status.NO_ELIGIBLE_SERVER) {
+                                    LOGGER.info("Change stream server '{}' no longer matches read preference '{}', and no eligible server is available; "
+                                            + "pausing change stream consumption at offset '{}'",
+                                            cursorAddress.get(), readPreferenceMonitor.getReadPreference(), effectiveOffset.getOffset());
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
 
-                var result = resumableEvent.document
-                        .map(doc -> processChangeStreamDocument(doc, splitHandler, partition, effectiveOffset))
-                        .orElseGet(() -> errorHandled(() -> dispatchHeartbeatEvent(resumableEvent, partition, effectiveOffset)));
-
-                if (result == StreamStatus.ERROR) {
+                if (nextAction == MongoDbReadPreferenceMonitor.Status.NO_ELIGIBLE_SERVER
+                        && !waitForEligibleServer(client, context, readPreferenceMonitor, partition)) {
+                    return;
+                }
+                if (nextAction != MongoDbReadPreferenceMonitor.Status.RELOCATE
+                        && nextAction != MongoDbReadPreferenceMonitor.Status.NO_ELIGIBLE_SERVER) {
                     return;
                 }
             }
         }
+        catch (InterruptedException e) {
+            LOGGER.info("Interrupted while reading the change stream");
+            Thread.currentThread().interrupt();
+        }
         catch (MongoException e) {
             LOGGER.error("Error while reading change stream", e);
             errorHandler.setProducerThrowable(e);
+        }
+    }
+
+    private boolean waitForEligibleServer(MongoClient client, ChangeEventSourceContext context,
+                                          MongoDbReadPreferenceMonitor readPreferenceMonitor, MongoDbPartition partition)
+            throws InterruptedException {
+        final Metronome metronome = Metronome.parker(Duration.ofMillis(readPreferenceMonitor.getCheckIntervalMs()), clock);
+
+        while (context.isRunning()) {
+            waitWhenStreamingPaused(context);
+            if (!readPreferenceMonitor.shouldWaitForEligibleServer(client.getClusterDescription())) {
+                LOGGER.info("An eligible server for read preference '{}' is available; resuming change stream consumption from offset '{}'",
+                        readPreferenceMonitor.getReadPreference(), effectiveOffset.getOffset());
+                return true;
+            }
+
+            offsetActivityMonitorService.pulse(partition, effectiveOffset);
+            metronome.pause();
+        }
+
+        return false;
+    }
+
+    private void waitWhenStreamingPaused(ChangeEventSourceContext context) throws InterruptedException {
+        if (context.isPaused()) {
+            LOGGER.info("Streaming will now pause while waiting for an eligible change stream server");
+            context.streamingPaused();
+            context.waitSnapshotCompletion();
+            LOGGER.info("Streaming resumed");
         }
     }
 
@@ -193,17 +284,6 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
     protected ChangeStreamIterable<BsonDocument> initChangeStream(MongoClient client, MongoDbOffsetContext offsetContext) {
         final ChangeStreamIterable<BsonDocument> stream = MongoUtils.openChangeStream(client, taskContext);
 
-        if (connectorConfig.getCaptureMode().isFullUpdate()) {
-            if (connectorConfig.getCaptureModeFullUpdateType().isPostImage()) {
-                stream.fullDocument(FullDocument.WHEN_AVAILABLE);
-            }
-            else {
-                stream.fullDocument(FullDocument.UPDATE_LOOKUP);
-            }
-        }
-        if (connectorConfig.getCaptureMode().isIncludePreImage()) {
-            stream.fullDocumentBeforeChange(FullDocumentBeforeChange.WHEN_AVAILABLE);
-        }
         if (offsetContext.lastResumeToken() != null) {
             LOGGER.info("Resuming streaming from token '{}'", offsetContext.lastResumeToken());
             stream.resumeAfter(offsetContext.lastResumeTokenDoc());
@@ -213,8 +293,9 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
             stream.startAtOperationTime(offsetContext.lastTimestamp());
         }
         else if (connectorConfig.startAtOperationTime().isPresent()) {
-            LOGGER.info("Resuming streaming from explicit operation time '{}'", offsetContext.lastTimestamp());
-            stream.startAtOperationTime(connectorConfig.startAtOperationTime().get());
+            final var startTimestamp = connectorConfig.startAtOperationTime().get();
+            LOGGER.info("Resuming streaming from explicit operation time '{}'", startTimestamp);
+            stream.startAtOperationTime(startTimestamp);
         }
 
         if (connectorConfig.getCursorMaxAwaitTime() > 0) {

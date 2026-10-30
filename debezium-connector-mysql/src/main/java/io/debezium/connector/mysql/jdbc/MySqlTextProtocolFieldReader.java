@@ -9,7 +9,8 @@ import java.io.UnsupportedEncodingException;
 import java.sql.Blob;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Calendar;
+import java.time.Duration;
+import java.time.LocalDateTime;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,8 +40,8 @@ public class MySqlTextProtocolFieldReader extends AbstractFieldReader {
             return null; // Don't continue parsing time field if it is null
         }
         else if (b.length() == 0) {
-            LOGGER.warn("Encountered a zero length blob for column index {}", columnIndex);
-            return null;
+            // zeroDateTimeBehavior=CONVERT_TO_NULL on the JDBC URL can cause the driver to return a zero-length blob for TIME 00:00:00.
+            return Duration.ZERO;
         }
 
         try {
@@ -62,7 +63,11 @@ public class MySqlTextProtocolFieldReader extends AbstractFieldReader {
         }
 
         try {
-            return MySqlValueConverters.stringToLocalDate(new String(b.getBytes(1, (int) (b.length())), "UTF-8"), column, table);
+            final String value = new String(b.getBytes(1, (int) (b.length())), "UTF-8");
+            if (isStructuredTemporalMode()) {
+                return MySqlValueConverters.stringToBinlogDateValue(value);
+            }
+            return MySqlValueConverters.stringToLocalDate(value, column, table);
         }
         catch (UnsupportedEncodingException e) {
             logInvalidValue(rs, columnIndex, b);
@@ -80,12 +85,16 @@ public class MySqlTextProtocolFieldReader extends AbstractFieldReader {
         }
         else if (b.length() == 0) {
             LOGGER.warn("Encountered a zero length blob for column index {}", columnIndex);
-            return null;
+            return isStructuredTemporalMode() ? MySqlValueConverters.stringToBinlogDateTimeValue("0000-00-00 00:00:00") : null;
         }
 
         try {
-            return MySqlValueConverters.containsZeroValuesInDatePart((new String(b.getBytes(1, (int) (b.length())), "UTF-8")), column, table) ? null
-                    : rs.getTimestamp(columnIndex, Calendar.getInstance());
+            final String value = new String(b.getBytes(1, (int) (b.length())), "UTF-8");
+            if (isStructuredTemporalMode()) {
+                return MySqlValueConverters.stringToBinlogDateTimeValue(value);
+            }
+            return MySqlValueConverters.containsZeroValuesInDatePart(value, column, table) ? null
+                    : rs.getObject(columnIndex, LocalDateTime.class);
         }
         catch (UnsupportedEncodingException e) {
             logInvalidValue(rs, columnIndex, b);

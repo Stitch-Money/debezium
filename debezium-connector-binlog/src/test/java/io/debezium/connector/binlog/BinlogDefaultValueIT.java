@@ -28,6 +28,7 @@ import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalAccessor;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
@@ -36,10 +37,15 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.binlog.jdbc.BinlogValueConverters;
+import io.debezium.connector.binlog.junit.BinlogDatabaseVersionResolver;
+import io.debezium.connector.binlog.junit.SkipWhenSchemaHistoryDisabled;
 import io.debezium.connector.binlog.util.BinlogTestConnection;
 import io.debezium.connector.binlog.util.TestHelper;
 import io.debezium.connector.binlog.util.UniqueDatabase;
@@ -68,6 +74,7 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
 
     private static final Path SCHEMA_HISTORY_PATH = Files.createTestingPath("file-schema-history-connect.txt").toAbsolutePath();
     private final UniqueDatabase DATABASE = TestHelper.getUniqueDatabase("myServer1", "default_value")
+            .withBinlogMetadataKeyColumns("$DBNAME$\\..*:A;$DBNAME$\\.FlOAT_DOUBLE_TABLE:F")
             .withDbHistoryPath(SCHEMA_HISTORY_PATH);
 
     private Configuration config;
@@ -88,6 +95,74 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         finally {
             Files.delete(SCHEMA_HISTORY_PATH);
         }
+    }
+
+    @ParameterizedTest
+    @MethodSource("integerSchemaDefaults")
+    @FixFor("debezium/dbz#2763")
+    void shouldPreserveIntegerSchemaDefaults(String stage, String type, String literal, long expected) throws Exception {
+        final var table = "integer_defaults";
+        final var snapshot = "snapshot".equals(stage);
+        executeStatements(DATABASE.getDatabaseName(),
+                "CREATE TABLE " + table + " (id INT PRIMARY KEY, v " + type + " NOT NULL DEFAULT " + (snapshot ? literal : "0") + ")",
+                "INSERT INTO " + table + " (id) VALUES (1)");
+        config = DATABASE.defaultConfig()
+                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
+                .with(BinlogConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName(table))
+                .with(BinlogConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
+                .build();
+        start(getConnectorClass(), config);
+        assertIntegerSchemaDefault(table, 1, "r", snapshot ? expected : 0);
+
+        if (!snapshot) {
+            waitForStreamingRunning(getConnectorName(), DATABASE.getServerName());
+            final var alteration = "modify".equals(stage)
+                    ? "MODIFY COLUMN v " + type + " NOT NULL DEFAULT " + literal
+                    : "ALTER COLUMN v SET DEFAULT " + literal;
+            executeStatements(DATABASE.getDatabaseName(),
+                    "ALTER TABLE " + table + " " + alteration,
+                    "INSERT INTO " + table + " (id) VALUES (2)");
+            assertIntegerSchemaDefault(table, 2, "c", expected);
+        }
+    }
+
+    protected static Stream<Arguments> integerSchemaDefaults() {
+        final var databaseVersionResolver = new BinlogDatabaseVersionResolver();
+        // MariaDB 12.3 rejects DEFAULT -1.5 with error 1067, even with sql_mode=''.
+        // DEFAULT '-1.5' is accepted and rounds to -2. Use the quoted form on 12.3+
+        // to retain snapshot, MODIFY COLUMN, and SET DEFAULT coverage without skipping tests.
+        final var fractionalDefault = databaseVersionResolver.isMariaDb() && databaseVersionResolver.getVersion().isGreaterThanEqualTo(12, 3, -1)
+                ? "'-1.5'"
+                : "-1.5";
+        return Stream.of("snapshot", "modify", "set").flatMap(stage -> Stream.of(
+                Arguments.of(stage, "BIGINT", "9007199254740993", 9007199254740993L),
+                Arguments.of(stage, "BIGINT", "9223372036854775806", Long.MAX_VALUE - 1),
+                Arguments.of(stage, "TINYINT", fractionalDefault, -2L),
+                Arguments.of(stage, "SMALLINT", fractionalDefault, -2L),
+                Arguments.of(stage, "MEDIUMINT", fractionalDefault, -2L),
+                Arguments.of(stage, "INT", fractionalDefault, -2L),
+                Arguments.of(stage, "BIGINT", fractionalDefault, -2L)));
+    }
+
+    private void assertIntegerSchemaDefault(String table, int id, String operation, long expected) throws Exception {
+        final var records = consumeRecordsByTopic(1).recordsForTopic(DATABASE.topicForTable(table));
+        assertThat(records).hasSize(1);
+        final var envelope = (Struct) records.get(0).value();
+        assertThat(envelope.getString("op")).isEqualTo(operation);
+        final var after = envelope.getStruct("after");
+        assertThat(after.getInt32("id")).isEqualTo(id);
+        final var rawValue = after.getWithoutDefault("v");
+        assertThat(rawValue).isInstanceOf(Number.class);
+        assertThat(((Number) rawValue).longValue()).as("Captured raw value").isEqualTo(expected);
+        try (var connection = getTestDatabaseConnection(DATABASE.getDatabaseName())) {
+            connection.query("SELECT v FROM " + table + " WHERE id = " + id, result -> {
+                assertThat(result.next()).isTrue();
+                assertThat(result.getLong(1)).as("Database value").isEqualTo(expected);
+                assertThat(result.next()).isFalse();
+            });
+        }
+        final var schemaDefault = after.schema().field("v").schema().defaultValue();
+        assertThat(schemaDefault).as("Schema default").isEqualTo(expectedSchemaDefault(records.get(0), rawValue));
     }
 
     @Test
@@ -337,6 +412,9 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
 
     @Test
     @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
+    @SkipWhenSchemaHistoryDisabled(reason = "Column DEFAULT values exist only in the table definition; none of the TABLE_MAP optional metadata "
+            + "fields carries them, so schemas reconstructed from the binlog declare no field defaults. Row values are unaffected, because "
+            + "binlog_row_image=FULL writes the materialized values")
     public void schemaHistorySaveDefaultValuesTest() throws InterruptedException, SQLException {
         config = DATABASE.defaultConfig()
                 .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
@@ -461,10 +539,10 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         Schema schemaC = record.valueSchema().fields().get(1).schema().fields().get(2).schema();
         Schema schemaD = record.valueSchema().fields().get(1).schema().fields().get(3).schema();
         Schema schemaE = record.valueSchema().fields().get(1).schema().fields().get(4).schema();
-        assertThat(schemaA.defaultValue()).isEqualTo((short) 0);
-        assertThat(schemaB.defaultValue()).isEqualTo((short) 1);
-        assertThat(schemaC.defaultValue()).isEqualTo((short) 1);
-        assertThat(schemaD.defaultValue()).isEqualTo((short) 1);
+        assertThat(schemaA.defaultValue()).isEqualTo((byte) 0);
+        assertThat(schemaB.defaultValue()).isEqualTo((byte) 1);
+        assertThat(schemaC.defaultValue()).isEqualTo((byte) 1);
+        assertThat(schemaD.defaultValue()).isEqualTo((byte) 1);
         assertThat(schemaE.defaultValue()).isEqualTo(null);
     }
 
@@ -490,18 +568,21 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         Schema schemaG = record.valueSchema().fields().get(1).schema().fields().get(6).schema();
         Schema schemaH = record.valueSchema().fields().get(1).schema().fields().get(7).schema();
 
-        assertThat(schemaA.defaultValue()).isEqualTo((short) 10);
+        assertThat(schemaA.defaultValue()).isEqualTo((byte) 10);
         assertThat(schemaB.defaultValue()).isEqualTo((short) 5);
         assertThat(schemaC.defaultValue()).isEqualTo(0);
         assertThat(schemaD.defaultValue()).isEqualTo(20L);
         assertThat(schemaE.defaultValue()).isEqualTo(null);
         assertEmptyFieldValue(record, "F");
-        assertThat(schemaG.defaultValue()).isEqualTo((short) 1);
+        assertThat(schemaG.defaultValue()).isEqualTo((byte) 1);
         assertThat(schemaH.defaultValue()).isEqualTo((int) 1);
     }
 
     @Test
     @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
+    @SkipWhenSchemaHistoryDisabled(reason = "Column DEFAULT values exist only in the table definition; none of the TABLE_MAP optional metadata "
+            + "fields carries them, so schemas reconstructed from the binlog declare no field defaults. Row values are unaffected, because "
+            + "binlog_row_image=FULL writes the materialized values")
     public void tinyIntBooleanTest() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
@@ -525,13 +606,16 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
 
         Schema schemaA = record.valueSchema().fields().get(1).schema().fields().get(0).schema();
         Schema schemaB = record.valueSchema().fields().get(1).schema().fields().get(1).schema();
-        assertThat(schemaA.defaultValue()).isEqualTo((short) 1);
-        assertThat(schemaB.defaultValue()).isEqualTo((short) 0);
+        assertThat(schemaA.defaultValue()).isEqualTo((byte) 1);
+        assertThat(schemaB.defaultValue()).isEqualTo((byte) 0);
     }
 
     @Test
     @FixFor("DBZ-1689")
     @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
+    @SkipWhenSchemaHistoryDisabled(reason = "Column DEFAULT values exist only in the table definition; none of the TABLE_MAP optional metadata "
+            + "fields carries them, so schemas reconstructed from the binlog declare no field defaults. Row values are unaffected, because "
+            + "binlog_row_image=FULL writes the materialized values")
     public void intBooleanTest() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
@@ -677,8 +761,7 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         // Number of days since epoch for date 1976-08-23
         assertThat(schemaA.defaultValue()).isEqualTo(2426);
 
-        String value1 = "1970-01-01 00:00:01";
-        ZonedDateTime t = java.sql.Timestamp.valueOf(value1).toInstant().atZone(ZoneId.systemDefault());
+        ZonedDateTime t = Instant.ofEpochSecond(1).atZone(ZoneId.systemDefault());
         String isoString = getZonedDateTimeIsoString(t);
         assertThat(schemaB.defaultValue()).isEqualTo(isoString);
 
@@ -745,8 +828,7 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         Instant instant = LocalDate.from(accessor).atStartOfDay().toInstant(ZoneOffset.UTC);
         assertThat(schemaA.defaultValue()).isEqualTo(java.util.Date.from(instant));
 
-        String value1 = "1970-01-01 00:00:01";
-        ZonedDateTime t = java.sql.Timestamp.valueOf(value1).toInstant().atZone(ZoneId.systemDefault());
+        ZonedDateTime t = Instant.ofEpochSecond(1).atZone(ZoneId.systemDefault());
         String isoString = getZonedDateTimeIsoString(t);
         assertThat(schemaB.defaultValue()).isEqualTo(isoString);
 
@@ -812,6 +894,9 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
     @Test
     @FixFor("DBZ-771")
     @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
+    @SkipWhenSchemaHistoryDisabled(reason = "Column DEFAULT values exist only in the table definition; none of the TABLE_MAP optional metadata "
+            + "fields carries them, so schemas reconstructed from the binlog declare no field defaults. Row values are unaffected, because "
+            + "binlog_row_image=FULL writes the materialized values")
     public void columnTypeAndDefaultValueChange() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
@@ -894,6 +979,9 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
 
     @Test
     @FixFor({ "DBZ-2267", "DBZ-6029" })
+    @SkipWhenSchemaHistoryDisabled(reason = "Column DEFAULT values exist only in the table definition; none of the TABLE_MAP optional metadata "
+            + "fields carries them, so schemas reconstructed from the binlog declare no field defaults. Row values are unaffected, because "
+            + "binlog_row_image=FULL writes the materialized values")
     public void alterDateAndTimeTest() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
@@ -974,6 +1062,9 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
 
     @Test
     @FixFor("DBZ-5241")
+    @SkipWhenSchemaHistoryDisabled(reason = "Column DEFAULT values exist only in the table definition; none of the TABLE_MAP optional metadata "
+            + "fields carries them, so schemas reconstructed from the binlog declare no field defaults. Row values are unaffected, because "
+            + "binlog_row_image=FULL writes the materialized values")
     public void shouldConvertDefaultWithCharacterSetIntroducer() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.NO_DATA)
@@ -1023,7 +1114,7 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         Struct change = ((Struct) record.value()).getStruct("after");
         assertFieldDefaultValue(change, "C1", (short) 0);
         assertFieldDefaultValue(change, "C2", (short) 0);
-        assertFieldDefaultValue(change, "C3", (short) 0);
+        assertFieldDefaultValue(change, "C3", (byte) 0);
         assertFieldDefaultValue(change, "C4", "abc");
         assertFieldDefaultValue(change, "C5", "abc");
         assertFieldDefaultValue(change, "C6", "abc");
@@ -1038,8 +1129,8 @@ public abstract class BinlogDefaultValueIT<C extends SourceConnector> extends Ab
         assertFieldDefaultValue(change, "C15", (short) 0);
         assertFieldDefaultValue(change, "C16", BigDecimal.valueOf(1.23));
         assertFieldDefaultValue(change, "C17", BigDecimal.valueOf(1.23));
-        assertFieldDefaultValue(change, "C18", 3.14f);
-        assertFieldDefaultValue(change, "C19", 3.14f);
+        assertFieldDefaultValue(change, "C18", 3.14d);
+        assertFieldDefaultValue(change, "C19", 3.14d);
     }
 
     private void assertFieldDefaultValue(Struct value, String fieldName, Object defaultValue) {

@@ -1,0 +1,406 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.pipeline.signal;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import org.apache.kafka.connect.source.SourceConnector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.debezium.DebeziumException;
+import io.debezium.config.CommonConnectorConfig;
+import io.debezium.document.Array;
+import io.debezium.document.Document;
+import io.debezium.document.DocumentReader;
+import io.debezium.pipeline.signal.actions.SignalAction;
+import io.debezium.pipeline.signal.channels.SignalChannelReader;
+import io.debezium.pipeline.signal.channels.SourceSignalChannel;
+import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.pipeline.spi.Offsets;
+import io.debezium.pipeline.spi.Partition;
+import io.debezium.relational.AbstractPartition;
+import io.debezium.util.LoggingContext;
+import io.debezium.util.Threads;
+
+/**
+ * This class permits to process signals coming from the different channels.
+ *
+ * @author Mario Fiore Vitale
+ */
+public class SignalProcessor<P extends Partition, O extends OffsetContext> {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(SignalProcessor.class);
+
+    public static final String DATA_COLLECTIONS_FIELD_NAME = "data-collections";
+    public static final String POINT_REGEX = "\\.";
+
+    private final Map<String, SignalAction<P>> signalActions = new HashMap<>();
+
+    private final CommonConnectorConfig connectorConfig;
+
+    private final List<SignalChannelReader> enabledChannelReaders;
+
+    private final List<SignalChannelReader> signalChannelReaders;
+
+    private final ScheduledExecutorService signalProcessorExecutor;
+
+    private final DocumentReader documentReader;
+
+    private final Map<P, O> partitionOffsets = new ConcurrentHashMap<>();
+
+    private final Semaphore semaphore = new Semaphore(1);
+
+    private final Queue<DeferredSignal<P>> synchronousSignals = new ConcurrentLinkedQueue<>();
+
+    private final int synchronousBatchSize;
+
+    public SignalProcessor(Class<? extends SourceConnector> connector,
+                           CommonConnectorConfig config,
+                           Map<String, SignalAction<P>> signalActions,
+                           List<SignalChannelReader> signalChannelReaders, DocumentReader documentReader,
+                           Offsets<P, O> previousOffsets) {
+
+        this.connectorConfig = config;
+        this.synchronousBatchSize = config.getSignalSynchronousBatchSize();
+        this.signalChannelReaders = signalChannelReaders;
+        this.documentReader = documentReader;
+        if (previousOffsets != null) {
+            previousOffsets.getOffsets().entrySet().stream()
+                    .filter(entry -> entry.getValue() != null)
+                    .forEach(entry -> this.partitionOffsets.put(entry.getKey(), entry.getValue()));
+        }
+        this.signalProcessorExecutor = Threads.newSingleThreadScheduledExecutor(connector, config.getLogicalName(), SignalProcessor.class.getSimpleName(), false);
+
+        // filter single channel reader based on configuration
+        this.enabledChannelReaders = getEnabledChannelReaders();
+
+        // initialize single channel reader with connector config
+        this.enabledChannelReaders.forEach(signalChannelReader -> signalChannelReader.init(connectorConfig));
+
+        this.signalActions.putAll(signalActions);
+    }
+
+    private Predicate<SignalChannelReader> isEnabled() {
+        return reader -> connectorConfig.getEnabledChannels().contains(reader.name());
+    }
+
+    private List<SignalChannelReader> getEnabledChannelReaders() {
+        return signalChannelReaders.stream()
+                .filter(isEnabled())
+                .collect(Collectors.toList());
+    }
+
+    public void setContext(Offsets<P, O> offsets) {
+        partitionOffsets.clear();
+        if (offsets != null) {
+            offsets.getOffsets().entrySet().stream()
+                    .filter(entry -> entry.getValue() != null)
+                    .forEach(entry -> partitionOffsets.put(entry.getKey(), entry.getValue()));
+        }
+        LOGGER.debug("Updated offset contexts for {} partition(s)", partitionOffsets.size());
+    }
+
+    public void start() {
+
+        LOGGER.info("SignalProcessor started. Scheduling it every {}ms", connectorConfig.getSignalPollInterval().toMillis());
+        signalProcessorExecutor.scheduleAtFixedRate(this::process, 0, connectorConfig.getSignalPollInterval().toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    public void stop() throws InterruptedException {
+
+        // The close must run with same thread of the read otherwise Kafka client will detect multi-thread and throw and exception
+        signalProcessorExecutor.submit(() -> enabledChannelReaders
+                .forEach(SignalChannelReader::close));
+
+        signalProcessorExecutor.shutdown();
+        boolean isShutdown = signalProcessorExecutor.awaitTermination(connectorConfig.getExecutorShutdownTimeout().toMillis(), TimeUnit.MILLISECONDS);
+
+        if (!isShutdown) {
+            LOGGER.warn("SignalProcessor didn't stop in the expected time, shutting down executor now");
+
+            // Clear interrupt flag so the forced termination is always attempted
+            Thread.interrupted();
+            signalProcessorExecutor.shutdownNow();
+            signalProcessorExecutor.awaitTermination(connectorConfig.getExecutorShutdownTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        }
+
+        if (!synchronousSignals.isEmpty()) {
+            LOGGER.warn("SignalProcessor stopped with {} synchronous signal(s) that were never executed: {}",
+                    synchronousSignals.size(),
+                    synchronousSignals.stream().map(deferred -> deferred.signalRecord().getId()).collect(Collectors.toList()));
+            synchronousSignals.clear();
+        }
+
+        LOGGER.info("SignalProcessor stopped");
+    }
+
+    public void registerSignalAction(String id, SignalAction<P> signal) {
+
+        LOGGER.debug("Registering signal '{}' using class '{}'", id, signal.getClass().getName());
+        signalActions.put(id, signal);
+    }
+
+    public void process() {
+
+        executeWithSemaphore(() -> {
+            LOGGER.trace("SignalProcessor processing");
+            enabledChannelReaders.stream()
+                    .map(SignalChannelReader::read)
+                    .flatMap(Collection::stream)
+                    .forEach(signalRecord -> processSignal(signalRecord, null));
+        });
+    }
+
+    public void processSourceSignal(P partition) {
+
+        executeWithSemaphore(() -> {
+            LOGGER.trace("Processing source signals for partition {}", partition);
+            enabledChannelReaders.stream()
+                    .filter(isSignal(SourceSignalChannel.class))
+                    .map(SignalChannelReader::read)
+                    .flatMap(Collection::stream)
+                    .forEach(signalRecord -> processSignal(signalRecord, partition));
+        });
+    }
+
+    /**
+     * Executes every signal whose action requested {@link SignalAction#isSynchronous() synchronous} invocation.
+     * <p>
+     * Streaming sources call this from their own thread at a point where it is safe for an action to inspect or
+     * mutate the source's state. Signals are executed in arrival order, and each is delivered with the offset
+     * context currently associated with its partition. A signal whose partition is no longer managed by this
+     * processor is skipped with a warning.
+     * <p>
+     * At most {@link CommonConnectorConfig#SIGNAL_SYNCHRONOUS_BATCH_SIZE} signals are executed per call so that a
+     * burst of signals cannot monopolize the streaming thread; any remainder is executed by subsequent calls.
+     * <p>
+     * This method does not contend for the semaphore that serializes channel reads, so it never blocks behind
+     * the signal processor's executor thread.
+     *
+     * @throws InterruptedException if the calling thread is interrupted while an action is executing
+     */
+    public void processSynchronousSignals() throws InterruptedException {
+        for (int i = 0; i < synchronousBatchSize; i++) {
+            final DeferredSignal<P> deferred = synchronousSignals.poll();
+            if (deferred == null) {
+                return;
+            }
+            final SignalRecord signalRecord = deferred.signalRecord();
+            final O offset = partitionOffsets.get(deferred.partition());
+            if (offset == null) {
+                LOGGER.warn("Signal '{}' of type '{}' references partition {} which is no longer managed by this task; skipping",
+                        signalRecord.getId(), signalRecord.getType(), deferred.partition());
+                continue;
+            }
+            LOGGER.debug("Executing synchronous signal id = '{}', type = '{}'", signalRecord.getId(), signalRecord.getType());
+            try {
+                invokeAction(deferred.action(), signalRecord, deferred.jsonData(), deferred.partition(), offset);
+            }
+            catch (InterruptedException e) {
+                throw e;
+            }
+            catch (Exception e) {
+                LOGGER.warn("Action {} failed. The signal {} may not have been processed.", signalRecord.getType(), signalRecord, e);
+            }
+        }
+        if (!synchronousSignals.isEmpty()) {
+            LOGGER.debug("Reached the limit of {} synchronous signals per call; {} signal(s) deferred until the next call",
+                    synchronousBatchSize, synchronousSignals.size());
+        }
+    }
+
+    /**
+     * The method permits to get specified SignalChannelReader instance from the available SPI implementations
+     * @param channel the class of the channel to get
+     * @return the specified instance from the available SPI implementations
+     */
+    public <T extends SignalChannelReader> T getSignalChannel(Class<T> channel) {
+        return channel.cast(signalChannelReaders.stream()
+                .filter(isSignal(channel))
+                .findFirst().get());
+    }
+
+    private void executeWithSemaphore(Runnable operation) {
+
+        final Duration waitTime = connectorConfig.getSignalProcessorSemaphoreWait();
+        boolean acquired = false;
+        try {
+            acquired = semaphore.tryAcquire(waitTime.toMillis(), TimeUnit.MILLISECONDS);
+            if (!acquired) {
+                LOGGER.warn("Could not acquire the signal processing semaphore within {}, skipping this cycle to preserve mutual exclusion", waitTime);
+                return;
+            }
+            operation.run();
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DebeziumException("Interrupted while acquiring the semaphore during signal processing", e);
+        }
+        finally {
+            if (acquired) {
+                semaphore.release();
+            }
+        }
+    }
+
+    private void processSignal(SignalRecord signalRecord, P knownPartition) {
+
+        LOGGER.debug("Signal Processor partition offsets: {}", partitionOffsets.keySet());
+        LOGGER.debug("Received signal id = '{}', type = '{}', data = '{}'", signalRecord.getId(), signalRecord.getType(), signalRecord.getData());
+        final SignalAction<P> action = signalActions.get(signalRecord.getType());
+        if (action == null) {
+            LOGGER.warn("Signal '{}' has been received but the type '{}' is not recognized", signalRecord.getId(), signalRecord.getType());
+            return;
+        }
+        try {
+            final Document jsonData = (signalRecord.getData() == null || signalRecord.getData().isEmpty()) ? Document.create()
+                    : documentReader.read(signalRecord.getData());
+
+            Offsets<P, O> finalOffsets = getOffsets(knownPartition, jsonData);
+
+            for (Map.Entry<P, O> entry : finalOffsets.getOffsets().entrySet()) {
+                executeSignal(action, signalRecord, jsonData, entry.getKey(), entry.getValue());
+            }
+        }
+        catch (IOException e) {
+            LOGGER.warn("Signal '{}' has been received but the data '{}' cannot be parsed", signalRecord.getId(), signalRecord.getData(), e);
+        }
+        catch (InterruptedException e) {
+            LOGGER.warn("Action {} has been interrupted. The signal {} may not have been processed.", signalRecord.getType(), signalRecord);
+            Thread.currentThread().interrupt();
+        }
+        catch (Exception e) {
+            LOGGER.warn("Action {} failed. The signal {} may not have been processed.", signalRecord.getType(), signalRecord, e);
+        }
+    }
+
+    private Offsets<P, O> getOffsets(P knownPartition, Document jsonData) {
+
+        if (knownPartition != null) {
+            return Offsets.of(knownPartition, partitionOffsets.get(knownPartition));
+        }
+
+        // External signal (Kafka/JMX/File)
+        if (partitionOffsets.size() == 1) {
+            return Offsets.of(partitionOffsets);
+        }
+
+        Optional<P> targetPartition = extractPartitionFromData(jsonData);
+
+        if (targetPartition.isPresent()) {
+            O offset = partitionOffsets.get(targetPartition.get());
+            if (offset != null) {
+                return Offsets.of(targetPartition.get(), offset);
+            }
+            else {
+                LOGGER.warn("Signal references partition {} which is not managed by this task. " +
+                        "Available partitions: {}", targetPartition, partitionOffsets.keySet());
+                return Offsets.of(Map.of());
+            }
+        }
+
+        // No partition extracted - broadcast to all partitions (for signals without data-collections)
+        return Offsets.of(partitionOffsets);
+    }
+
+    private Optional<P> extractPartitionFromData(Document jsonData) {
+
+        final Array dataCollectionsArray = jsonData.getArray(DATA_COLLECTIONS_FIELD_NAME);
+        if (dataCollectionsArray == null || dataCollectionsArray.isEmpty()) {
+            LOGGER.debug("No data-collections found in signal data");
+            return Optional.empty();
+        }
+
+        // Extract database name from first data collection
+        for (Array.Entry entry : dataCollectionsArray) {
+            if (!entry.getValue().isString()) {
+                LOGGER.debug("Skipping non-string data-collections element while resolving the signal partition");
+                continue;
+            }
+            String dataCollection = entry.getValue().asString().trim();
+
+            String[] parts = dataCollection.split(POINT_REGEX);
+            if (parts.length >= 2) {
+                String databaseName = parts[0];
+
+                for (P partition : partitionOffsets.keySet()) {
+                    if (matchesDatabase(partition, databaseName)) {
+                        LOGGER.debug("Matched data collection '{}' to partition {}", dataCollection, partition);
+                        return Optional.of(partition);
+                    }
+                }
+            }
+            else {
+                LOGGER.debug("Data collection '{}' does not contain database qualifier", dataCollection);
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    private boolean matchesDatabase(P partition, String databaseName) {
+
+        if (partition instanceof AbstractPartition) {
+            Map<String, String> loggingContext = partition.getLoggingContext();
+            String partitionDatabaseName = loggingContext.get(LoggingContext.DATABASE_NAME);
+            return databaseName.equalsIgnoreCase(partitionDatabaseName);
+        }
+
+        return false;
+    }
+
+    private void executeSignal(SignalAction<P> action, SignalRecord signalRecord,
+                               Document jsonData, P partition, O offset)
+            throws InterruptedException {
+        if (action.isSynchronous()) {
+            LOGGER.debug("Signal '{}' of type '{}' deferred until the streaming source processes synchronous signals",
+                    signalRecord.getId(), signalRecord.getType());
+            synchronousSignals.add(new DeferredSignal<>(action, signalRecord, jsonData, partition));
+            return;
+        }
+        invokeAction(action, signalRecord, jsonData, partition, offset);
+    }
+
+    private void invokeAction(SignalAction<P> action, SignalRecord signalRecord,
+                              Document jsonData, P partition, O offset)
+            throws InterruptedException {
+        SignalPayload<P> payload = new SignalPayload<>(
+                partition,
+                signalRecord.getId(),
+                signalRecord.getType(),
+                jsonData,
+                offset,
+                signalRecord.getAdditionalData());
+        action.arrived(payload);
+    }
+
+    private static <T extends SignalChannelReader> Predicate<SignalChannelReader> isSignal(Class<T> channelClass) {
+        return channel -> channel.getClass().equals(channelClass);
+    }
+
+    /**
+     * A signal whose action requested synchronous invocation, held until the streaming source drains the queue.
+     * The offset is resolved when the signal executes rather than captured here, so the action observes the
+     * offset context that is current at that time.
+     */
+    private record DeferredSignal<P extends Partition>(SignalAction<P> action, SignalRecord signalRecord, Document jsonData, P partition) {
+    }
+}

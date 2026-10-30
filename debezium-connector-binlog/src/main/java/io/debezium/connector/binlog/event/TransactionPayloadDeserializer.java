@@ -19,6 +19,7 @@ import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.TransactionPayloadEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 
+import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 
 /**
@@ -28,11 +29,19 @@ public class TransactionPayloadDeserializer extends TransactionPayloadEventDataD
 
     private final Map<Long, TableMapEventData> tableMapEventByTableId;
     private final CommonConnectorConfig.EventProcessingFailureHandlingMode eventDeserializationFailureHandlingMode;
+    private final boolean preserveInvalidTemporalValues;
 
     public TransactionPayloadDeserializer(Map<Long, TableMapEventData> tableMapEventByTableId,
                                           CommonConnectorConfig.EventProcessingFailureHandlingMode eventDeserializationFailureHandlingMode) {
+        this(tableMapEventByTableId, eventDeserializationFailureHandlingMode, false);
+    }
+
+    public TransactionPayloadDeserializer(Map<Long, TableMapEventData> tableMapEventByTableId,
+                                          CommonConnectorConfig.EventProcessingFailureHandlingMode eventDeserializationFailureHandlingMode,
+                                          boolean preserveInvalidTemporalValues) {
         this.tableMapEventByTableId = tableMapEventByTableId;
         this.eventDeserializationFailureHandlingMode = eventDeserializationFailureHandlingMode;
+        this.preserveInvalidTemporalValues = preserveInvalidTemporalValues;
     }
 
     @Override
@@ -82,27 +91,31 @@ public class TransactionPayloadDeserializer extends TransactionPayloadEventDataD
 
         // Decompress the payload
         byte[] src = eventData.getPayload();
-        byte[] dst = ByteBuffer.allocate(eventData.getUncompressedSize()).array();
+        final var uncompressedSize = eventData.getUncompressedSize();
+        if (uncompressedSize > Integer.MAX_VALUE) {
+            throw new DebeziumException("Cannot process event of size '" + uncompressedSize + "' larger than max array size");
+        }
+        final var dst = ByteBuffer.allocate((int) uncompressedSize).array();
         Zstd.decompressByteArray(dst, 0, dst.length, src, 0, src.length);
 
         // Read and store events from decompressed byte array into input stream
         ArrayList<Event> decompressedEvents = new ArrayList<>();
         EventDeserializer transactionPayloadEventDeserializer = new EventDeserializer();
         transactionPayloadEventDeserializer.setEventDataDeserializer(EventType.WRITE_ROWS,
-                new RowDeserializers.WriteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.WriteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
         transactionPayloadEventDeserializer.setEventDataDeserializer(EventType.UPDATE_ROWS,
-                new RowDeserializers.UpdateRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.UpdateRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
         transactionPayloadEventDeserializer.setEventDataDeserializer(EventType.DELETE_ROWS,
-                new RowDeserializers.DeleteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.DeleteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues));
         transactionPayloadEventDeserializer.setEventDataDeserializer(EventType.EXT_WRITE_ROWS,
                 new RowDeserializers.WriteRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues).setMayContainExtraInformation(true));
         transactionPayloadEventDeserializer.setEventDataDeserializer(EventType.EXT_UPDATE_ROWS,
                 new RowDeserializers.UpdateRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues).setMayContainExtraInformation(true));
         transactionPayloadEventDeserializer.setEventDataDeserializer(EventType.EXT_DELETE_ROWS,
                 new RowDeserializers.DeleteRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId, eventDeserializationFailureHandlingMode, preserveInvalidTemporalValues).setMayContainExtraInformation(true));
 
         ByteArrayInputStream destinationInputStream = new ByteArrayInputStream(dst);
 

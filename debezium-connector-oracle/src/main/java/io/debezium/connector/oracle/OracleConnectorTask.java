@@ -12,7 +12,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
@@ -24,12 +23,15 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
-import io.debezium.connector.base.DefaultQueueProvider;
+import io.debezium.connector.base.QueueProviderService;
 import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.common.DebeziumHeaderProducer;
 import io.debezium.connector.oracle.OracleConnectorConfig.ConnectorAdapter;
 import io.debezium.connector.oracle.StreamingAdapter.TableNameCaseSensitivity;
+import io.debezium.connector.oracle.jdbc.CaptureMode;
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
+import io.debezium.connector.oracle.jdbc.OracleConnectionFactoryProvider;
 import io.debezium.document.DocumentReader;
 import io.debezium.heartbeat.HeartbeatFactory;
 import io.debezium.jdbc.JdbcConfiguration;
@@ -96,7 +98,7 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
         SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
 
         final JdbcConfiguration jdbcConfig = connectorConfig.getJdbcConfig();
-        final OracleConnectionFactory connectionFactory = new OracleConnectionFactory(connectorConfig);
+        final OracleConnectionFactory connectionFactory = OracleConnectionFactoryProvider.create(connectorConfig);
 
         jdbcConnection = connectionFactory.mainConnection();
 
@@ -115,11 +117,18 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
         this.schema = new OracleDatabaseSchema(connectorConfig, valueConverters, defaultValueConverter, schemaNameAdjuster,
                 topicNamingStrategy, tableNameCaseSensitivity, extendedStringsSupported, customConverterRegistry, taskContext);
 
-        Offsets<OraclePartition, OracleOffsetContext> previousOffsets = getPreviousOffsets(partitionProvider, offsetContextLoader);
+        Offsets<OraclePartition, OracleOffsetContext> previousOffsets = getSinglePartitionPreviousOffsets(partitionProvider, offsetContextLoader);
+
+        // make use of the Secondary DB when capture mode is PHYSICAL_STANDBY
+        if (connectorConfig.getCaptureMode() == CaptureMode.PHYSICAL_STANDBY) {
+            beanRegistryJdbcConnection = connectionFactory.streamingConnectionFactory().newConnection();
+        }
+        else {
+            beanRegistryJdbcConnection = connectionFactory.newConnection();
+        }
 
         // The bean registry JDBC connection should always be pinned to the PDB
         // when the connector is configured to use a pluggable database
-        beanRegistryJdbcConnection = connectionFactory.newConnection();
         if (!Strings.isNullOrEmpty(connectorConfig.getPdbName())) {
             beanRegistryJdbcConnection.setSessionToPdb(connectorConfig.getPdbName());
         }
@@ -139,8 +148,6 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
 
         connectorConfig.getArchiveDestinationNameResolver().validate(jdbcConnection);
 
-        OracleOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
-
         // Validate guardrail limits for captured tables to prevent loading excessive table schemas into memory
         if (connectorConfig.getGuardrailCollectionsMax() <= 0) {
             LOGGER.info("Guardrail validation skipped");
@@ -151,23 +158,18 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
 
         validateSchemaHistory(connectorConfig, jdbcConnection::validateLogPosition, previousOffsets, schema, snapshotterService.getSnapshotter());
 
-        // If the redo log position is not available it is necessary to re-execute snapshot
-        if (previousOffset == null) {
-            LOGGER.info("No previous offset found");
-        }
-        else {
-            LOGGER.info("Found previous offset {}", previousOffset);
-        }
+        validateSignalDataCollection(connectorConfig, jdbcConnection);
 
         Clock clock = Clock.system();
 
         // Set up the task record queue ...
         this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                 .pollInterval(connectorConfig.getPollInterval())
+                .pollDispatchInterval(connectorConfig.getPollDispatchInterval())
                 .maxBatchSize(connectorConfig.getMaxBatchSize())
                 .maxQueueSize(connectorConfig.getMaxQueueSize())
                 .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
-                .queueProvider(new DefaultQueueProvider<>(connectorConfig.getMaxQueueSize()))
+                .queueProvider(connectorConfig.getServiceRegistry().tryGetService(QueueProviderService.class).getQueueProvider())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                 .build();
 
@@ -233,7 +235,7 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
     }
 
     private OracleConnection getHeartbeatConnection(OracleConnectorConfig connectorConfig, JdbcConfiguration jdbcConfig) {
-        final OracleConnection connection = new OracleConnection(connectorConfig, jdbcConfig);
+        final OracleConnection connection = new OracleConnection(connectorConfig, jdbcConfig, true);
         if (!Strings.isNullOrBlank(connectorConfig.getPdbName())) {
             connection.setSessionToPdb(connectorConfig.getPdbName());
         }
@@ -242,11 +244,7 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
 
     @Override
     public List<SourceRecord> doPoll() throws InterruptedException {
-        List<DataChangeEvent> records = queue.poll();
-
-        return records.stream()
-                .map(DataChangeEvent::getRecord)
-                .collect(Collectors.toList());
+        return pollRecords(queue);
     }
 
     @Override
@@ -276,6 +274,10 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
 
         if (schema != null) {
             schema.close();
+        }
+
+        if (queue != null) {
+            queue.close();
         }
     }
 

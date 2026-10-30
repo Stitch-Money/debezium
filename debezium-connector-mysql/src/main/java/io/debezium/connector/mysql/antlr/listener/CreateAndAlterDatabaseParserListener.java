@@ -21,6 +21,7 @@ public class CreateAndAlterDatabaseParserListener extends MySqlParserBaseListene
 
     private final MySqlAntlrDdlParser parser;
     private String databaseName;
+    private boolean charsetSpecified;
 
     public CreateAndAlterDatabaseParserListener(MySqlAntlrDdlParser parser) {
         this.parser = parser;
@@ -28,35 +29,61 @@ public class CreateAndAlterDatabaseParserListener extends MySqlParserBaseListene
 
     @Override
     public void enterCreateDatabase(MySqlParser.CreateDatabaseContext ctx) {
-        databaseName = parser.parseName(ctx.uid());
+        databaseName = parser.parseName(ctx.schemaName().identifier());
+        charsetSpecified = false;
         super.enterCreateDatabase(ctx);
     }
 
     @Override
     public void exitCreateDatabase(MySqlParser.CreateDatabaseContext ctx) {
-        parser.signalCreateDatabase(databaseName, ctx);
+        // Use parent context to include CREATE keyword
+        parser.signalCreateDatabase(databaseName, ctx.getParent());
+        databaseName = null; // Clear to prevent table charset from overwriting database charset
         super.exitCreateDatabase(ctx);
     }
 
     @Override
-    public void enterAlterSimpleDatabase(MySqlParser.AlterSimpleDatabaseContext ctx) {
-        databaseName = ctx.uid() == null ? parser.currentSchema() : parser.parseName(ctx.uid());
-        super.enterAlterSimpleDatabase(ctx);
+    public void enterAlterDatabase(MySqlParser.AlterDatabaseContext ctx) {
+        // The database name is optional and defaults to the current database
+        databaseName = ctx.schemaRef() == null ? parser.currentSchema() : parser.parseName(ctx.schemaRef().identifier());
+        charsetSpecified = false;
+        super.enterAlterDatabase(ctx);
     }
 
     @Override
-    public void enterCreateDatabaseOption(MySqlParser.CreateDatabaseOptionContext ctx) {
-        String charsetName = parser.extractCharset(ctx.charsetName(), ctx.collationName());
-        if (ctx.charsetName() != null) {
+    public void exitAlterDatabase(MySqlParser.AlterDatabaseContext ctx) {
+        databaseName = null; // Clear to prevent table charset from overwriting database charset
+        super.exitAlterDatabase(ctx);
+    }
+
+    @Override
+    public void enterDefaultCharset(MySqlParser.DefaultCharsetContext ctx) {
+        // Only process if we're in a CREATE/ALTER DATABASE context (databaseName is set)
+        // This method can also be triggered by CREATE TABLE with DEFAULT CHARSET
+        if (databaseName != null) {
+            String charsetName = parser.withoutQuotes(ctx.charsetName());
             if ("DEFAULT".equalsIgnoreCase(charsetName)) {
                 charsetName = parser.systemVariables().getVariable(BinlogSystemVariables.CHARSET_NAME_SERVER);
             }
             parser.charsetNameForDatabase().put(databaseName, charsetName);
+            charsetSpecified = true;
         }
-        // Collation is used only if the database charset was not set by charset setting
-        else if (ctx.charsetName() != null && !parser.charsetNameForDatabase().containsKey(charsetName)) {
-            parser.charsetNameForDatabase().put(databaseName, charsetName);
+        super.enterDefaultCharset(ctx);
+    }
+
+    @Override
+    public void enterDefaultCollation(MySqlParser.DefaultCollationContext ctx) {
+        // Only process if we're in a CREATE/ALTER DATABASE context (databaseName is set)
+        // This method can also be triggered by CREATE TABLE with DEFAULT COLLATE
+        if (databaseName != null) {
+            // Collation is used only if the statement does not set the charset explicitly
+            if (!charsetSpecified) {
+                String charsetName = parser.extractCharset(null, ctx.collationName());
+                if (charsetName != null) {
+                    parser.charsetNameForDatabase().put(databaseName, charsetName);
+                }
+            }
         }
-        super.enterCreateDatabaseOption(ctx);
+        super.enterDefaultCollation(ctx);
     }
 }

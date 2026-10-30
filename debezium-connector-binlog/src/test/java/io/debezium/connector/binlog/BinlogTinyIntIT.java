@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.binlog.converters.TinyIntOneToBooleanConverter;
+import io.debezium.connector.binlog.junit.SkipWhenSchemaHistoryDisabled;
 import io.debezium.connector.binlog.util.TestHelper;
 import io.debezium.connector.binlog.util.UniqueDatabase;
 import io.debezium.doc.FixFor;
@@ -80,11 +81,21 @@ public abstract class BinlogTinyIntIT<C extends SourceConnector> extends Abstrac
         }
         assertIntChangeRecord();
 
+        try (Connection conn = getTestDatabaseConnection(DATABASE.getDatabaseName()).connection()) {
+            conn.createStatement().execute("INSERT INTO DBZ1773 VALUES (DEFAULT, -128, -1, 127, false)");
+        }
+        assertIntChangeRecord((byte) -128, (byte) -1, (byte) 127, (byte) 0);
+
         stopConnector();
     }
 
     @Test
     @FixFor("DBZ-1800")
+    @SkipWhenSchemaHistoryDisabled(reason = "TinyIntOneToBooleanConverter detects boolean columns through the TINYINT(1) display width, which "
+            + "exists only in the table definition: integer TABLE_MAP metadata is empty, and MySQL deprecated integer display widths in "
+            + "8.0.17, retaining only TINYINT(1) as a boolean marker. The converter still works with length.checker=false and an explicit "
+            + "selector, the setup already recommended for MySQL 8, where even SHOW CREATE TABLE drops the width of TINYINT(1) UNSIGNED "
+            + "(DBZ-5343)")
     public void shouldHandleTinyIntOneAsBoolean() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
@@ -111,7 +122,41 @@ public abstract class BinlogTinyIntIT<C extends SourceConnector> extends Abstrac
     }
 
     @Test
+    @FixFor("debezium/dbz#2260")
+    public void shouldHandleNegativeTinyIntOneAsTrue() throws SQLException, InterruptedException {
+        // Use the DB configuration to define the connector's configuration ...
+        config = DATABASE.defaultConfig()
+                .with(BinlogConnectorConfig.SNAPSHOT_MODE, BinlogConnectorConfig.SnapshotMode.INITIAL)
+                .with(BinlogConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DBZ1773"))
+                .with(BinlogConnectorConfig.CUSTOM_CONVERTERS, "boolean")
+                .with("boolean.type", TinyIntOneToBooleanConverter.class.getName())
+                .with("boolean.length.checker", "false")
+                .with("boolean.selector", ".*DBZ1773.b")
+                .build();
+
+        // Start the connector ...
+        start(getConnectorClass(), config);
+
+        consumeInitial();
+
+        assertBooleanChangeRecord();
+
+        // MySQL considers any nonzero value true, e.g. "SELECT -1 IS TRUE" returns 1
+        try (Connection conn = getTestDatabaseConnection(DATABASE.getDatabaseName()).connection()) {
+            conn.createStatement().execute("INSERT INTO DBZ1773 VALUES (DEFAULT, 100, 5, 50, -1)");
+        }
+        assertBooleanChangeRecord();
+
+        stopConnector();
+    }
+
+    @Test
     @FixFor("DBZ-2085")
+    @SkipWhenSchemaHistoryDisabled(reason = "TinyIntOneToBooleanConverter detects boolean columns through the TINYINT(1) display width, which "
+            + "exists only in the table definition: integer TABLE_MAP metadata is empty, and MySQL deprecated integer display widths in "
+            + "8.0.17, retaining only TINYINT(1) as a boolean marker. The converter still works with length.checker=false and an explicit "
+            + "selector, the setup already recommended for MySQL 8, where even SHOW CREATE TABLE drops the width of TINYINT(1) UNSIGNED "
+            + "(DBZ-5343)")
     public void shouldDefaultValueForTinyIntOneAsBoolean() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
@@ -204,14 +249,18 @@ public abstract class BinlogTinyIntIT<C extends SourceConnector> extends Abstrac
     }
 
     private void assertIntChangeRecord() throws InterruptedException {
+        assertIntChangeRecord((byte) 100, (byte) 5, (byte) 50, (byte) 1);
+    }
+
+    private void assertIntChangeRecord(byte ti, byte ti1, byte ti2, byte b) throws InterruptedException {
         final SourceRecord record = consumeRecord();
         assertThat(record).isNotNull();
         final Struct change = ((Struct) record.value()).getStruct("after");
 
-        assertThat(change.getInt16("ti")).isEqualTo((short) 100);
-        assertThat(change.getInt16("ti1")).isEqualTo((short) 5);
-        assertThat(change.getInt16("ti2")).isEqualTo((short) 50);
-        assertThat(change.getInt16("b")).isEqualTo((short) 1);
+        assertThat(change.getInt8("ti")).isEqualTo(ti);
+        assertThat(change.getInt8("ti1")).isEqualTo(ti1);
+        assertThat(change.getInt8("ti2")).isEqualTo(ti2);
+        assertThat(change.getInt8("b")).isEqualTo(b);
     }
 
     private void assertBooleanChangeRecord() throws InterruptedException {
@@ -219,9 +268,9 @@ public abstract class BinlogTinyIntIT<C extends SourceConnector> extends Abstrac
         assertThat(record).isNotNull();
         final Struct change = ((Struct) record.value()).getStruct("after");
 
-        assertThat(change.getInt16("ti")).isEqualTo((short) 100);
-        assertThat(change.getInt16("ti1")).isEqualTo((short) 5);
-        assertThat(change.getInt16("ti2")).isEqualTo((short) 50);
+        assertThat(change.getInt8("ti")).isEqualTo((byte) 100);
+        assertThat(change.getInt8("ti1")).isEqualTo((byte) 5);
+        assertThat(change.getInt8("ti2")).isEqualTo((byte) 50);
         assertThat(change.getBoolean("b")).isEqualTo(true);
     }
 

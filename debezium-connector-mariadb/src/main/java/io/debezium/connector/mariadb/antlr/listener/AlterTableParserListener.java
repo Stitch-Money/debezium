@@ -10,10 +10,9 @@ import static io.debezium.antlr.AntlrDdlParser.getText;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.antlr.v4.runtime.tree.ParseTreeListener;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.mariadb.antlr.MariaDbAntlrDdlParser;
 import io.debezium.ddl.parser.mariadb.generated.MariaDBParser;
@@ -31,8 +30,6 @@ public class AlterTableParserListener extends TableCommonParserListener {
 
     private static final int STARTING_INDEX = 1;
 
-    private final static Logger LOG = LoggerFactory.getLogger(AlterTableParserListener.class);
-
     private ColumnEditor defaultValueColumnEditor;
     private DefaultValueParserListener defaultValueListener;
 
@@ -45,9 +42,9 @@ public class AlterTableParserListener extends TableCommonParserListener {
 
     @Override
     public void enterAlterTable(MariaDBParser.AlterTableContext ctx) {
+        parser.binaryLiteralDefaults().clear();
         final TableId tableId = parser.parseQualifiedTableId(ctx.tableName().fullId());
-        if (parser.databaseTables().forTable(tableId) == null) {
-            LOG.debug("Ignoring ALTER TABLE statement for non-captured table {}", tableId);
+        if (parser.handleAlterTableIfTableIsMissing(tableId, ctx, parser.getTableFilter())) {
             return;
         }
         tableEditor = parser.databaseTables().editTable(tableId);
@@ -62,6 +59,9 @@ public class AlterTableParserListener extends TableCommonParserListener {
     public void exitAlterTable(MariaDBParser.AlterTableContext ctx) {
         parser.runIfNotNull(() -> {
             listeners.remove(columnDefinitionListener);
+            // The character set of the table is known now, and applies to the columns that do not declare one
+            parser.binaryLiteralDefaults().convert(tableEditor, parser.charsetForTable(tableEditor.tableId()),
+                    DefaultValueParserListener.javaEncodings(parser));
             parser.databaseTables().overwriteTable(tableEditor.create());
             parser.signalAlterTable(tableEditor.tableId(), null, ctx.getParent());
         }, tableEditor);
@@ -181,6 +181,7 @@ public class AlterTableParserListener extends TableCommonParserListener {
             String newColumnName = parser.parseName(ctx.newColumn);
             if (newColumnName != null && !column.name().equals(newColumnName)) {
                 tableEditor.renameColumn(column.name(), newColumnName);
+                parser.binaryLiteralDefaults().rename(column.name(), newColumnName);
             }
 
             if (ctx.FIRST() != null) {
@@ -261,11 +262,12 @@ public class AlterTableParserListener extends TableCommonParserListener {
                 defaultValueColumnEditor = column.edit();
                 if (ctx.SET() != null) {
                     defaultValueListener = new DefaultValueParserListener(defaultValueColumnEditor,
-                            new AtomicReference<>(column.isOptional()));
+                            new AtomicReference<>(column.isOptional()), parser);
                     listeners.add(defaultValueListener);
                 }
                 else if (ctx.DROP() != null) {
                     defaultValueColumnEditor.unsetDefaultValueExpression();
+                    parser.binaryLiteralDefaults().remove(column.name());
                 }
             }
         }, tableEditor);
@@ -342,6 +344,7 @@ public class AlterTableParserListener extends TableCommonParserListener {
             String newColumnName = parser.parseName(ctx.newColumn);
             if (newColumnName != null && !column.name().equals(newColumnName)) {
                 tableEditor.renameColumn(column.name(), newColumnName);
+                parser.binaryLiteralDefaults().rename(column.name(), newColumnName);
             }
             listeners.remove(columnDefinitionListener);
         }, tableEditor, columnDefinitionListener);
@@ -365,5 +368,28 @@ public class AlterTableParserListener extends TableCommonParserListener {
         parser.runIfNotNull(() -> tableEditor.setPrimaryKeyNames(parser.parseName(ctx.uid())), tableEditor);
 
         super.enterAlterByNotExistingPrimaryKey(ctx);
+    }
+
+    @Override
+    public void enterAlterByConvertCharacterset(MariaDBParser.AlterByConvertCharactersetContext ctx) {
+        parser.runIfNotNull(() -> {
+            String charsetName = parser.extractCharset(ctx.charsetName(), ctx.collationName());
+            if (charsetName != null) {
+                tableEditor.setDefaultCharsetName(charsetName);
+                tableEditor.setColumns(tableEditor.columns().stream()
+                        .map(
+                                column -> {
+                                    final ColumnEditor columnEditor = column.edit();
+                                    if (columnEditor.charsetName() != null) {
+                                        columnEditor.charsetNameOfTable(charsetName);
+                                        columnEditor.charsetName(charsetName);
+                                    }
+                                    return columnEditor;
+                                })
+                        .map(ColumnEditor::create)
+                        .collect(Collectors.toList()));
+            }
+        }, tableEditor);
+        super.enterAlterByConvertCharacterset(ctx);
     }
 }

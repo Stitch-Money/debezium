@@ -10,16 +10,22 @@ import java.nio.charset.Charset;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
+import java.time.DateTimeException;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
@@ -31,7 +37,6 @@ import org.postgresql.core.BaseConnection;
 import org.postgresql.jdbc.PgConnection;
 import org.postgresql.jdbc.TimestampUtils;
 import org.postgresql.replication.LogSequenceNumber;
-import org.postgresql.util.PGmoney;
 import org.postgresql.util.PSQLState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -100,26 +105,48 @@ public class PostgresConnection extends JdbcConnection {
 
     /**
      * Creates a Postgres connection using the supplied configuration.
-     * If necessary this connection is able to resolve data type mappings.
-     * Such a connection requires a {@link PostgresValueConverter}, and will provide its own {@link TypeRegistry}.
-     * Usually only one such connection per connector is needed.
+     * If the connection needs to resolve data types, it needs to create both {@link TypeRegistry} and {@link PostgresValueConverter}
+     * in advance, and pass them to this constructor.
      *
      * @param config {@link Configuration} instance, may not be null.
-     * @param valueConverterBuilder supplies a configured {@link PostgresValueConverter} for a given {@link TypeRegistry}
+     * @param typeRegistry an already-primed {@link TypeRegistry} instance
+     * @param valueConverterBuilder supplies a configured {@link PostgresValueConverter} for a given {@link TypeRegistry};
+     *            may be null when no default value converter is needed, in which case the constructor does not connect
      * @param connectionUsage a symbolic name of the connection to be tracked in monitoring tools
      */
-    public PostgresConnection(JdbcConfiguration config, PostgresValueConverterBuilder valueConverterBuilder, String connectionUsage) {
+    public PostgresConnection(JdbcConfiguration config, TypeRegistry typeRegistry, PostgresValueConverterBuilder valueConverterBuilder, String connectionUsage) {
         super(addDefaultSettings(config, connectionUsage), FACTORY, PostgresConnection::validateServerVersion, "\"", "\"");
 
-        if (Objects.isNull(valueConverterBuilder)) {
-            this.typeRegistry = null;
+        this.typeRegistry = typeRegistry;
+        if (Objects.isNull(typeRegistry) || Objects.isNull(valueConverterBuilder)) {
             this.defaultValueConverter = null;
         }
         else {
-            this.typeRegistry = new TypeRegistry(this);
+            this.defaultValueConverter = initializeAndCloseOnFailure(() -> {
+                final PostgresValueConverter valueConverter = valueConverterBuilder.build(this.typeRegistry);
+                return new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils(), typeRegistry);
+            });
+        }
+    }
 
-            final PostgresValueConverter valueConverter = valueConverterBuilder.build(this.typeRegistry);
-            this.defaultValueConverter = new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils(), typeRegistry);
+    public static TypeRegistry createTypeRegistry(JdbcConfiguration config) {
+        return createTypeRegistry(config, Collections.emptySet());
+    }
+
+    /**
+     * Creates a {@link TypeRegistry} pre-loaded only with types from the given schemas.
+     * {@code pg_catalog} and {@code information_schema} are always included.
+     * Pass an empty set to load all schemas.
+     *
+     * @param config       {@link JdbcConfiguration} instance, may not be null.
+     * @param schemaFilter schema names to pre-load types from; empty means all schemas
+     */
+    public static TypeRegistry createTypeRegistry(JdbcConfiguration config, Set<String> schemaFilter) {
+        try (PostgresConnection connection = new PostgresConnection(config, PostgresConnection.CONNECTION_GENERAL)) {
+            return new TypeRegistry(connection, schemaFilter);
+        }
+        catch (DebeziumException e) {
+            throw new DebeziumException("Failed to create TypeRegistry", e);
         }
     }
 
@@ -141,8 +168,10 @@ public class PostgresConnection extends JdbcConnection {
         }
         else {
             this.typeRegistry = typeRegistry;
-            final PostgresValueConverter valueConverter = PostgresValueConverter.of(config, this.getDatabaseCharset(), typeRegistry);
-            this.defaultValueConverter = new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils(), typeRegistry);
+            this.defaultValueConverter = initializeAndCloseOnFailure(() -> {
+                final PostgresValueConverter valueConverter = PostgresValueConverter.of(config, this.getDatabaseCharset(), typeRegistry);
+                return new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils(), typeRegistry);
+            });
         }
     }
 
@@ -154,7 +183,7 @@ public class PostgresConnection extends JdbcConnection {
      * @param connectionUsage a symbolic name of the connection to be tracked in monitoring tools
      */
     public PostgresConnection(JdbcConfiguration config, String connectionUsage) {
-        this(config, null, connectionUsage);
+        this(config, null, null, connectionUsage);
     }
 
     static JdbcConfiguration addDefaultSettings(JdbcConfiguration configuration, String connectionUsage) {
@@ -680,7 +709,8 @@ public class PostgresConnection extends JdbcConnection {
 
             // first source the length/scale from the column metadata provided by the driver
             // this may be overridden below if the column type is a user-defined domain type
-            column.length(columnMetadata.getInt(7));
+            final int driverLength = columnMetadata.getInt(7);
+            column.length(driverLength);
             if (columnMetadata.getObject(9) != null) {
                 column.scale(columnMetadata.getInt(9));
             }
@@ -700,9 +730,20 @@ public class PostgresConnection extends JdbcConnection {
 
             // Lookup the column type from the TypeRegistry
             // For all types, we need to set the Native and Jdbc types by using the root-type
-            final PostgresType nativeType = getTypeRegistry().get(column.typeName());
+            String typeName = column.typeName();
+            PostgresType nativeType = getTypeRegistry().get(tableId.schema(), typeName);
             column.nativeType(nativeType.getRootType().getOid());
             column.jdbcType(nativeType.getRootType().getJdbcId());
+
+            // The JDBC driver reports a user-defined type schema-qualified (e.g. "schema"."type") when
+            // its schema is not on the search_path, whereas streaming always uses the unqualified name
+            // via PostgresType#getName(). Normalize to the unqualified form so snapshot and streaming
+            // agree (debezium/dbz#683), but skip it when the type did not resolve so an unrecognized
+            // name (e.g. from a PostgreSQL-compatible source) keeps the driver's spelling rather than
+            // the UNKNOWN placeholder.
+            if (typeName.contains(".") && nativeType != PostgresType.UNKNOWN) {
+                column.type(nativeType.getName());
+            }
 
             // For domain types, the postgres driver is unable to traverse a nested unbounded
             // hierarchy of types and report the right length/scale of a given type. We use
@@ -713,8 +754,19 @@ public class PostgresConnection extends JdbcConnection {
                 column.scale(nativeType.getDefaultScale());
             }
 
+            // The driver reports COLUMN_SIZE as MAX_VALUE for vectors (see PostgresType#isVector);
+            // recover the real dimension from the catalog instead.
+            if (nativeType.isVector() && driverLength == Integer.MAX_VALUE) {
+                final OptionalInt dimension = readVectorDimension(tableId, columnName);
+                // Real dimension, or clear the bogus MAX_VALUE for a bare vector so no length is propagated.
+                column.length(dimension.orElse(Column.UNSET_INT_VALUE));
+                if (dimension.isPresent()) {
+                    column.scale(0);
+                }
+            }
+
             final String defaultValueExpression = columnMetadata.getString(13);
-            if (defaultValueExpression != null && getDefaultValueConverter().supportConversion(column.typeName())) {
+            if (defaultValueExpression != null && getDefaultValueConverter().supportConversion(nativeType.getName())) {
                 column.defaultValueExpression(defaultValueExpression);
             }
 
@@ -722,6 +774,35 @@ public class PostgresConnection extends JdbcConnection {
         }
 
         return Optional.empty();
+    }
+
+    /**
+     * Reads a pgvector column's dimension from {@code pg_attribute.atttypmod}, which the JDBC driver
+     * cannot expose for these extension types (see {@link PostgresType#isVector()}).
+     *
+     * @return the dimension, or empty when the column has no dimension modifier
+     */
+    private OptionalInt readVectorDimension(TableId tableId, String columnName) throws SQLException {
+        final String schema = tableId.schema() != null && !tableId.schema().isEmpty() ? tableId.schema() : "public";
+        return prepareQueryAndMap(
+                "SELECT a.atttypmod FROM pg_attribute a "
+                        + "JOIN pg_class c ON a.attrelid = c.oid "
+                        + "JOIN pg_namespace n ON c.relnamespace = n.oid "
+                        + "WHERE n.nspname = ? AND c.relname = ? AND a.attname = ? AND a.attnum > 0 AND NOT a.attisdropped",
+                statement -> {
+                    statement.setString(1, schema);
+                    statement.setString(2, tableId.table());
+                    statement.setString(3, columnName);
+                },
+                rs -> {
+                    if (rs.next()) {
+                        final int typmod = rs.getInt(1);
+                        if (typmod > 0) {
+                            return OptionalInt.of(typmod);
+                        }
+                    }
+                    return OptionalInt.empty();
+                });
     }
 
     public PostgresDefaultValueConverter getDefaultValueConverter() {
@@ -737,12 +818,14 @@ public class PostgresConnection extends JdbcConnection {
     @Override
     public Object getColumnValue(ResultSet rs, int columnIndex, Column column, Table table) throws SQLException {
         try {
-            final ResultSetMetaData metaData = rs.getMetaData();
-            final String columnTypeName = metaData.getColumnTypeName(columnIndex);
-            final PostgresType type = getTypeRegistry().get(columnTypeName);
+            // Resolve the column's type from the relational model's OID (captured once at schema discovery) rather
+            // than re-deriving it from ResultSetMetaData#getColumnTypeName on every column of every row. Postgres
+            // collapses scalar domains to their base type on the wire, so this matches the ResultSetMetaData
+            // resolution for everything the logic below distinguishes -- array-ness and the built-in base-type OIDs.
+            final PostgresType type = getTypeRegistry().get(column.nativeType());
 
             LOGGER.trace("Type of incoming data is: {}", type.getOid());
-            LOGGER.trace("ColumnTypeName is: {}", columnTypeName);
+            LOGGER.trace("ColumnTypeName is: {}", type.getName());
             LOGGER.trace("Type is: {}", type);
 
             if (type.isArrayType()) {
@@ -751,17 +834,8 @@ public class PostgresConnection extends JdbcConnection {
 
             switch (type.getOid()) {
                 case PgOid.MONEY:
-                    // TODO author=Horia Chiorean date=14/11/2016 description=workaround for https://github.com/pgjdbc/pgjdbc/issues/100
                     final String sMoney = rs.getString(columnIndex);
-                    if (sMoney == null) {
-                        return sMoney;
-                    }
-                    if (sMoney.startsWith("-")) {
-                        // PGmoney expects negative values to be provided in the format of "($XXXXX.YY)"
-                        final String negativeMoney = "(" + sMoney.substring(1) + ")";
-                        return new PGmoney(negativeMoney).val;
-                    }
-                    return new PGmoney(sMoney).val;
+                    return PostgresMoney.parse(sMoney);
                 case PgOid.BIT:
                     return rs.getString(columnIndex);
                 case PgOid.NUMERIC:
@@ -778,6 +852,66 @@ public class PostgresConnection extends JdbcConnection {
                     // In order to guarantee that we resolve TIMETZ columns with proper microsecond precision,
                     // read the column as a string instead and then re-parse inside the converter.
                     return rs.getString(columnIndex);
+                case PgOid.DATE:
+                    // Read as LocalDate so that the era survives. java.sql.Date carries no era, so a date
+                    // stored as BC would arrive as the same day AD. LocalDate is a proleptic ISO type and
+                    // never passes through java.sql.Date's Calendar.
+                    final LocalDate localDate;
+                    try {
+                        localDate = rs.getObject(columnIndex, LocalDate.class);
+                    }
+                    catch (DateTimeException e) {
+                        // pgjdbc validates the date against the year-of-era before applying BC, so February 29
+                        // of a BC leap year (1 BC, 5 BC, ...) is rejected; the converters parse the text form correctly
+                        return rs.getString(columnIndex);
+                    }
+                    // The driver maps infinity to LocalDate.MAX/MIN; emit the connector's own sentinels, as streaming does
+                    if (LocalDate.MAX.equals(localDate)) {
+                        return PostgresValueConverter.POSITIVE_INFINITY_LOCAL_DATE;
+                    }
+                    if (LocalDate.MIN.equals(localDate)) {
+                        return PostgresValueConverter.NEGATIVE_INFINITY_LOCAL_DATE;
+                    }
+                    return localDate;
+                case PgOid.TIMESTAMP:
+                    // Read as LocalDateTime rather than java.sql.Timestamp, whose Julian-Gregorian calendar conversion
+                    // corrupts dates before 1582-10-15 (PostgreSQL uses proleptic Gregorian). The driver parses the
+                    // value natively, which is considerably cheaper than re-parsing its text form in the converter.
+                    final LocalDateTime localDateTime;
+                    try {
+                        localDateTime = rs.getObject(columnIndex, LocalDateTime.class);
+                    }
+                    catch (DateTimeException e) {
+                        // pgjdbc validates the date against the year-of-era before applying BC, so February 29
+                        // of a BC leap year (1 BC, 5 BC, ...) is rejected; the converters parse the text form correctly
+                        return rs.getString(columnIndex);
+                    }
+                    // The driver maps infinity to LocalDateTime.MAX/MIN; the converters expect the connector's own sentinels
+                    if (LocalDateTime.MAX.equals(localDateTime)) {
+                        return PostgresValueConverter.POSITIVE_INFINITY_LOCAL_DATE_TIME;
+                    }
+                    if (LocalDateTime.MIN.equals(localDateTime)) {
+                        return PostgresValueConverter.NEGATIVE_INFINITY_LOCAL_DATE_TIME;
+                    }
+                    return localDateTime;
+                case PgOid.TIMESTAMPTZ:
+                    // Read as OffsetDateTime for the same reasons as TIMESTAMP; the driver normalizes it to UTC
+                    final OffsetDateTime offsetDateTime;
+                    try {
+                        offsetDateTime = rs.getObject(columnIndex, OffsetDateTime.class);
+                    }
+                    catch (DateTimeException e) {
+                        // Same BC leap day limitation as TIMESTAMP
+                        return rs.getString(columnIndex);
+                    }
+                    // The driver maps infinity to OffsetDateTime.MAX/MIN; the converters expect the connector's own sentinels
+                    if (OffsetDateTime.MAX.equals(offsetDateTime)) {
+                        return PostgresValueConverter.POSITIVE_INFINITY_OFFSET_DATE_TIME;
+                    }
+                    if (OffsetDateTime.MIN.equals(offsetDateTime)) {
+                        return PostgresValueConverter.NEGATIVE_INFINITY_OFFSET_DATE_TIME;
+                    }
+                    return offsetDateTime;
                 default:
                     Object x = rs.getObject(columnIndex);
                     if (x != null) {
@@ -830,6 +964,31 @@ public class PostgresConnection extends JdbcConnection {
     public <T extends DataCollectionId> ChunkQueryBuilder<T> chunkQueryBuilder(RelationalDatabaseConnectorConfig connectorConfig) {
         // PostgreSQL definitely must use row value constructors in order to yield optimal results. See DBZ-5071.
         return new RowValueConstructorChunkQueryBuilder<>(connectorConfig, this);
+    }
+
+    @Override
+    public OptionalLong readRowCountEstimate(TableId tableId) {
+        // pg_class.reltuples is a planner estimate maintained by ANALYZE/autovacuum; -1 means "unknown" (never analyzed).
+        final String query = "SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                + "WHERE n.nspname = ? AND c.relname = ?";
+        try {
+            return prepareQueryAndMap(query,
+                    statement -> {
+                        statement.setString(1, tableId.schema());
+                        statement.setString(2, tableId.table());
+                    },
+                    rs -> {
+                        if (rs.next()) {
+                            final long estimate = rs.getLong(1);
+                            return estimate >= 0 ? OptionalLong.of(estimate) : OptionalLong.empty();
+                        }
+                        return OptionalLong.empty();
+                    });
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to read row count estimate for table '{}' from pg_class; incremental snapshot will fall back to an exact count", tableId, e);
+            return OptionalLong.empty();
+        }
     }
 
     @Override

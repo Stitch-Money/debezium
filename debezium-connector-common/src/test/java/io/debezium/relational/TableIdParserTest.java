@@ -1,0 +1,127 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.relational;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import org.junit.jupiter.api.Test;
+
+import io.debezium.doc.FixFor;
+
+/**
+ * Unit test for {@link TableIdParser}.
+ *
+ * @author Gunnar Morling
+ */
+class TableIdParserTest {
+
+    @Test
+    public void canParseValidIdentifiers() {
+        assertThat(TableIdParser.parse("s.a")).containsExactly("s", "a");
+        assertThat(TableIdParser.parse("s2.a")).containsExactly("s2", "a");
+        assertThat(TableIdParser.parse("table")).containsExactly("table");
+        assertThat(TableIdParser.parse("  table  ")).containsExactly("table");
+        assertThat(TableIdParser.parse("schema.table")).containsExactly("schema", "table");
+        assertThat(TableIdParser.parse("  schema  .  table  ")).containsExactly("schema", "table");
+        assertThat(TableIdParser.parse("catalog.schema.table")).containsExactly("catalog", "schema", "table");
+        assertThat(TableIdParser.parse("catalog  .  schema  .  table")).containsExactly("catalog", "schema", "table");
+        assertThat(TableIdParser.parse("\"table\"")).containsExactly("table");
+        assertThat(TableIdParser.parse("\"ta.ble\"")).containsExactly("ta.ble");
+        assertThat(TableIdParser.parse("\"ta   ble\"")).containsExactly("ta   ble");
+        assertThat(TableIdParser.parse("\"schema\".\"table\"")).containsExactly("schema", "table");
+        assertThat(TableIdParser.parse("\"cata . log\" . \"sche . ma\" . \"ta . ble\"")).containsExactly("cata . log", "sche . ma", "ta . ble");
+        assertThat(TableIdParser.parse("\"tab\"\"le\"")).containsExactly("tab\"le");
+        assertThat(TableIdParser.parse("\"tab\"\"\"\"le\"")).containsExactly("tab\"\"le");
+        assertThat(TableIdParser.parse("\"\"\"s\"\"\".\"\"\"a\"\"\"")).containsExactly("\"s\"", "\"a\"");
+        assertThat(TableIdParser.parse("[db].[table]", new TestTableIdPredicates())).containsExactly("db", "table");
+        assertThat(TableIdParser.parse("[db].[table with spaces]", new TestTableIdPredicates())).containsExactly("db", "table with spaces");
+    }
+
+    @Test
+    void leadingSeparatorIsInvalid() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            TableIdParser.parse(".table");
+        });
+    }
+
+    @Test
+    void trailingSeparatorIsInvalid() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            TableIdParser.parse("table.");
+        });
+    }
+
+    @Test
+    void unclosedQuotingCharIsInvalid() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            TableIdParser.parse("\"table");
+        });
+    }
+
+    @Test
+    void escapedQuoteDoesntCloseQuotedIdentifier() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            TableIdParser.parse("\"table\"\"");
+        });
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1377")
+    public void onlyTheQuotingCharIsUnescaped() {
+        assertThat(TableIdParser.parse("test_dd.\"test''dd\"")).containsExactly("test_dd", "test''dd");
+        assertThat(TableIdParser.parse("\"test``dd\"")).containsExactly("test``dd");
+        assertThat(TableIdParser.parse("`test\"\"dd`")).containsExactly("test\"\"dd");
+        assertThat(TableIdParser.parse("`test``dd`")).containsExactly("test`dd");
+        assertThat(TableIdParser.parse("'test''dd'")).containsExactly("test'dd");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1377")
+    public void unquotedPartsAreNotUnescaped() {
+        assertThat(TableIdParser.parse("test_dd.test''dd")).containsExactly("test_dd", "test''dd");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1377")
+    public void delimitedPartsAreNotUnescaped() {
+        assertThat(TableIdParser.parse("[test''dd]", new TestTableIdPredicates())).containsExactly("test''dd");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2841")
+    public void shouldParseDelimitedIdentifierWithEscapedEndDelimiter() {
+        assertThat(TableIdParser.parse("[tab]]le]", new TestTableIdPredicates())).containsExactly("tab]le");
+        assertThat(TableIdParser.parse("[table]]]", new TestTableIdPredicates())).containsExactly("table]");
+        assertThat(TableIdParser.parse("[[table]", new TestTableIdPredicates())).containsExactly("[table");
+        assertThat(TableIdParser.parse("[[table]]]", new TestTableIdPredicates())).containsExactly("[table]");
+        assertThat(TableIdParser.parse("[table]]]]]", new TestTableIdPredicates())).containsExactly("table]]");
+        assertThat(TableIdParser.parse("[db].[schema].[table]]]", new TestTableIdPredicates())).containsExactly("db", "schema", "table]");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2841")
+    void escapedDelimiterDoesntCloseDelimitedIdentifier() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            TableIdParser.parse("[table]]", new TestTableIdPredicates());
+        });
+        assertThrows(IllegalArgumentException.class, () -> {
+            TableIdParser.parse("[table", new TestTableIdPredicates());
+        });
+    }
+
+    private static class TestTableIdPredicates implements TableIdPredicates {
+        @Override
+        public boolean isStartDelimiter(char c) {
+            return c == '[';
+        }
+
+        @Override
+        public boolean isEndDelimiter(char c) {
+            return c == ']';
+        }
+    }
+}

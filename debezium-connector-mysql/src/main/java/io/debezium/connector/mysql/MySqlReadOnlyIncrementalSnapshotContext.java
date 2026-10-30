@@ -5,12 +5,12 @@
  */
 package io.debezium.connector.mysql;
 
-import static io.debezium.connector.mysql.gtid.MySqlGtidSet.GTID_DELIMITER;
-
 import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.github.shyiko.mysql.binlog.event.MySqlGtid;
 
 import io.debezium.connector.binlog.BinlogReadOnlyIncrementalSnapshotContext;
 import io.debezium.connector.binlog.gtid.GtidSet;
@@ -78,14 +78,13 @@ public class MySqlReadOnlyIncrementalSnapshotContext<T> extends BinlogReadOnlyIn
         if (currentGtid == null) {
             return true;
         }
-        String[] gtid = GTID_DELIMITER.split(currentGtid);
-        MySqlGtidSet.UUIDSet uuidSet = getUuidSet(gtid[0]);
+        final MySqlGtid gtid = MySqlGtid.fromString(currentGtid);
+        MySqlGtidSet.UUIDSet uuidSet = getUuidSet(gtid.getServerId().toString(), gtid.getTag());
         if (uuidSet != null) {
-            long maxTransactionId = uuidSet.getIntervals().stream()
+            final java.util.OptionalLong maxTransactionId = uuidSet.getIntervals().stream()
                     .mapToLong(MySqlGtidSet.Interval::getEnd)
-                    .max()
-                    .getAsLong();
-            if (maxTransactionId <= Long.parseLong(gtid[1])) {
+                    .max();
+            if (maxTransactionId.isPresent() && maxTransactionId.getAsLong() <= gtid.getTransactionId()) {
                 LOGGER.debug("Gtid {} reached high watermark {}", currentGtid, highWatermark);
                 return true;
             }
@@ -107,8 +106,9 @@ public class MySqlReadOnlyIncrementalSnapshotContext<T> extends BinlogReadOnlyIn
         return !previousLowWatermark.equals(lowWatermark) || !previousHighWatermark.equals(highWatermark);
     }
 
-    private MySqlGtidSet.UUIDSet getUuidSet(String serverId) {
-        return highWatermark.getUUIDSets().isEmpty() ? lowWatermark.forServerWithId(serverId) : highWatermark.forServerWithId(serverId);
+    private MySqlGtidSet.UUIDSet getUuidSet(String serverId, String tag) {
+        final MySqlGtidSet wm = highWatermark.getUUIDSets().isEmpty() ? lowWatermark : highWatermark;
+        return wm.forServerWithIdAndTag(serverId, tag);
     }
 
     private boolean serverUuidChanged() {

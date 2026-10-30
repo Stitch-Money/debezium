@@ -5,9 +5,19 @@ inputs:
   path-core:
     description: "Debezium core repository checkout path"
     required: true
+  path-quarkus:
+    description: "Debezium Quarkus repository checkout path"
+    required: true
+  path-elasticsearch:
+    description: "Debezium Elasticsearch connector repository checkout path"
+    required: true
   path-server:
     description: "Debezium Server repository checkout path"
     required: true
+  only-build:
+    description: "Only build without tests, checkstyle, and format"
+    required: false
+    default: 'false'
   shell:
     description: "The shell to use"
     required: false
@@ -29,15 +39,43 @@ runs:
         -Dmaven.wagon.http.pool=false
         -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
 
+    # This is needed for the debezium-quarkus-bridge
+    - name: Build Quarkus
+      shell: ${{ inputs.shell }}
+      run: >
+        ./${{ inputs.path-quarkus }}/mvnw -B -ntp clean install -f ${{ inputs.path-quarkus }}/pom.xml
+        -Passembly
+        -Dformat.skip=true
+        -Dcheckstyle.skip=true
+        -Dorg.slf4j.simpleLogger.showDateTime=true
+        -Dorg.slf4j.simpleLogger.dateTimeFormat="YYYY-MM-dd HH:mm:ss,SSS"
+        -DskipTests=true
+        -DskipITs=true
+        -DskipNonCore
+
+    # This is needed for the debezium-server-elasticsearch sink
+    - name: Build Elasticsearch
+      shell: ${{ inputs.shell }}
+      run: >
+        ./${{ inputs.path-core }}/mvnw -B -ntp clean install -f ${{ inputs.path-elasticsearch }}/pom.xml
+        -Dformat.skip=true
+        -Dcheckstyle.skip=true
+        -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+        -Dmaven.wagon.http.pool=false
+        -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+        -DskipTests=true
+        -DskipITs=true
+
     - name: Build Server
       shell: ${{ inputs.shell }}
       run: >
-        ./${{ inputs.path-core }}/mvnw clean install -B -ntp -fae -f ${{ inputs.path-server }}/pom.xml 
-        -Passembly                
-        -Dcheckstyle.skip=false
-        -Dformat.skip=false
+        ./${{ inputs.path-core }}/mvnw clean install -B -ntp -fae -f ${{ inputs.path-server }}/pom.xml
+        -Passembly
+        -Dcheckstyle.skip=${{ inputs.only-build == 'true' && 'true' || 'false' }}
+        -Dformat.skip=${{ inputs.only-build == 'true' && 'true' || 'false' }}
         -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
         -Dmaven.wagon.http.pool=false
         -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
         -DskipNonCore
-        -DfailFlakyTests=false        
+        -DfailFlakyTests=false
+        ${{ inputs.only-build == 'true' && '-DskipTests=true -DskipITs=true' || '' }}        

@@ -194,8 +194,8 @@ public class MongoDbOffsetContext extends CommonOffsetContext<SourceInfo> {
         if (obj == null) {
             return 0;
         }
-        if (obj instanceof Number) {
-            return ((Number) obj).intValue();
+        if (obj instanceof Number number) {
+            return number.intValue();
         }
         try {
             return Integer.parseInt(obj.toString());
@@ -224,7 +224,10 @@ public class MongoDbOffsetContext extends CommonOffsetContext<SourceInfo> {
         public MongoDbOffsetContext load(Map<String, ?> offset) {
             var sourceInfo = new SourceInfo(connectorConfig);
 
-            if (!booleanOffsetValue(offset, INITIAL_SYNC)) {
+            if (booleanOffsetValue(offset, INITIAL_SYNC)) {
+                sourceInfo.startInitialSnapshot();
+            }
+            else {
                 var position = positionFromOffset(offset);
                 sourceInfo.setPosition(position);
             }

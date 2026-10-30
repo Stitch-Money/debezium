@@ -7,7 +7,9 @@ package io.debezium.testing.testcontainers;
 
 import static io.debezium.testing.testcontainers.MongoDbReplicaSet.replicaSet;
 
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 
 import org.assertj.core.api.Assertions;
 import org.bson.Document;
@@ -17,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.testcontainers.images.PullPolicy;
 
 import com.mongodb.MongoCommandException;
 import com.mongodb.client.MongoClients;
@@ -44,7 +47,7 @@ public class MongoDbReplicaSetAuthContainerIT {
     @BeforeAll
     static void beforeAll() {
         DockerUtils.enableFakeDnsIfRequired();
-        mongo = replicaSet().authEnabled(true).build();
+        mongo = replicaSet().withImagePullPolicy(PullPolicy.ageBased(Duration.ofHours(8))).authEnabled(true).build();
         LOGGER.info("Starting {}...", mongo);
         mongo.start();
         LOGGER.info("Setting up users");
@@ -83,17 +86,18 @@ public class MongoDbReplicaSetAuthContainerIT {
         LOGGER.info("Connecting to cluster without credentials: {}", noAuthConnectionString);
         try (var client = MongoClients.create(noAuthConnectionString)) {
             LOGGER.info("Connected to cluster: {}", client.getClusterDescription());
-            client.getDatabase(TEST_DATABASE_1).listCollectionNames();
-        }
-        catch (MongoCommandException e) {
-            Assertions.assertThat(e.getMessage()).contains("Unauthorized");
+            Assertions.assertThatThrownBy(() -> client.getDatabase(TEST_DATABASE_1).listCollectionNames().first(),
+                    "An unauthenticated client must not list collections")
+                    .isInstanceOfSatisfying(MongoCommandException.class,
+                            error -> Assertions.assertThat(error.getErrorCode()).isEqualTo(13));
         }
 
         var connectionString = mongo.getConnectionString();
         LOGGER.info("Connecting to cluster as root: {}", connectionString);
         try (var client = MongoClients.create(connectionString)) {
             LOGGER.info("Connected to cluster: {}", client.getClusterDescription());
-            client.getDatabase(TEST_DATABASE_1).listCollectionNames();
+            final List<String> names = client.getDatabase(TEST_DATABASE_1).listCollectionNames().into(new ArrayList<>());
+            Assertions.assertThat(names).containsOnly(TEST_COLLECTION);
         }
 
         var authConnectionString = mongo.getAuthConnectionString(TEST_USER, TEST_PWD, AUTH_DATABASE);
@@ -106,10 +110,10 @@ public class MongoDbReplicaSetAuthContainerIT {
         }
         try (var client = MongoClients.create(authConnectionString)) {
             // TEST_USER can NOT read TEST_DATABASE_2
-            client.getDatabase(TEST_DATABASE_2).listCollectionNames().first();
-        }
-        catch (MongoCommandException e) {
-            Assertions.assertThat(e.getMessage()).contains("not authorized");
+            Assertions.assertThatThrownBy(() -> client.getDatabase(TEST_DATABASE_2).listCollectionNames().first(),
+                    "The test user must not list collections in the second database")
+                    .isInstanceOfSatisfying(MongoCommandException.class,
+                            error -> Assertions.assertThat(error.getErrorCode()).isEqualTo(13));
         }
     }
 }

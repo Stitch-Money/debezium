@@ -15,14 +15,14 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.apache.kafka.connect.runtime.WorkerConfig;
-import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
-import org.apache.kafka.connect.util.Callback;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import io.debezium.config.Configuration;
+import io.debezium.doc.FixFor;
+import io.debezium.spi.storage.OffsetStore;
 import io.debezium.storage.jdbc.offset.JdbcOffsetBackingStore;
 
 /**
@@ -35,7 +35,7 @@ public class JdbcOffsetBackingStoreTest {
 
     JdbcOffsetBackingStore store;
     Map<String, String> props;
-    WorkerConfig config;
+    Configuration config;
     File dbFile;
 
     @BeforeEach
@@ -43,7 +43,6 @@ public class JdbcOffsetBackingStoreTest {
         dbFile = File.createTempFile("test-", "db");
         store = new JdbcOffsetBackingStore();
         props = new HashMap<>();
-        props.put(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, "dummy");
         props.put("offset.storage.jdbc.url", "jdbc:sqlite:" + dbFile.getAbsolutePath());
         props.put("offset.storage.jdbc.user", "user");
         props.put("offset.storage.jdbc.password", "pass");
@@ -56,9 +55,7 @@ public class JdbcOffsetBackingStoreTest {
                 ")");
         props.put("offset.storage.jdbc.offset.table.select", "SELECT id, offset_key, offset_val FROM offsets_jdbc " +
                 "ORDER BY record_insert_ts, record_insert_seq");
-        props.put(StandaloneConfig.KEY_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonConverter");
-        props.put(StandaloneConfig.VALUE_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonConverter");
-        config = new StandaloneConfig(props);
+        config = Configuration.from(props);
         store.configure(config);
         store.start();
 
@@ -74,7 +71,7 @@ public class JdbcOffsetBackingStoreTest {
     }
 
     @Test
-    public void testInitialize() {
+    public void testInitializeWithCredentials() {
         // multiple initialization should not fail
         // first one should create the table and following ones should use the created table
         store.start();
@@ -83,11 +80,20 @@ public class JdbcOffsetBackingStoreTest {
     }
 
     @Test
+    @FixFor("debezium/dbz#1957")
+    public void testInitializeWithoutCredentials() {
+        store.stop();
+        props.remove("offset.storage.jdbc.user");
+        props.remove("offset.storage.jdbc.password");
+        config = Configuration.from(props);
+        store = new JdbcOffsetBackingStore();
+        store.configure(config);
+        store.start();
+    }
+
+    @Test
     public void testGetSet() throws Exception {
-        Callback<Void> cb = new Callback<Void>() {
-            public void onCompletion(Throwable error, Void result) {
-                return;
-            }
+        OffsetStore.Callback<Void> cb = (error, result) -> {
         };
         store.set(firstSet, cb).get();
 
@@ -98,17 +104,14 @@ public class JdbcOffsetBackingStoreTest {
 
     @Test
     public void testSaveRestore() throws Exception {
-        Callback<Void> cb = new Callback<Void>() {
-            public void onCompletion(Throwable error, Void result) {
-                return;
-            }
+        OffsetStore.Callback<Void> cb = (error, result) -> {
         };
 
         store.set(firstSet, cb).get();
         store.set(secondSet, cb).get();
         store.stop();
 
-        // Restore into a new store mand make sure its correctly reload
+        // Restore into a new store and make sure its correctly reload
         JdbcOffsetBackingStore restore = new JdbcOffsetBackingStore();
         restore.configure(config);
         restore.start();

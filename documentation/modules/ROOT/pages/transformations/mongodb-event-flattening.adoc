@@ -6,6 +6,7 @@
 [id="mongodb-new-document-state-extraction"]
 = MongoDB New Document State Extraction
 
+ifdef::community[]
 :toc:
 :toc-placement: macro
 :linkattrs:
@@ -13,6 +14,7 @@
 :source-highlighter: highlight.js
 
 toc::[]
+endif::community[]
 The {prodname} MongoDB connector emits data change messages to represent each operation that occurs in a MongoDB collection.
 The complex structure of these event messages faithfully represent the details of the original database event.
 However, some downstream consumers might not be able to process the messages in their original format.
@@ -61,30 +63,40 @@ Source metadata:: Includes, but is not limited to the following fields:
 
 Document data::
 `before` data:::
-This field is present in environments that run MongoDB 6.0 and later when the `capture.mode` for the {prodname} connector is set to one of the following values:
-* `change_streams_with_pre_image`.
-* `change_streams_update_full_with_pre_image`.
+A JSON string that represents the document before the change.
+To request pre-images, set `capture.mode.pre.image` to `when_available` or `required`.
+Pre-images require MongoDB 6.0 or later and must be enabled separately for the captured collections before the changes occur.
+With `when_available`, the `before` value is null if the image is unavailable.
+With `required`, a missing pre-image for an update, replacement, or delete causes the connector to fail.
 +
-For more information, see {link-prefix}:{link-mongodb-connector}#mongodb-pre-image-support[MongoDB pre-image support]
+For more information, see {link-prefix}:{link-mongodb-connector}#mongodb-property-capture-mode-pre-image[`capture.mode.pre.image`].
 
 `after` data:::
-JSON strings that represent the values that are present in a document after the current operation.
-The presence of an `after` field in an event message depends on the type of event and the connector configuration.
-A `create` event for a MongoDB `insert` operation always contain an `after` field, regardless of the `capture.mode` setting.
-For `update` events, the `after` field is present only when `capture.mode` is set to one of the following values:
-* `change_streams_update_full`
-* `change_streams_update_full_with_pre_image`.
+A JSON string that represents the full document retrieved for the event.
+Insert and replacement operations include the full document regardless of the image settings.
+For MongoDB update operations, `capture.mode.post.image` controls how the connector requests the full document:
 +
+--
+* `off`: Does not request the full document.
+* `lookup` (default): Requests the current full document by using a lookup.
+* `post_image`: Requests the document as it appeared immediately after the update, when available.
+* `post_image_required`: Requires the document as it appeared immediately after the update and causes the connector to fail if it is unavailable.
+
+With `lookup` or `post_image`, the `after` value can be null if the document is unavailable.
+
 [NOTE]
 ====
-The `after` value in a change event message does not necessarily represent the state of a document immediately following the event.
-The value is not calculated dynamically; instead, after the connector captures a change event, it  queries the collection to retrieve the current value of the document.
+With `capture.mode.post.image=lookup`, concurrent updates can cause the lookup to return a newer document state than the operation represented by the event.
+For example, the document retrieved for change `a` might already include subsequent changes `b` or `c`.
 
-For example, imagine a situation in which multiple operations, `a`, `b`, and `c` modify a document in quick succession.
-When the connector processes, change `a`, it queries the collection for the full document.
-In the meantime, changes `b` and `c` occur.
-When the connector receives a response to its query for the full document for change `a`, it might receive a version of the document that is based on the subsequent changes for `b` or `c`.
-For more information, see the documentation for the {link-prefix}:{link-mongodb-connector}#mongodb-property-capture-mode[`capture.mode`] property.
+For more information, see {link-prefix}:{link-mongodb-connector}#mongodb-property-capture-mode-post-image[`capture.mode.post.image`].
+====
+--
+
+[NOTE]
+====
+With either required-image policy, `deployment` or `database` capture scope and regex filtering can cause missing-image errors for events from excluded collections.
+See {link-prefix}:{link-mongodb-connector}#mongodb-property-capture-mode-pre-image[`capture.mode.pre.image`] for scope, filtering, retention, and restart considerations.
 ====
 
 The following fragment shows the basic structure of a `create` change event that the connector emits after a MongoDB `insert` operation:
@@ -349,18 +361,16 @@ The following example shows part of an update message for an operation that resu
 }
 ----
 
-In the preceding example, the `before` and `after` represent the state of the source document before and after the document was updated.
-These fields are present in the event message that a connector emits only if the `capture.mode` for the connector is set as described in the following list:
+In the preceding update event, the availability of the `before` and `after` values depends on the connector's image settings and whether MongoDB can provide the requested images.
 
-`before` field:: Provides the state of the document before the change.
-This field is present only when `capture.mode` is set to one of the following values:
-** `change_streams_with_pre_image`
-** `change_streams_update_full_with_pre_image`.
+`before` field::
+Requested when `capture.mode.pre.image` is `when_available` or `required`.
 
-`after` field:: Provides the full state of the document after a change.
-This field is present only when `capture.mode` is set to one of the following values:
-** `change_streams_update_full`
-** `change_streams_update_full_with_pre_image`.
+`after` field::
+Requested when `capture.mode.post.image` is `lookup`, `post_image`, or `post_image_required`.
+
+The optional image policies can produce null values when images are unavailable.
+The required image policies cause the connector to fail instead.
 
 Assuming a connector that is configured to capture full documents, when the `ExtractNewDocumentState` SMT receives an `update` message for an `$unset` event, the SMT re-encodes the message by representing the removed field has a `null` value, as shown in the following example:
 
@@ -413,7 +423,7 @@ The assigned string value is based on the `op` field value in the original {link
 == Adding metadata fields
 
 The event flattening SMT for MongoDB can add metadata fields from the original change event message to the simplified message.
-The added metadata fields are prefixed with a double underscore (`"__"`).
+The added metadata fields are prefixed with a double underscore (`+"__"+`).
 Adding metadata to the event record makes it possible to include content such as the name of the collection in which a change event occurred, or to include connector-specific fields, such as a replica set name.
 Currently, the SMT can add fields from the following change event sub-structures only: `source`, `transaction` and `updateDescription`.
 
@@ -434,6 +444,18 @@ The preceding configuration results in the following content being added to the 
 ----
 
 If you want the SMT to add metadata fields to `delete` events, set the value of the xref:mongodb-extract-new-record-state-delete-tombstone-handling-mode[`delete.tombstone.handling.mode`] option to `rewrite`.
+
+To retain the change stream resume token, add the following property:
+
+[source,properties]
+----
+transforms.unwrap.add.fields=source.resume_token
+----
+
+The resulting `__source_resume_token` field contains the token as an Extended JSON string.
+Alternatively, use `transforms.unwrap.add.headers=source.resume_token` to retain it in a record header.
+Snapshot records have a null token, and tombstone records have no value from which to extract metadata.
+When replaying older records whose source schema does not include `resume_token`, the SMT omits the additional field or header.
 
 // Type: concept
 // Title: Options for applying the MongoDB extract new document state transformation selectively
@@ -477,6 +499,22 @@ The SMT populates each of these index fields with the value that it retrieves fr
 
 For more information about the `array.coding` option, see the xref:mongodb-event-flattening-array-encoding[options for encoding arrays in MongoDB event messages].
 
+|[[mongodb-extract-new-record-state-bson-timestamp-handling-mode]]<<mongodb-extract-new-record-state-bson-timestamp-handling-mode, `bson.timestamp.handling.mode`>>
+|`connect`
+|Specifies how the SMT represents BSON Timestamp values.
+Set one of the following options:
+
+`connect`::
+The SMT converts the value into a Kafka Connect Timestamp that is based on the time component of the BSON value.
+Because the connector discards the increment component that MongoDB uses to order operations that occur during the same second, distinct BSON values might result in the same output value.
+
+`struct`::
+The SMT emits a structure with the fields `time` and `increment`, preserving both components of the BSON value.
++
+When `bson.timestamp.handling.mode=struct` and `array.encoding=array`, the SMT cannot process arrays that contain both BSON Timestamp values and BSON Date values because it represents the two value types with different schemas.
++
+To capture arrays that contain these mixed value types, set `array.encoding=document`.
+
 |[[mongodb-extract-new-record-state-flatten-struct]]<<mongodb-extract-new-record-state-flatten-struct, `flatten.struct`>>
 |`false`
 |The SMT flattens structures (structs) in the original event message by concatenating the names of nested properties in the message, separated by a configurable delimiter, to form a simple field name.
@@ -510,16 +548,16 @@ This setting provides another way to indicate that the record has been deleted.
 
 |[[mongodb-extract-new-record-state-add-headers-prefix]]<<mongodb-extract-new-record-state-add-headers-prefix, `add.headers.prefix`>>
 |__ (double-underscore)
-|Set this optional string to prefix a header.
+|Specifies an optional string to prefix a header.
 
 |[[mongodb-extract-new-record-state-add-headers]]<<mongodb-extract-new-record-state-add-headers, `add.headers`>>
 |No default
-|Specifies a comma-separated list, with no spaces, of metadata fields that you want the SMT to add to the header of simplified messages.
-When the original message contains duplicate field names, you can identify the specific field to modify by providing the name of the struct together with the name of the field, for example, `source.ts_ms`.
+|Specifies a comma-separated list, with no spaces, of metadata fields that you want the SMT to add to the header of the simplified Kafka message.
+If the original message contains duplicate field names, you can specify the field to modify by providing the name of the struct together with the name of the field, for example, `source.ts_ms`.
 
-Optionally, you can override the original name of a field and assign it a new name by adding an entry in the following format to the list: +
+Optionally, you can override the original name of a field and assign it a case-sensitive new name by adding an entry in the following format to the list:
 
-`__<field_name>__:__<new_field_name>__`. +
+`__<field_name>__:__<new_field_name>__`.
 
 For example:
 
@@ -528,12 +566,10 @@ For example:
 version:VERSION, connector:CONNECTOR, source.ts_ms:EVENT_TIMESTAMP
 ----
 
-The new name values that you specify are case-sensitive. +
- +
 When the SMT adds metadata fields to the header of the simplified message, it prefixes each metadata field name with a double underscore.
-For a struct specification, the SMT also inserts an underscore between the struct name and the field name. +
- +
-If you specify a field that is not in the change event original message, the SMT does not add the field to the header.
+For a struct specification, the SMT also inserts an underscore between the struct name and the field name.
+
+If you specify a field that is not present in the header of the original change event message, the SMT does not add the field to the header.
 
 |[[mongodb-extract-new-record-state-add-fields-prefix]]<<mongodb-extract-new-record-state-add-fields-prefix, `add.fields.prefix`>>
 |__ (double-underscore)
@@ -541,12 +577,12 @@ If you specify a field that is not in the change event original message, the SMT
 
 |[[mongodb-extract-new-record-state-add-fields]]<<mongodb-extract-new-record-state-add-fields, `add.fields`>>
 |No default
-|Set this option to a comma-separated list, with no spaces, of metadata fields to add to the `value` element of the simplified Kafka message.
-When the original message contains duplicate field names, you can identify the specific field to modify by providing the name of the struct together with the name of the field, for example, `source.ts_ms`.
- +
-Optionally, you can override the original name of a field and assign it a new name by adding an entry in the following format to the list: +
+|Specifies a comma-separated list, with no spaces, of metadata fields that you want the SMT to add to the `value` element of the simplified Kafka message.
+If the original message contains duplicate field names, you can specify the field to modify by providing the name of the struct together with the name of the field, for example, `source.ts_ms`.
 
-`__<field_name>__:__<new_field_name>__`. +
+Optionally, you can override the original name of a field and assign it a case-sensitive new name by adding an entry in the following format to the list:
+
+`__<field_name>__:__<new_field_name>__`.
 
 For example:
 
@@ -555,17 +591,32 @@ For example:
 version:VERSION, connector:CONNECTOR, source.ts_ms:EVENT_TIMESTAMP
 ----
 
-The new name values that you specify are case-sensitive. +
-
 When the SMT adds metadata fields to the `value` element of the simplified message, it prefixes each metadata field name with a double underscore.
-For a struct specification, the SMT also inserts an underscore between the struct name and the field name. +
- +
-If you specify a field that is not present in the original change event message, the SMT still adds the specified field to the `value` element of the modified message.
+For a struct specification, the SMT also inserts an underscore between the struct name and the field name.
 
+If you specify a field that is not present in the original change event schema, the SMT omits the field from the modified message.
+For example, a misspelled `source.resume_tokne` entry is omitted when the requested field does not exist in the change event schema.
+If an optional field is present in the schema but its value is null, the SMT adds the field with a null value.
+
+|[[mongodb-extract-new-record-state-field-name-adjustment-mode]]xref:mongodb-extract-new-record-state-field-name-adjustment-mode[`field.name.adjustment.mode`]
+|`none`
+|Specifies how the SMT adjusts field and schema names for compatibility with different message converters.
+Set one of the following options:
+
+`none` (default):: No adjustment is performed.
+
+`avro`:: The SMT replaces any character that is invalid for Avro field names with an underscore character (`_`). It also adjusts the dot-separated segments of the output schema name individually, replacing invalid initial characters with an underscore to prevent Avro `SchemaParseException` errors when collection names begin with a digit.
+
+`avro_unicode`:: Similar to `avro`, but replaces invalid characters with their Unicode equivalent (e.g., `_u0031` for a leading `1`).
 |===
 
+// Type: reference
+// Title: Known limitations of the MongoDB event flattening SMT
+// ModuleID: mongodb-event-flattening-smt-known-limitations
 [id="debezium-event-flattening-smt-for-mongodb-known-limitations"]
 == Known limitations
+
+Because MongoDB is schemaless and sink connectors require specific message formats, the following constraints apply when you configure the MongoDB event flattening transformation.
 
 * Because MongoDB is a schemaless database, to ensure consistent column definitions when you use {prodname} to stream changes to a schema-based data relational database, fields within a collection that have the same name must store the same type of data.
 

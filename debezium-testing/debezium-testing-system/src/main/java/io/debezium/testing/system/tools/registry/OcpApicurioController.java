@@ -16,8 +16,8 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.apicurio.registry.operator.api.v1.model.ApicurioRegistry;
-import io.apicurio.registry.operator.api.v1.model.ApicurioRegistryList;
+import io.apicurio.registry.operator.api.v1.ApicurioRegistry3;
+import io.apicurio.registry.operator.api.v1.ApicurioRegistry3List;
 import io.debezium.testing.system.tools.OpenShiftUtils;
 import io.debezium.testing.system.tools.WaitConditions;
 import io.fabric8.kubernetes.api.model.Service;
@@ -37,16 +37,18 @@ import okhttp3.OkHttpClient;
 public class OcpApicurioController implements RegistryController {
     private static final Logger LOGGER = LoggerFactory.getLogger(OcpApicurioController.class);
 
-    public static final String APICURIO_NAME_LBL = "apicur.io/name";
+    public static final String APICURIO_INSTANCE_LBL = "app.kubernetes.io/instance";
+    public static final String APICURIO_COMPONENT_LBL = "app.kubernetes.io/component";
+    public static final String APICURIO_COMPONENT_APP = "app";
 
     protected final OpenShiftClient ocp;
     protected final OkHttpClient http;
     protected final String project;
     protected final String name;
     protected final OpenShiftUtils ocpUtils;
-    protected ApicurioRegistry registry;
+    protected ApicurioRegistry3 registry;
 
-    public OcpApicurioController(ApicurioRegistry registry, OpenShiftClient ocp, OkHttpClient http) {
+    public OcpApicurioController(ApicurioRegistry3 registry, OpenShiftClient ocp, OkHttpClient http) {
         this.registry = registry;
         this.ocp = ocp;
         this.http = http;
@@ -55,8 +57,8 @@ public class OcpApicurioController implements RegistryController {
         this.ocpUtils = new OpenShiftUtils(ocp);
     }
 
-    protected NonNamespaceOperation<ApicurioRegistry, ApicurioRegistryList, Resource<ApicurioRegistry>> registryOperation() {
-        return ocp.resources(ApicurioRegistry.class, ApicurioRegistryList.class).inNamespace(project);
+    protected NonNamespaceOperation<ApicurioRegistry3, ApicurioRegistry3List, Resource<ApicurioRegistry3>> registryOperation() {
+        return ocp.resources(ApicurioRegistry3.class, ApicurioRegistry3List.class).inNamespace(project);
     }
 
     protected String getPublicRegistryAddress() {
@@ -69,11 +71,17 @@ public class OcpApicurioController implements RegistryController {
     }
 
     private List<Route> getRoutes() {
-        return ocp.routes().inNamespace(project).withLabel(APICURIO_NAME_LBL, name).list().getItems();
+        return ocp.routes().inNamespace(project)
+                .withLabel(APICURIO_INSTANCE_LBL, name)
+                .withLabel(APICURIO_COMPONENT_LBL, APICURIO_COMPONENT_APP)
+                .list().getItems();
     }
 
     protected Service getRegistryService() {
-        List<Service> items = ocp.services().inNamespace(project).withLabel(APICURIO_NAME_LBL, name).list().getItems();
+        List<Service> items = ocp.services().inNamespace(project)
+                .withLabel(APICURIO_INSTANCE_LBL, name)
+                .withLabel(APICURIO_COMPONENT_LBL, APICURIO_COMPONENT_APP)
+                .list().getItems();
         if (items.isEmpty()) {
             throw new IllegalStateException("No service for registry '" + registry.getMetadata().getName() + "'");
         }
@@ -88,12 +96,12 @@ public class OcpApicurioController implements RegistryController {
 
     @Override
     public String getRegistryApiAddress() {
-        return getRegistryAddress() + "/apis/registry/v2";
+        return getRegistryAddress();
     }
 
     @Override
     public String getPublicRegistryApiAddress() {
-        return "http://" + getPublicRegistryAddress() + "/apis/registry/v2";
+        return "http://" + getPublicRegistryAddress();
     }
 
     @Override
@@ -104,6 +112,8 @@ public class OcpApicurioController implements RegistryController {
                 .until(() -> !getRegistryDeployments(name).isEmpty());
 
         Deployment deployment = getRegistryDeployments(name).get(0);
+        patchProbeDelay(deployment, 60);
+
         ocp.apps()
                 .deployments()
                 .inNamespace(project)
@@ -113,8 +123,27 @@ public class OcpApicurioController implements RegistryController {
         registry = registryOperation().withName(name).get();
     }
 
+    private void patchProbeDelay(Deployment deployment, int delaySeconds) {
+        final var deploymentName = deployment.getMetadata().getName();
+        LOGGER.info("Patching liveness and readiness probes initialDelaySeconds to {} for deployment '{}'", delaySeconds, deploymentName);
+        ocp.apps().deployments().inNamespace(project).withName(deploymentName).edit(d -> {
+            d.getSpec().getTemplate().getSpec().getContainers().forEach(container -> {
+                if (container.getLivenessProbe() != null) {
+                    container.getLivenessProbe().setInitialDelaySeconds(delaySeconds);
+                }
+                if (container.getReadinessProbe() != null) {
+                    container.getReadinessProbe().setInitialDelaySeconds(delaySeconds);
+                }
+            });
+            return d;
+        });
+    }
+
     private List<Deployment> getRegistryDeployments(String name) {
-        return ocp.apps().deployments().inNamespace(project).withLabel("app", name).list().getItems();
+        return ocp.apps().deployments().inNamespace(project)
+                .withLabel(APICURIO_INSTANCE_LBL, name)
+                .withLabel(APICURIO_COMPONENT_LBL, APICURIO_COMPONENT_APP)
+                .list().getItems();
     }
 
     @Override

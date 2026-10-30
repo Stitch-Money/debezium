@@ -1,0 +1,25 @@
+[source,yaml,subs="+attributes"]
+----
+apiVersion: {KafkaConnectApiVersion}
+kind: KafkaConnector
+metadata:
+  labels:
+    strimzi.io/cluster: debezium-kafka-connect-cluster
+  name: inventory-connector-{context}
+spec:
+  class: io.debezium.connector.{context}.{connector-class}Connector
+  tasksMax: 1
+  config:
+    schema.history.internal.kafka.bootstrap.servers: debezium-kafka-cluster-kafka-bootstrap.debezium.svc.cluster.local:9092
+    schema.history.internal.kafka.topic: schema-changes.inventory
+    database.hostname: {context}.debezium-{context}.svc.cluster.local
+    database.port: {database-port}
+    database.user: debezium
+    database.password: dbz
+    database.dbname: mydatabase
+    topic.prefix: inventory-connector-{context}
+    table.include.list: {include-list-example}
+
+    ...
+----
+=====================================================================

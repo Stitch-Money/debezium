@@ -43,12 +43,10 @@ public class ExtendedStringParser extends AbstractSingleColumnSqlRedoPreamblePar
         }
 
         // Parse schema and table
-        startIndex = parseQuotedValue(update, startIndex, value -> this.tableName = value);
         startIndex = parseQuotedValue(update, startIndex, value -> this.schemaName = value);
+        startIndex = parseQuotedValue(update, startIndex, value -> this.tableName = value);
 
-        if (startsWithAtIndexThrow(SET, startIndex, update)) {
-            startIndex += SET.length();
-        }
+        startIndex = indexOfThrow(SET, update, startIndex) + SET.length();
 
         startIndex = parseQuotedValue(update, startIndex, value -> this.columnName = value);
 

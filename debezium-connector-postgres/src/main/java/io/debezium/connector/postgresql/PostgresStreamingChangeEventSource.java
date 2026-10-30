@@ -10,6 +10,7 @@ import static io.debezium.connector.postgresql.PostgresConnectorConfig.LsnFlushT
 import java.sql.SQLException;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -27,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.DebeziumException;
 import io.debezium.connector.postgresql.connection.LogicalDecodingMessage;
 import io.debezium.connector.postgresql.connection.Lsn;
+import io.debezium.connector.postgresql.connection.OriginMessage;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.connector.postgresql.connection.ReplicationMessage;
@@ -35,6 +37,8 @@ import io.debezium.connector.postgresql.connection.ReplicationStream;
 import io.debezium.connector.postgresql.connection.WalPositionLocator;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.pipeline.ErrorHandler;
+import io.debezium.pipeline.monitor.OffsetActivityMonitor;
+import io.debezium.pipeline.monitor.OffsetActivityMonitorService;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
 import io.debezium.snapshot.SnapshotterService;
@@ -97,6 +101,8 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     private long numberOfEventsSinceLastEventSentOrWalGrowingWarning = 0;
     private Lsn lastCompletelyProcessedLsn;
     private PostgresOffsetContext effectiveOffset;
+    private final OffsetActivityMonitorService offsetActivityMonitorService;
+    private OffsetActivityMonitor<PostgresPartition, PostgresOffsetContext> offsetActivityMonitor;
 
     private ElapsedTimeStrategy refreshXmin;
     private Long lastXmin;
@@ -119,6 +125,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         if (connectorConfig.xminFetchInterval().toMillis() > 0) {
             this.refreshXmin = ElapsedTimeStrategy.constant(Clock.SYSTEM, connectorConfig.xminFetchInterval().toMillis());
         }
+        this.offsetActivityMonitorService = OffsetActivityMonitorService.lookup(connectorConfig.getServiceRegistry());
     }
 
     @Override
@@ -170,7 +177,8 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                         : this.effectiveOffset.lsn();
                 final Operation lastProcessedMessageType = this.effectiveOffset.lastProcessedMessageType();
                 LOGGER.info("Retrieved latest position from stored offset '{}'", lsn);
-                walPosition = new WalPositionLocator(this.effectiveOffset.lastCommitLsn(), lsn, lastProcessedMessageType);
+                walPosition = new WalPositionLocator(this.effectiveOffset.lastCommitLsn(), lsn, lastProcessedMessageType,
+                        this.effectiveOffset.lsnEventsProcessed());
                 replicationStream.compareAndSet(null, replicationConnection.startStreaming(lsn, walPosition));
             }
             else {
@@ -273,6 +281,9 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                     pauseNoMessage.sleepWhen(true);
                 }
             }
+
+            offsetActivityMonitorService.pulse(partition, offsetContext);
+
             if (!isInPreSnapshotCatchUpStreaming(offsetContext)) {
                 // During catch up streaming, the streaming phase needs to hold a transaction open so that
                 // the phase can stream event up to a specific lsn and the snapshot that occurs after the catch up
@@ -324,6 +335,9 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
 
         // Tx BEGIN/END event
         if (message.isTransactionalMessage()) {
+            if (message.getOperation() == Operation.BEGIN) {
+                offsetContext.clearOrigin();
+            }
 
             offsetContext.updateWalPosition(lsn, lastCompletelyProcessedLsn, message.getCommitTime(), toLong(message.getTransactionId()),
                     getSlotXmin(),
@@ -335,6 +349,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 // Don't skip on BEGIN message as it would flush LSN for the whole transaction
                 // too early
                 if (message.getOperation() == Operation.COMMIT) {
+                    offsetContext.resetLsnEventsProcessed();
                     commitMessage(partition, offsetContext, lsn);
                     dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, message.getCommitTime());
                 }
@@ -345,18 +360,21 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 dispatcher.dispatchTransactionStartedEvent(partition, toString(message.getTransactionId()), offsetContext, message.getCommitTime());
             }
             else if (message.getOperation() == Operation.COMMIT) {
+                offsetContext.resetLsnEventsProcessed();
                 commitMessage(partition, offsetContext, lsn);
                 dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, message.getCommitTime());
             }
             maybeWarnAboutGrowingWalBacklog(true);
         }
         else if (message.getOperation() == Operation.MESSAGE) {
-            offsetContext.updateWalPosition(lsn, lastCompletelyProcessedLsn, message.getCommitTime(), toLong(message.getTransactionId()),
+            final LogicalDecodingMessage logicalMessage = (LogicalDecodingMessage) message;
+            offsetContext.updateWalPosition(lsn, lastCompletelyProcessedLsn, logicalMessage.getCommitTime(), toLong(logicalMessage.getTransactionId()),
                     getSlotXmin(),
-                    message.getOperation());
+                    logicalMessage.getOperation());
 
             // non-transactional message that will not be followed by a COMMIT message
-            if (message.isLastEventForLsn()) {
+            if (!logicalMessage.isTransactional()) {
+                offsetContext.resetLsnEventsProcessed();
                 commitMessage(partition, offsetContext, lsn);
             }
 
@@ -364,18 +382,31 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                     partition,
                     offsetContext,
                     clock.currentTimeAsInstant().toEpochMilli(),
-                    (LogicalDecodingMessage) message);
+                    logicalMessage);
 
             maybeWarnAboutGrowingWalBacklog(true);
         }
+        // ORIGIN message - update origin state in offset context
+        else if (message.getOperation() == Operation.ORIGIN) {
+            OriginMessage originMessage = (OriginMessage) message;
+            offsetContext.updateOrigin(originMessage.getOriginName(), originMessage.getOriginLsn());
+            LOGGER.trace("Updated origin information: name={}, lsn={}", originMessage.getOriginName(), originMessage.getOriginLsn());
+        }
         // DML event
         else {
+
+            if (message.getOperation() == Operation.NOOP) {
+                LOGGER.info("Received a NOOP event. This event is no longer processed, and ignored.");
+                return;
+            }
+
             TableId tableId = null;
             if (!message.isSkippedMessage()) {
                 tableId = PostgresSchema.parse(message.getTable());
                 Objects.requireNonNull(tableId);
             }
 
+            offsetContext.incrementLsnEventsProcessed(lsn);
             offsetContext.updateWalPosition(lsn, lastCompletelyProcessedLsn, message.getCommitTime(), toLong(message.getTransactionId()),
                     getSlotXmin(),
                     tableId,
@@ -596,6 +627,14 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     @Override
     public PostgresOffsetContext getOffsetContext() {
         return effectiveOffset;
+    }
+
+    @Override
+    public Optional<OffsetActivityMonitor<PostgresPartition, PostgresOffsetContext>> getOffsetActivityMonitor() {
+        if (offsetActivityMonitor == null) {
+            offsetActivityMonitor = new PostgresOffsetActivityMonitor(connectorConfig.getOffsetActivityMonitorInterval());
+        }
+        return Optional.of(offsetActivityMonitor);
     }
 
     /**

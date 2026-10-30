@@ -50,8 +50,8 @@ can be generated with the `Release Notes` tool in JIRA on the version's detail p
 * https://github.com/debezium/debezium.github.io/blob/develop/releases/1.7/release-notes.asciidoc
 * https://github.com/debezium/debezium.github.io/blob/develop/_data/releases/1.7/series.yml
 
-JIRA issues that break backwards compatability for existing consumers, should be marked with the "add-to-upgrade-guide" label.
-Search for them using [this query](https://issues.redhat.com/issues/?jql=labels%20%3D%20add-to-upgrade-guide) and describe the
+GitHub issues that break backward compatibility for existing consumers should be marked with the "backward-incompatible" label.
+Search for them using [this query](https://github.com/debezium/dbz/issues?q=is%3Aissue%20state%3Aopen%20label%3Abackward-incompatible) and describe the
 implications and required steps for upgrading in the changelog on the website.
 
 ### Update antora.yml and series.yml
@@ -128,7 +128,7 @@ Only if this is the case can you proceed with the release.
 
 Once the codebase is in a state that is ready to be released, use the following command to automatically update the POM to use the release number, commit the changes to your local Git repository, tag that commit, and then update the POM to use snapshot versions and commit to your local Git repository:
 
-    $ mvn release:clean release:prepare
+    $ ./mvnw release:clean release:prepare
 
 This will prompt for several inputs:
 
@@ -178,7 +178,7 @@ At this point, the code on the branch in the [official Debezium repository](http
 
 Now that the [official Debezium repository](https://github.com/debezium/debezium) has a tag with the code that we want to release, the next step is to actually build and release what we tagged:
 
-    $ mvn release:perform
+    $ ./mvnw release:perform
 
 This performs the following steps:
 
@@ -258,7 +258,7 @@ Go back to Sonatype's Nexus Repository Manager at https://s01.oss.sonatype.org/ 
 
 Select the staging repository (by checking the box) and press the "Release" button. Enter a description in the dialog box, and press "OK" to release the artifacts to Maven Central. You may need to press the "Refresh" button a few times until the staging repository disappears.
 
-It may take some time for the artifacts to actually be [visible in Maven Central search](http://search.maven.org/#search%7Cga%7C1%7Cg%3A%22io.debezium%22) or [directly in Maven Central](https://repo1.maven.org/maven2/io/debezium/debezium-core/).
+It may take some time for the artifacts to actually be [visible in Maven Central search](http://search.maven.org/#search%7Cga%7C1%7Cg%3A%22io.debezium%22) or [directly in Maven Central](https://repo1.maven.org/maven2/io/debezium/debezium-connector-common/).
 
 ### Merge your pull request to update the container images
 

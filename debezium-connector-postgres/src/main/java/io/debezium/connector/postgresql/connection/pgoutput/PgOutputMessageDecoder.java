@@ -7,8 +7,9 @@ package io.debezium.connector.postgresql.connection.pgoutput;
 
 import static java.util.stream.Collectors.toMap;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
 import java.time.Instant;
@@ -39,6 +40,7 @@ import io.debezium.connector.postgresql.connection.AbstractReplicationMessageCol
 import io.debezium.connector.postgresql.connection.LogicalDecodingMessage;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.MessageDecoderContext;
+import io.debezium.connector.postgresql.connection.OriginMessage;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationMessage.Column;
 import io.debezium.connector.postgresql.connection.ReplicationMessage.NoopMessage;
@@ -51,7 +53,6 @@ import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.util.HexConverter;
-import io.debezium.util.Strings;
 
 /**
  * Decodes messages from the PG logical replication plug-in ("pgoutput").
@@ -132,9 +133,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             LOGGER.trace("Message Type: {}", type);
             switch (type) {
                 case TYPE:
-                case ORIGIN:
-                    // TYPE/ORIGIN
-                    // These should be skipped without calling shouldMessageBeSkipped. DBZ-5792
+                    // TYPE messages should be skipped without calling shouldMessageBeSkipped. DBZ-5792
                     LOGGER.trace("{} messages are always skipped without calling shouldMessageBeSkipped", type);
                     return true;
                 case TRUNCATE:
@@ -147,11 +146,21 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                 default:
                     // call super.shouldMessageBeSkipped for rest of the types
             }
-            final boolean candidateForSkipping = super.shouldMessageBeSkipped(buffer, lastReceivedLsn, startLsn, walPosition);
+            if (type == MessageType.LOGICAL_DECODING_MESSAGE && walPosition.skipProcessedLogicalMessage(lastReceivedLsn)) {
+                return true;
+            }
+            // BEGIN, COMMIT, RELATION, ORIGIN and logical decoding messages are not events
+            // lsn_events_processed counts, so they must not use up a skip meant for the
+            // already-processed rows at the stored LSN.
+            final boolean candidateForSkipping = switch (type) {
+                case BEGIN, COMMIT, RELATION, ORIGIN, LOGICAL_DECODING_MESSAGE -> walPosition.skipMessage(lastReceivedLsn, false);
+                default -> super.shouldMessageBeSkipped(buffer, lastReceivedLsn, startLsn, walPosition);
+            };
             switch (type) {
                 case COMMIT:
                 case BEGIN:
                 case RELATION:
+                case ORIGIN:
                     // BEGIN
                     // These types should always be processed due to the nature that they provide
                     // the stream with pertinent per-transaction boundary state we will need to
@@ -161,6 +170,12 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                     // RELATION
                     // These messages are always sent with a lastReceivedLSN=0; and we need to
                     // always accept these to keep per-stream table state cached properly.
+                    //
+                    // ORIGIN
+                    // These messages contain origin information that needs to be cached for
+                    // subsequent events. Even during restart recovery, we need to process
+                    // ORIGIN messages to have the correct origin info once we reach the
+                    // point where we start emitting events.
                     LOGGER.trace("{} messages are always reprocessed", type);
                     return false;
                 default:
@@ -200,6 +215,9 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                 break;
             case RELATION:
                 handleRelationMessage(buffer, typeRegistry);
+                break;
+            case ORIGIN:
+                handleOriginMessage(buffer, processor);
                 break;
             case LOGICAL_DECODING_MESSAGE:
                 handleLogicalDecodingMessage(buffer, processor);
@@ -254,6 +272,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         final Lsn lsn = Lsn.valueOf(buffer.getLong()); // LSN
         this.commitTimestamp = PG_EPOCH.plus(buffer.getLong(), ChronoUnit.MICROS);
         this.transactionId = Integer.toUnsignedLong(buffer.getInt());
+
         LOGGER.trace("Event: {}", MessageType.BEGIN);
         LOGGER.trace("Final LSN of transaction: {}", lsn);
         LOGGER.trace("Commit timestamp of transaction: {}", commitTimestamp);
@@ -272,12 +291,36 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         final Lsn lsn = Lsn.valueOf(buffer.getLong()); // LSN of the commit
         final Lsn endLsn = Lsn.valueOf(buffer.getLong()); // End LSN of the transaction
         Instant commitTimestamp = PG_EPOCH.plus(buffer.getLong(), ChronoUnit.MICROS);
+
         LOGGER.trace("Event: {}", MessageType.COMMIT);
         LOGGER.trace("Flags: {} (currently unused and most likely 0)", flags);
         LOGGER.trace("Commit LSN: {}", lsn);
         LOGGER.trace("End LSN of transaction: {}", endLsn);
         LOGGER.trace("Commit timestamp of transaction: {}", commitTimestamp);
         processor.process(new TransactionMessage(Operation.COMMIT, transactionId, commitTimestamp));
+    }
+
+    /**
+     * Callback handler for the 'O' origin replication message.
+     * The origin message indicates that the transaction originated from another server
+     * (e.g., in a logical replication setup).
+     *
+     * Message format according to PostgreSQL protocol:
+     * - Int64: The LSN of the commit on the origin server
+     * - String: Name of the origin
+     *
+     * @param buffer The replication stream buffer
+     * @param processor The replication message processor
+     */
+    private void handleOriginMessage(ByteBuffer buffer, ReplicationMessageProcessor processor) throws SQLException, InterruptedException {
+        Lsn originLsn = Lsn.valueOf(buffer.getLong());
+        String originName = readString(buffer);
+
+        LOGGER.trace("Event: {}", MessageType.ORIGIN);
+        LOGGER.trace("Origin LSN: {}", originLsn);
+        LOGGER.trace("Origin name: {}", originName);
+
+        processor.process(new OriginMessage(originName, originLsn, transactionId, commitTimestamp));
     }
 
     /**
@@ -299,6 +342,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         // Perform several out-of-bands database metadata queries
         Map<String, Optional<String>> columnDefaults;
         Map<String, Boolean> columnOptionality;
+        Map<String, String> columnTypeNames;
         List<String> primaryKeyColumns;
 
         final DatabaseMetaData databaseMetadata = connection.connection().getMetaData();
@@ -311,6 +355,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                 .collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::defaultValueExpression));
 
         columnOptionality = readColumns.stream().collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::isOptional));
+        columnTypeNames = readColumns.stream().collect(toMap(io.debezium.relational.Column::name, io.debezium.relational.Column::typeName));
         primaryKeyColumns = connection.readPrimaryKeyNames(databaseMetadata, tableId);
         if (primaryKeyColumns == null || primaryKeyColumns.isEmpty()) {
             LOGGER.warn("Primary keys are not defined for table '{}', defaulting to unique indices", tableName);
@@ -322,7 +367,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         Set<String> seenLowercaseColumnNames = new HashSet<>();
         for (short i = 0; i < columnCount; ++i) {
             byte flags = buffer.get();
-            String columnName = Strings.unquoteIdentifierPart(readString(buffer));
+            // pgoutput sends column names unquoted
+            String columnName = readString(buffer);
             int columnType = buffer.getInt();
             int attypmod = buffer.getInt();
 
@@ -350,7 +396,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             final boolean hasDefault = columnDefaults.containsKey(columnName);
             final String defaultValueExpression = columnDefaults.getOrDefault(columnName, Optional.empty()).orElse(null);
 
-            columns.add(new ColumnMetaData(columnName, postgresType, key, optional, hasDefault, defaultValueExpression, attypmod));
+            columns.add(new ColumnMetaData(columnName, postgresType, key, optional, hasDefault, defaultValueExpression, attypmod,
+                    columnTypeNames.get(columnName)));
             columnNames.add(columnName);
         }
 
@@ -654,7 +701,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                     .jdbcType(columnMetadata.getPostgresType().getRootType().getJdbcId())
                     .nativeType(columnMetadata.getPostgresType().getRootType().getOid())
                     .optional(columnMetadata.isOptional())
-                    .type(columnMetadata.getPostgresType().getName(), columnMetadata.getTypeName())
+                    .type(columnMetadata.getDriverTypeName(), columnMetadata.getTypeName())
                     .length(columnMetadata.getLength())
                     .scale(columnMetadata.getScale());
 
@@ -679,16 +726,28 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     /**
      * Reads the replication stream up to the next null-terminator byte and returns the contents as a string.
      *
+     * <p>This method capture current buffer position, then it scans the buffer for a byte of value 0. It creates a string directy from
+     * the buffer underlying array using offset = arrayOffset + captured positon and a length
+     * of NULL byte position - original position - 1 (for the null byte).
+     *
+     * <p>The method doesn't copy the data into any intermediate buffers, the only data copying will happen inside {@code new String()}.
+     *
      * @param buffer The replication stream buffer
      * @return string read from the replication stream
      */
     private static String readString(ByteBuffer buffer) {
-        StringBuilder sb = new StringBuilder();
-        byte b = 0;
-        while ((b = buffer.get()) != 0) {
-            sb.append((char) b);
+        requireHeapBuffer(buffer);
+
+        final var position = buffer.position();
+
+        while (buffer.get() != 0) {
+            // Scan to a null terminator; get() throws BufferedUnderflowException if we reach the end of the buffer and null was not found
         }
-        return sb.toString();
+
+        return new String(buffer.array(),
+                buffer.arrayOffset() + position,
+                buffer.position() - position - 1,
+                StandardCharsets.UTF_8);
     }
 
     /**
@@ -698,10 +757,28 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
      * @return the column value as a string read from the replication stream
      */
     private static String readColumnValueAsString(ByteBuffer buffer) {
-        int length = buffer.getInt();
-        byte[] value = new byte[length];
-        buffer.get(value, 0, length);
-        return new String(value, Charset.forName("UTF-8"));
+        requireHeapBuffer(buffer);
+
+        final var length = buffer.getInt();
+        if (length < 0 || length > buffer.remaining()) {
+            throw new BufferUnderflowException();
+        }
+
+        final var value = new String(buffer.array(),
+                buffer.arrayOffset() + buffer.position(),
+                length,
+                StandardCharsets.UTF_8);
+        buffer.position(buffer.position() + length);
+        return value;
+    }
+
+    private static void requireHeapBuffer(ByteBuffer buffer) {
+        // Postgres JDBC driver generally returns heap byte buffers.
+        // This check is here to assert in case a driver ever changes behavior.
+        if (!buffer.hasArray()) {
+            throw new DebeziumException("pgoutput decoding requires a heap ByteBuffer, but the driver returned "
+                    + buffer.getClass().getName());
+        }
     }
 
     /**
@@ -721,8 +798,11 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
 
             final io.debezium.relational.Column column = table.columns().get(i);
             final String columnName = column.name();
-            final String typeName = column.typeName();
-            final PostgresType columnType = typeRegistry.get(typeName);
+            // Resolve the column's type by its OID, which the relation message established as the
+            // authoritative identity, rather than by (table schema + unqualified type name). A name-based
+            // lookup confuses types that share an unqualified name across schemas: a cross-schema domain
+            // such as oracle.date would fall back to pg_catalog.date and parse its value as the wrong type.
+            final PostgresType columnType = typeRegistry.get(column.nativeType());
             final String typeExpression = column.typeExpression();
             final boolean optional = column.isOptional();
 

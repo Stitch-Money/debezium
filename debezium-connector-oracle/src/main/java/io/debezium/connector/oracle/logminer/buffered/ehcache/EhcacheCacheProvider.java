@@ -20,6 +20,7 @@ import java.util.stream.Collectors;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
 
 import org.ehcache.Cache;
 import org.ehcache.CacheManager;
@@ -50,6 +51,11 @@ import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 public class EhcacheCacheProvider extends AbstractCacheProvider<EhcacheTransaction> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EhcacheCacheProvider.class);
+
+    private static final String FEATURE_DISALLOW_DOCTYPE = "http://apache.org/xml/features/disallow-doctype-decl";
+    private static final String FEATURE_EXTERNAL_GENERAL_ENTITIES = "http://xml.org/sax/features/external-general-entities";
+    private static final String FEATURE_EXTERNAL_PARAMETER_ENTITIES = "http://xml.org/sax/features/external-parameter-entities";
+    private static final String JDK_DOCUMENT_BUILDER_FACTORY_IMPL = "com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl";
 
     private final boolean dropBufferOnStop;
     private final CacheManager cacheManager;
@@ -87,21 +93,29 @@ public class EhcacheCacheProvider extends AbstractCacheProvider<EhcacheTransacti
 
     @Override
     public void close() throws Exception {
-        if (cacheManager != null) {
-            if (dropBufferOnStop) {
-                LOGGER.info("Clearing Ehcache caches");
-                transactionCache.clear();
-                schemaChangesCache.clear();
-                processedTransactionsCache.clear();
+        final boolean wasInterrupted = Thread.interrupted();
+        try {
+            if (cacheManager != null) {
+                if (dropBufferOnStop) {
+                    LOGGER.info("Clearing Ehcache caches");
+                    transactionCache.clear();
+                    schemaChangesCache.clear();
+                    processedTransactionsCache.clear();
 
-                cacheManager.removeCache(TRANSACTIONS_CACHE_NAME);
-                cacheManager.removeCache(PROCESSED_TRANSACTIONS_CACHE_NAME);
-                cacheManager.removeCache(SCHEMA_CHANGES_CACHE_NAME);
-                cacheManager.removeCache(EVENTS_CACHE_NAME);
+                    cacheManager.removeCache(TRANSACTIONS_CACHE_NAME);
+                    cacheManager.removeCache(PROCESSED_TRANSACTIONS_CACHE_NAME);
+                    cacheManager.removeCache(SCHEMA_CHANGES_CACHE_NAME);
+                    cacheManager.removeCache(EVENTS_CACHE_NAME);
+                }
+
+                LOGGER.info("Shutting down Ehcache embedded caches");
+                cacheManager.close();
             }
-
-            LOGGER.info("Shutting down Ehcache embedded caches");
-            cacheManager.close();
+        }
+        finally {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -110,10 +124,17 @@ public class EhcacheCacheProvider extends AbstractCacheProvider<EhcacheTransacti
             final Configuration ehcacheConfig = connectorConfig.getLogMiningEhcacheConfiguration();
 
             // Create the full XML configuration based on configuration template
-            final DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            // Explicitly use the JDK built-in parser to avoid Oracle's JXDocumentBuilderFactory
+            // being picked up via service-loader when Oracle XML JARs are on the classpath,
+            // as Oracle's parser does not support the Apache XXE security features below.
+            final DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance(
+                    JDK_DOCUMENT_BUILDER_FACTORY_IMPL,
+                    EhcacheCacheProvider.class.getClassLoader());
 
             // Required for propagating namespace info
             factory.setNamespaceAware(true);
+
+            enableSecurityFeatures(factory);
 
             final DocumentBuilder builder = factory.newDocumentBuilder();
 
@@ -130,6 +151,13 @@ public class EhcacheCacheProvider extends AbstractCacheProvider<EhcacheTransacti
         catch (Exception e) {
             throw new DebeziumException("Failed to create Ehcache cache manager", e);
         }
+    }
+
+    private void enableSecurityFeatures(DocumentBuilderFactory factory) throws ParserConfigurationException {
+        factory.setFeature(FEATURE_DISALLOW_DOCTYPE, true);
+        factory.setFeature(FEATURE_EXTERNAL_GENERAL_ENTITIES, false);
+        factory.setFeature(FEATURE_EXTERNAL_PARAMETER_ENTITIES, false);
+        factory.setExpandEntityReferences(false);
     }
 
     private String getConfigurationWithSubstitutions(Configuration configuration) {

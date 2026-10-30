@@ -59,6 +59,13 @@ public class OracleConnectorTest {
     protected static void assertConfigDefIsValid(Connector connector, io.debezium.config.Field.Set fields) {
         ConfigDef configDef = connector.config();
         assertThat(configDef).isNotNull();
+
+        // Collect all field names that are dependents of other fields (via value-based dependencies)
+        java.util.Set<String> dependentFieldNames = new java.util.HashSet<>();
+        fields.forEach(field -> {
+            field.valueDependants().values().forEach(dependentFieldNames::addAll);
+        });
+
         fields.forEach(expected -> {
             assertThat(configDef.names()).contains(expected.name());
             ConfigKey key = configDef.configKeys().get(expected.name());
@@ -68,15 +75,21 @@ public class OracleConnectorTest {
             assertThat(key.importance).isEqualTo(expected.importance());
             assertThat(key.documentation).isEqualTo(expected.description());
             assertThat(key.type).isEqualTo(expected.type());
-            if (expected.equals(OracleConnectorConfig.SCHEMA_HISTORY) || expected.equals(CommonConnectorConfig.TOPIC_NAMING_STRATEGY)) {
+            if (expected.equals(CommonConnectorConfig.TOPIC_NAMING_STRATEGY)) {
                 assertThat(((Class<?>) key.defaultValue).getName()).isEqualTo((String) expected.defaultValue());
+            }
+            else if (expected.equals(OracleConnectorConfig.SCHEMA_HISTORY)) {
+                assertThat(key.defaultValue).isEqualTo(expected.defaultValue());
             }
             assertThat(key.dependents).isEqualTo(expected.dependents());
             assertThat(key.width).isNotNull();
             assertThat(key.group).isNotNull();
             assertThat(key.orderInGroup).isGreaterThan(0);
             assertThat(key.validator).isNull();
-            assertThat(key.recommender).isNull();
+            // Recommenders are allowed for fields that are value-based dependents of other fields
+            if (!dependentFieldNames.contains(expected.name())) {
+                assertThat(key.recommender).isNull();
+            }
         });
     }
 }

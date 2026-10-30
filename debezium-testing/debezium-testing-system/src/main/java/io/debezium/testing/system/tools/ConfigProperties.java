@@ -36,8 +36,9 @@ public final class ConfigProperties {
     public static final String DOCKER_IMAGE_MONGO = System.getProperty("test.docker.image.mongo", "quay.io/debezium/example-mongodb:2.6");
     public static final String DOCKER_IMAGE_MONGO_SHARDED = System.getProperty("test.docker.image.mongo.sharded", "quay.io/debezium/example-mongodb:2.6");
     public static final String DOCKER_IMAGE_SQLSERVER = System.getProperty("test.docker.image.sqlserver", "mcr.microsoft.com/mssql/server:2019-latest");
-    public static final String DOCKER_IMAGE_DB2 = System.getProperty("test.docker.image.db2", "quay.io/debezium/db2-cdc:latest");
+    public static final String DOCKER_IMAGE_DB2 = System.getProperty("test.docker.image.db2", "quay.io/rh_integration/dbz-db2-cdc:latest");
     public static final String DOCKER_IMAGE_ORACLE = System.getProperty("test.docker.image.oracle", "quay.io/rh_integration/dbz-oracle:19.3.0");
+    public static final String DOCKER_IMAGE_INFORMIX = System.getProperty("test.docker.image.informix", "quay.io/rh_integration/dbz-informix:14");
 
     // OpenShift configuration
     public static final Optional<String> OCP_URL = stringOptionalProperty("test.ocp.url");
@@ -53,20 +54,24 @@ public final class ConfigProperties {
     public static final String OCP_PROJECT_MONGO = System.getProperty("test.ocp.project.mongo", OCP_PROJECT_DBZ + "-mongo");
     public static final String OCP_PROJECT_DB2 = System.getProperty("test.ocp.project.db2", OCP_PROJECT_DBZ + "-db2");
     public static final String OCP_PROJECT_ORACLE = System.getProperty("test.ocp.project.oracle", OCP_PROJECT_DBZ + "-oracle");
+    public static final String OCP_PROJECT_INFORMIX = System.getProperty("test.ocp.project.informix", OCP_PROJECT_DBZ + "-informix");
 
     public static final Optional<String> OCP_PULL_SECRET_PATH = stringOptionalProperty("test.ocp.pull.secret.paths");
 
     // Strimzi configuration
     public static final String STRIMZI_OPERATOR_CHANNEL = System.getProperty("test.strimzi.operator.channel", "stable");
-    public static final String STRIMZI_OPERATOR_VERSION = System.getProperty("test.strimzi.operator.version", "0.45.0");
+    public static final String STRIMZI_OPERATOR_VERSION = System.getProperty("test.strimzi.operator.version", "1.3.0");
     public static final boolean STRIMZI_OPERATOR_CONNECTORS = booleanProperty("test.strimzi.operator.connectors", true);
-    public static final String STRIMZI_VERSION_KAFKA = System.getProperty("test.strimzi.version.kafka", "3.1.0");
-    public static final boolean FORCE_KRAFT = booleanProperty("test.force.kraft", false);
+    public static final String STRIMZI_VERSION_KAFKA = System.getProperty("test.strimzi.version.kafka", "4.3.1");
+    public static final boolean FORCE_KRAFT = booleanProperty("test.force.kraft", true);
 
     // Apicurio Registry configuration
-    public static final String APICURIO_LOG_LEVEL = System.getProperty("test.apicurio.log.level", "INFO");
-    public static final String APICURIO_OPERATOR_CHANNEL = System.getProperty("test.apicurio.operator.channel", "2.x");
-    public static final String APICURIO_OPERATOR_VERSION = System.getProperty("test.apicurio.operator.version", "1.1.3-v2.6.4.final");
+    public static final String APICURIO_VERSION = System.getProperty("version.apicurio", "3.2.5");
+    public static final String APICURIO_OPERATOR_NAME = System.getProperty("test.apicurio.operator.name", "apicurio-registry-3");
+    public static final String APICURIO_OPERATOR_CHANNEL = System.getProperty("test.apicurio.operator.channel", "3.x");
+    public static final String APICURIO_OPERATOR_VERSION = System.getProperty("test.apicurio.operator.version", APICURIO_VERSION);
+    public static final String APICURIO_STARTING_CSV = System.getProperty("test.apicurio.operator.starting.csv",
+            "apicurio-registry-3.v" + APICURIO_OPERATOR_VERSION);
     public static final boolean APICURIO_TLS_ENABLED = booleanProperty("test.apicurio.tls.enabled", false);
 
     // MySql Configuration
@@ -74,14 +79,12 @@ public final class ConfigProperties {
     public static final String DATABASE_MYSQL_PASSWORD = System.getProperty("test.database.mysql.password", "mysqlpw");
     public static final String DATABASE_MYSQL_DBZ_USERNAME = System.getProperty("test.database.mysql.dbz.username", "debezium");
     public static final String DATABASE_MYSQL_DBZ_PASSWORD = System.getProperty("test.database.mysql.dbz.password", "dbz");
-    public static final Optional<String> DATABASE_MYSQL_HOST = stringOptionalProperty("test.database.mysql.host");
     public static final int DATABASE_MYSQL_PORT = Integer.parseInt(System.getProperty("test.database.mysql.port", "3306"));
 
-    public static final String DATABASE_MARIADB_USERNAME = System.getProperty("test.database.mariadb.username", "mysqluser");
-    public static final String DATABASE_MARIADB_PASSWORD = System.getProperty("test.database.mariadb.password", "mysqlpw");
+    public static final String DATABASE_MARIADB_USERNAME = System.getProperty("test.database.mariadb.username", "mariadbuser");
+    public static final String DATABASE_MARIADB_PASSWORD = System.getProperty("test.database.mariadb.password", "mariadbpw");
     public static final String DATABASE_MARIADB_DBZ_USERNAME = System.getProperty("test.database.mariadb.dbz.username", "debezium");
     public static final String DATABASE_MARIADB_DBZ_PASSWORD = System.getProperty("test.database.mariadb.dbz.password", "dbz");
-    public static final Optional<String> DATABASE_MARIADB_HOST = stringOptionalProperty("test.database.mariadb.host");
     public static final int DATABASE_MARIADB_PORT = Integer.parseInt(System.getProperty("test.database.mariadb.port", "3306"));
 
     // PostgreSql Configuration
@@ -90,7 +93,6 @@ public final class ConfigProperties {
     public static final String DATABASE_POSTGRESQL_DBZ_USERNAME = System.getProperty("test.database.postgresql.dbz.username", "debezium");
     public static final String DATABASE_POSTGRESQL_DBZ_PASSWORD = System.getProperty("test.database.postgresql.dbz.password", "debezium");
     public static final String DATABASE_POSTGRESQL_DBZ_DBNAME = System.getProperty("test.database.postgresql.dbname", "debezium");
-    public static final Optional<String> DATABASE_POSTGRESQL_HOST = stringOptionalProperty("test.database.postgresql.host");
     public static final int DATABASE_POSTGRESQL_PORT = Integer.parseInt(System.getProperty("test.database.postgresql.port", "5432"));
 
     // SqlServer Configuration
@@ -99,7 +101,6 @@ public final class ConfigProperties {
     public static final String DATABASE_SQLSERVER_DBZ_USERNAME = System.getProperty("test.database.sqlserver.dbz.username", DATABASE_SQLSERVER_USERNAME);
     public static final String DATABASE_SQLSERVER_DBZ_PASSWORD = System.getProperty("test.database.sqlserver.dbz.password", DATABASE_SQLSERVER_SA_PASSWORD);
     public static final String DATABASE_SQLSERVER_DBZ_DBNAMES = System.getProperty("test.database.sqlserver.dbnames", "testDB");
-    public static final Optional<String> DATABASE_SQLSERVER_HOST = stringOptionalProperty("test.database.sqlserver.host");
     public static final int DATABASE_SQLSERVER_PORT = Integer.parseInt(System.getProperty("test.database.sqlserver.port", "1433"));
 
     // Mongo Configuration
@@ -107,15 +108,14 @@ public final class ConfigProperties {
     public static final String DATABASE_MONGO_SA_PASSWORD = System.getProperty("test.database.mongo.password", "admin");
     public static final String DATABASE_MONGO_DBZ_USERNAME = System.getProperty("test.database.mongo.dbz.username", "debezium");
     public static final String DATABASE_MONGO_DBZ_PASSWORD = System.getProperty("test.database.mongo.dbz.password", "dbz");
-    public static final String DATABASE_MONGO_DBZ_DBNAME = System.getProperty("test.database.mongo.dbname", "inventory");
+    public static final String DATABASE_MONGO_DBZ_DBNAME = System.getProperty("test.database.mongo.dbz.dbname", "inventory");
     public static final String DATABASE_MONGO_DBZ_LOGIN_DBNAME = System.getProperty("test.database.mongo.dbz.login.dbname", "admin");
-    public static final Optional<String> DATABASE_MONGO_HOST = stringOptionalProperty("test.database.mongo.host");
     public static final int DATABASE_MONGO_PORT = Integer.parseInt(System.getProperty("test.database.mongo.port", "27017"));
     public static final boolean DATABASE_MONGO_USE_KEYFILE = Boolean.parseBoolean(System.getProperty("test.database.mongo.use.keyfile"));
     public static final boolean DATABASE_MONGO_USE_TLS = Boolean.parseBoolean(System.getProperty("test.database.mongo.use.tls"));
 
-    public static final String DATABASE_MONGO_DOCKER_DESKTOP_PORTS = System.getProperty("database.mongo.docker.desktop.ports", "27017:27117");
-    public static final int DATABASE_MONGO_DOCKER_REPLICA_SIZE = Integer.parseInt(System.getProperty("database.mongo.docker.replica.size", "1"));
+    public static final String DATABASE_MONGO_DOCKER_DESKTOP_PORTS = System.getProperty("test.database.mongo.docker.desktop.ports", "27017:27117");
+    public static final int DATABASE_MONGO_DOCKER_REPLICA_SIZE = Integer.parseInt(System.getProperty("test.database.mongo.docker.replica.size", "1"));
     // DB2 Configuration
     public static final String DATABASE_DB2_USERNAME = System.getProperty("test.database.db2.username", "db2inst1");
     public static final String DATABASE_DB2_PASSWORD = System.getProperty("test.database.db2.password", "=Password!");
@@ -123,8 +123,15 @@ public final class ConfigProperties {
     public static final String DATABASE_DB2_DBZ_PASSWORD = System.getProperty("test.database.db2.dbz.password", DATABASE_DB2_PASSWORD);
     public static final String DATABASE_DB2_DBZ_DBNAME = System.getProperty("test.database.db2.dbname", "TESTDB");
     public static final String DATABASE_DB2_CDC_SCHEMA = System.getProperty("test.database.db2.cdc.schema", "ASNCDC");
-    public static final Optional<String> DATABASE_DB2_HOST = stringOptionalProperty("test.database.sqlserver.host");
     public static final int DATABASE_DB2_PORT = Integer.parseInt(System.getProperty("test.database.db2.port", "50000"));
+
+    // INFORMIX CONFIGURATION
+    public static final String DATABASE_INFORMIX_USERNAME = System.getProperty("test.database.informix.username", "informix");
+    public static final String DATABASE_INFORMIX_PASSWORD = System.getProperty("test.database.informix.password", "in4mix");
+    public static final String DATABASE_INFORMIX_DBZ_USERNAME = System.getProperty("test.database.informix.dbz.username", DATABASE_INFORMIX_USERNAME);
+    public static final String DATABASE_INFORMIX_DBZ_PASSWORD = System.getProperty("test.database.informix.dbz.password", DATABASE_INFORMIX_PASSWORD);
+    public static final String DATABASE_INFORMIX_DBZ_DBNAME = System.getProperty("test.database.informix.dbname", "testdb");
+    public static final int DATABASE_INFORMIX_PORT = Integer.parseInt(System.getProperty("test.database.informix.port", "9088"));
 
     // Oracle Configuration
     public static final boolean DATABASE_ORACLE = booleanProperty("test.database.oracle", true);

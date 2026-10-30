@@ -59,14 +59,14 @@ public class ApicurioRegistryTestIT {
 
     private static final List<Pattern> logMatchers = Collections.synchronizedList(new ArrayList<>());
 
-    private static final Network network = Network.SHARED;
+    private static final Network NETWORK = Network.SHARED;
 
-    private static final ApicurioRegistryContainer apicurioContainer = new ApicurioRegistryContainer().withNetwork(network);
+    private static final ApicurioRegistryContainer apicurioContainer = new ApicurioRegistryContainer().withNetwork(NETWORK);
 
     private static StrimziKafkaCluster kafkaCluster;
 
     public static final PostgreSQLContainer<?> postgresContainer = new PostgreSQLContainer<>(ImageNames.POSTGRES_DOCKER_IMAGE_NAME)
-            .withNetwork(network)
+            .withNetwork(NETWORK)
             .withNetworkAliases("postgres");
 
     private static final String TROUBLE_MAKER_LOG = "Caused by: java.io.FileNotFoundException: TroubleMaker";
@@ -79,17 +79,18 @@ public class ApicurioRegistryTestIT {
                 .withNumberOfBrokers(1)
                 .withSharedNetwork()
                 .build();
-        kafkaCluster.start();
+
+        // kafkaCluster.start();
 
         debeziumContainer = DebeziumContainer.nightly()
                 .withKafka(kafkaCluster)
-                .withNetwork(network)
+                .dependsOn(kafkaCluster)
                 .withLogConsumer(new Slf4jLogConsumer(LOGGER))
                 .withLogConsumer(ApicurioRegistryTestIT::captureMatchingLog)
                 .enableApicurioConverters();
 
         Startables.deepStart(Stream.of(
-                apicurioContainer, postgresContainer, debeziumContainer)).join();
+                kafkaCluster, apicurioContainer, postgresContainer, debeziumContainer)).join();
     }
 
     @BeforeEach
@@ -217,7 +218,6 @@ public class ApicurioRegistryTestIT {
     @FixFor("DBZ-5282")
     @Test
     public void shouldNotErrorWithBadHeader() {
-
         logMatchers.add(Pattern.compile(".*" + INVALID_HEADER_NAME_LOG + ".*", Pattern.DOTALL));
         logMatchers.add(Pattern.compile(".*" + TROUBLE_MAKER_LOG + ".*", Pattern.DOTALL));
 
@@ -234,13 +234,15 @@ public class ApicurioRegistryTestIT {
                 .with("value.converter.avro.apicurio.registry.url", apicurioUrl)
                 .with("value.converter.avro.apicurio.registry.auto-register", "true")
                 .with("value.converter.avro.apicurio.registry.artifact.group-id", "dummy")
-                .with("value.converter.avro.apicurio.registry.request.ssl.truststore.location", "TroubleMaker");
+                .with("value.converter.avro.apicurio.registry.http.adapter", "JDK")
+                .with("value.converter.avro.apicurio.registry.tls.truststore.location", "TroubleMaker");
 
-        debeziumContainer.registerConnector("my-connector-test-apicurio-header", config);
-        debeziumContainer.ensureConnectorTaskState("my-connector-test-apicurio-header", 0, Connector.State.FAILED);
+        String connectorName = "my-connector-test-apicurio-header";
+        debeziumContainer.registerConnector(connectorName, config);
+        debeziumContainer.ensureConnectorTaskState(connectorName, 0, Connector.State.FAILED);
 
         // in debezium 1.9, the invalid header log would be found due the use of the older apicurio jar
-        // assertThat(capturedLogs).hasSize(1); TODO: => I am getting 0 instead of 1.
+        assertThat(capturedLogs).hasSize(1);
         assertThat(capturedLogs).allMatch(log -> log.contains(TROUBLE_MAKER_LOG));
         assertThat(capturedLogs).noneMatch(log -> log.contains(INVALID_HEADER_NAME_LOG));
     }
@@ -311,7 +313,7 @@ public class ApicurioRegistryTestIT {
     private String getApicurioUrl() {
         final String host = apicurioContainer.getContainerInfo().getConfig().getHostName();
         final int port = apicurioContainer.getExposedPorts().get(0);
-        final String apicurioUrl = "http://" + host + ":" + port + "/apis/registry/v2";
+        final String apicurioUrl = "http://" + host + ":" + port;
         return apicurioUrl;
     }
 

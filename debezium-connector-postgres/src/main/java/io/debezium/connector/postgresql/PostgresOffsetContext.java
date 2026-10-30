@@ -37,6 +37,7 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
 
     public static final String LAST_COMPLETELY_PROCESSED_LSN_KEY = "lsn_proc";
     public static final String LAST_COMMIT_LSN_KEY = "lsn_commit";
+    public static final String LSN_EVENTS_PROCESSED_KEY = "lsn_events_processed";
 
     private final Schema sourceInfoSchema;
     private boolean lastSnapshotRecord;
@@ -45,6 +46,8 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
     private Lsn streamingStoppingLsn = null;
     private final TransactionContext transactionContext;
     private final IncrementalSnapshotContext<TableId> incrementalSnapshotContext;
+    private long lsnEventsProcessed;
+    private Lsn previousLsn;
 
     private PostgresOffsetContext(PostgresConnectorConfig connectorConfig, Lsn lsn, Lsn lastCompletelyProcessedLsn, Lsn lastCommitLsn, Long txId, Operation messageType,
                                   Instant time,
@@ -100,6 +103,9 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
         if (sourceInfo.messageType() != null) {
             result.put(SourceInfo.MSG_TYPE_KEY, sourceInfo.messageType().toString());
         }
+        if (lsnEventsProcessed > 0) {
+            result.put(LSN_EVENTS_PROCESSED_KEY, lsnEventsProcessed);
+        }
         return sourceInfo.isSnapshot() ? result : incrementalSnapshotContext.store(transactionContext.store(result));
     }
 
@@ -138,6 +144,20 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
         sourceInfo.updateLastCommit(lsn);
     }
 
+    /**
+     * Updates the origin information in the source info.
+     *
+     * @param originName the name of the origin server
+     * @param originLsn the LSN on the origin server
+     */
+    public void updateOrigin(String originName, Lsn originLsn) {
+        sourceInfo.updateOrigin(originName, originLsn);
+    }
+
+    public void clearOrigin() {
+        sourceInfo.clearOrigin();
+    }
+
     boolean hasLastKnownPosition() {
         return sourceInfo.lsn() != null;
     }
@@ -160,6 +180,33 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
 
     Operation lastProcessedMessageType() {
         return sourceInfo.messageType();
+    }
+
+    public long lsnEventsProcessed() {
+        return lsnEventsProcessed;
+    }
+
+    /**
+     * Increments the per-LSN event counter. If the LSN has changed since the last call,
+     * the counter resets to 1. This enables precise restart recovery when multiple events
+     * share the same LSN (e.g. COPY or batched inserts).
+     */
+    public void incrementLsnEventsProcessed(Lsn currentLsn) {
+        if (previousLsn != null && previousLsn.equals(currentLsn)) {
+            lsnEventsProcessed++;
+        }
+        else {
+            lsnEventsProcessed = 1;
+            previousLsn = currentLsn;
+        }
+    }
+
+    /**
+     * Resets the per-LSN event counter, typically called on transaction commit
+     * when the LSN is fully processed.
+     */
+    public void resetLsnEventsProcessed() {
+        lsnEventsProcessed = 0;
     }
 
     /**
@@ -210,13 +257,17 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
             final SnapshotType snapshot = loadSnapshot(offset).orElse(null);
             boolean snapshotCompleted = loadSnapshotCompleted(offset);
             final boolean lastSnapshotRecord = (boolean) ((Map<String, Object>) offset).getOrDefault(SourceInfo.LAST_SNAPSHOT_RECORD_KEY, Boolean.FALSE);
-            return new PostgresOffsetContext(connectorConfig, lsn,
+            final long lsnEventsProcessed = ((Number) ((Map<String, Object>) offset).getOrDefault(LSN_EVENTS_PROCESSED_KEY, 0L)).longValue();
+            final PostgresOffsetContext context = new PostgresOffsetContext(connectorConfig, lsn,
                     lastCompletelyProcessedLsn, lastCommitLsn, txId, messageType, useconds, snapshot, lastSnapshotRecord,
                     snapshotCompleted,
                     TransactionContext.load(offset),
                     connectorConfig.isReadOnlyConnection()
                             ? PostgresReadOnlyIncrementalSnapshotContext.load(offset)
                             : SignalBasedIncrementalSnapshotContext.load(offset, false));
+            context.lsnEventsProcessed = lsnEventsProcessed;
+            context.previousLsn = lsn;
+            return context;
         }
 
     }

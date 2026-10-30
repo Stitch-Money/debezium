@@ -19,6 +19,7 @@ import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.data.Struct;
 import org.bson.BsonTimestamp;
 import org.bson.Document;
@@ -30,6 +31,7 @@ import com.mongodb.ConnectionString;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.ConfigDefinition;
 import io.debezium.config.Configuration;
+import io.debezium.config.ConnectorConfigValidationHelper;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.config.Field.ValidationOutput;
@@ -48,9 +50,6 @@ import io.debezium.util.Strings;
 public class MongoDbConnectorConfig extends CommonConnectorConfig implements SharedMongoDbConnectorConfig {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MongoDbConnectorConfig.class);
-
-    protected static final String COLLECTION_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG = "\"collection.include.list\" is already specified";
-    protected static final String DATABASE_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG = "\"database.include.list\" is already specified";
 
     protected static final Pattern PATTERN_SPILT = Pattern.compile(",");
 
@@ -154,8 +153,11 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     }
 
     /**
-     * The set of different ways how connector can capture changes.
+     * The legacy combinations of pre- and post-image policies.
+     *
+     * @deprecated Use {@link PreImageMode} and {@link PostImageMode} instead.
      */
+    @Deprecated
     public enum CaptureMode implements EnumeratedValue {
 
         /**
@@ -247,8 +249,11 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     }
 
     /**
-     * The set off different ways how connector performs full update
+     * The legacy methods for retrieving updated documents.
+     *
+     * @deprecated Use {@link PostImageMode} instead.
      */
+    @Deprecated
     public enum FullUpdateType implements EnumeratedValue {
 
         /**
@@ -259,7 +264,12 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
         /**
          * Full update utilises MongoDB post images
          */
-        POST_IMAGE("post_image", true);
+        POST_IMAGE("post_image", true),
+
+        /**
+         * Full update requires a MongoDB post-image and fails if it is unavailable.
+         */
+        POST_IMAGE_REQUIRED("post_image_required", true);
 
         private final String value;
         private final boolean postImage;
@@ -314,6 +324,90 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
 
         public boolean isPostImage() {
             return postImage;
+        }
+    }
+
+    /**
+     * Controls how the connector retrieves the full document after an update.
+     */
+    public enum PostImageMode implements EnumeratedValue {
+        OFF("off"),
+        LOOKUP("lookup"),
+        POST_IMAGE("post_image"),
+        POST_IMAGE_REQUIRED("post_image_required");
+
+        private final String value;
+
+        PostImageMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public boolean isEnabled() {
+            return this != OFF;
+        }
+
+        public boolean isRequired() {
+            return this == POST_IMAGE_REQUIRED;
+        }
+
+        public boolean isPostImage() {
+            return this == POST_IMAGE || isRequired();
+        }
+
+        public static PostImageMode parse(String value) {
+            if (value != null) {
+                for (var mode : values()) {
+                    if (mode.value.equalsIgnoreCase(value.trim())) {
+                        return mode;
+                    }
+                }
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Controls whether a missing pre-image is allowed.
+     */
+    public enum PreImageMode implements EnumeratedValue {
+        OFF("off"),
+        WHEN_AVAILABLE("when_available"),
+        REQUIRED("required");
+
+        private final String value;
+
+        PreImageMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public boolean isEnabled() {
+            return this != OFF;
+        }
+
+        public boolean isRequired() {
+            return this == REQUIRED;
+        }
+
+        public static PreImageMode parse(String value) {
+            if (value == null || value.isBlank()) {
+                return OFF;
+            }
+            for (var mode : values()) {
+                if (mode.value.equalsIgnoreCase(value.trim())) {
+                    return mode;
+                }
+            }
+            return null;
         }
     }
 
@@ -607,6 +701,73 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
         }
     }
 
+    /**
+     * The set of different ways the connector serializes MongoDB Extended JSON in event payloads.
+     */
+    public enum JsonSerializationMode implements EnumeratedValue {
+        /**
+         * Serializes full documents using MongoDB Extended JSON v1 strict mode and updated fields using MongoDB Extended JSON v2 relaxed mode.
+         */
+        LEGACY("legacy"),
+        /**
+         * Serializes using MongoDB Extended JSON v1 strict mode (deprecated legacy format).
+         */
+        STRICT("strict"),
+        /**
+         * Serializes using MongoDB Extended JSON v2 canonical mode.
+         */
+        EXTENDED("extended"),
+        /**
+         * Serializes using MongoDB Extended JSON v2 relaxed mode.
+         */
+        RELAXED("relaxed");
+
+        private final String value;
+
+        JsonSerializationMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @return the matching option, or null if no match is found
+         */
+        public static JsonSerializationMode parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (JsonSerializationMode option : JsonSerializationMode.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @param defaultValue the default value; may be null
+         * @return the matching option, or null if no match is found and the non-null default is invalid
+         */
+        public static JsonSerializationMode parse(String value, String defaultValue) {
+            JsonSerializationMode mode = parse(value);
+            if (mode == null && defaultValue != null) {
+                mode = parse(defaultValue);
+            }
+            return mode;
+        }
+    }
+
     protected static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 0;
 
     public static final Field ALLOW_OFFSET_INVALIDATION = Field.createInternal("mongodb.allow.offset.invalidation")
@@ -617,7 +778,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field USER = Field.create("mongodb.user")
             .withDisplayName("User")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(Width.SHORT)
             .withImportance(Importance.HIGH)
             .withDescription("Database user for connecting to MongoDB, if necessary.");
@@ -625,7 +786,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field PASSWORD = Field.create("mongodb.password")
             .withDisplayName("Password")
             .withType(Type.PASSWORD)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(Width.SHORT)
             .withImportance(Importance.HIGH)
             .withDescription("Password to be used when connecting to MongoDB, if necessary.");
@@ -633,7 +794,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field MONGODB_POLL_INTERVAL_MS = Field.create("mongodb.poll.interval.ms")
             .withDisplayName("Replica membership poll interval (ms)")
             .withType(Type.LONG)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDefault(30_000L)
@@ -643,7 +804,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SSL_ENABLED = Field.create("mongodb.ssl.enabled")
             .withDisplayName("Enable SSL connection to MongoDB")
             .withType(Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDefault(false)
@@ -653,7 +814,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SSL_ALLOW_INVALID_HOSTNAMES = Field.create("mongodb.ssl.invalid.hostname.allowed")
             .withDisplayName("Allow invalid hostnames for SSL connection")
             .withType(Type.BOOLEAN)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDefault(false)
@@ -663,7 +824,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SSL_KEYSTORE = Field.create("mongodb.ssl.keystore")
             .withDisplayName("SSL Keystore")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.LONG)
             .withImportance(Importance.MEDIUM)
             .withDescription("The location of the key store file. "
@@ -672,7 +833,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SSL_KEYSTORE_PASSWORD = Field.create("mongodb.ssl.keystore.password")
             .withDisplayName("SSL Keystore Password")
             .withType(Type.PASSWORD)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.MEDIUM)
             .withDescription("The password for the key store file. "
@@ -682,7 +843,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
             .withDisplayName("SSL Keystore Type")
             .withType(Type.STRING)
             .withDefault("PKCS12")
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.MEDIUM)
             .withDescription("The type of key store file. "
@@ -691,7 +852,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SSL_TRUSTSTORE = Field.create("mongodb.ssl.truststore")
             .withDisplayName("SSL Truststore")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.LONG)
             .withImportance(Importance.MEDIUM)
             .withDescription("The location of the trust store file for the server certificate verification.");
@@ -699,7 +860,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SSL_TRUSTSTORE_PASSWORD = Field.create("mongodb.ssl.truststore.password")
             .withDisplayName("SSL Truststore Password")
             .withType(Type.PASSWORD)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.MEDIUM)
             .withDescription("The password for the trust store file. "
@@ -709,7 +870,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
             .withDisplayName("SSL Keystore Type")
             .withType(Type.STRING)
             .withDefault("PKCS12")
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 6))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.MEDIUM)
             .withDescription("The type of trust store file. "
@@ -718,7 +879,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field CONNECT_TIMEOUT_MS = Field.create("mongodb.connect.timeout.ms")
             .withDisplayName("Connect Timeout MS")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(10_000)
@@ -727,7 +888,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field AUTH_SOURCE = Field.create("mongodb.authsource")
             .withDisplayName("Credentials Database")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDefault(ADMIN_DATABASE_NAME)
@@ -736,7 +897,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SERVER_SELECTION_TIMEOUT_MS = Field.create("mongodb.server.selection.timeout.ms")
             .withDisplayName("Server selection timeout MS")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(30_000)
@@ -745,7 +906,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SOCKET_TIMEOUT_MS = Field.create("mongodb.socket.timeout.ms")
             .withDisplayName("Socket timeout MS")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(0)
@@ -754,7 +915,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field HEARTBEAT_FREQUENCY_MS = Field.create("mongodb.heartbeat.frequency.ms")
             .withDisplayName("Heartbeat frequency ms")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(10_000)
@@ -763,7 +924,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field AUTH_PROVIDER_CLASS = Field.create("mongodb.authentication.class")
             .withDisplayName("Authentication Provider Custom Class")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.MEDIUM)
             .withDefault(DefaultMongoDbAuthProvider.class.getName())
@@ -777,7 +938,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field DATABASE_INCLUDE_LIST = Field.create("database.include.list")
             .withDisplayName("Include Databases")
             .withType(Type.LIST)
-            .withGroup(Field.createGroupEntry(Field.Group.FILTERS, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.FILTERS))
             .withWidth(Width.LONG)
             .withImportance(Importance.HIGH)
             .withValidation(MongoDbConnectorConfig::validateListOfRegexesOrLiterals)
@@ -790,7 +951,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field DATABASE_EXCLUDE_LIST = Field.create("database.exclude.list")
             .withDisplayName("Exclude Databases")
             .withType(Type.LIST)
-            .withGroup(Field.createGroupEntry(Field.Group.FILTERS, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.FILTERS))
             .withWidth(Width.LONG)
             .withImportance(Importance.HIGH)
             .withValidation(MongoDbConnectorConfig::validateListOfRegexesOrLiterals, MongoDbConnectorConfig::validateDatabaseExcludeList)
@@ -804,7 +965,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field COLLECTION_INCLUDE_LIST = Field.create("collection.include.list")
             .withDisplayName("Include Collections")
             .withType(Type.LIST)
-            .withGroup(Field.createGroupEntry(Field.Group.FILTERS, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.FILTERS))
             .withWidth(Width.LONG)
             .withImportance(Importance.HIGH)
             .withValidation(MongoDbConnectorConfig::validateListOfRegexesOrLiterals)
@@ -816,7 +977,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
      * Must not be used with {@link #COLLECTION_INCLUDE_LIST}.
      */
     public static final Field COLLECTION_EXCLUDE_LIST = Field.create("collection.exclude.list")
-            .withGroup(Field.createGroupEntry(Field.Group.FILTERS, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.FILTERS))
             .withValidation(MongoDbConnectorConfig::validateListOfRegexesOrLiterals, MongoDbConnectorConfig::validateCollectionExcludeList)
             .withInvisibleRecommender()
             .withDescription("A comma-separated list of regular expressions or literals that match the collection names for which changes are to be excluded");
@@ -824,7 +985,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field FILTERS_MATCH_MODE = Field.create("filters.match.mode")
             .withDisplayName("Database and collection include/exclude match mode")
             .withEnum(FiltersMatchMode.class, FiltersMatchMode.REGEX)
-            .withGroup(Field.createGroupEntry(Field.Group.FILTERS, 6))
+            .withGroup(Field.createGroupEntry(Field.Group.FILTERS))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("The mode used by the aggregation pipeline to match events based on included/excluded database and collection names"
@@ -841,7 +1002,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field FIELD_EXCLUDE_LIST = Field.create("field.exclude.list")
             .withDisplayName("Exclude Fields")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.FILTERS, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.FILTERS))
             .withWidth(Width.LONG)
             .withImportance(Importance.MEDIUM)
             .withValidation(MongoDbConnectorConfig::validateFieldExcludeList)
@@ -857,7 +1018,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field FIELD_RENAMES = Field.create("field.renames")
             .withDisplayName("Rename Fields")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.LONG)
             .withImportance(Importance.MEDIUM)
             .withValidation(MongoDbConnectorConfig::validateFieldRenamesList)
@@ -867,42 +1028,111 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
                     " where databaseName and collectionName may contain the wildcard (*) which matches any characters," +
                     " the colon character (:) is used to determine rename mapping of field.");
 
+    /**
+     * @deprecated Use {@link #CAPTURE_MODE_PRE_IMAGE} and {@link #CAPTURE_MODE_POST_IMAGE} instead.
+     */
+    @Deprecated
     public static final Field CAPTURE_MODE = Field.create("capture.mode")
             .withDisplayName("Capture mode")
             .withEnum(CaptureMode.class, CaptureMode.CHANGE_STREAMS_UPDATE_FULL)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
-            .withDescription("The method used to capture changes from MongoDB server. "
+            .withDescription("Deprecated. Use capture.mode.pre.image and capture.mode.post.image instead. "
+                    + "The method used to capture changes from MongoDB server. "
                     + "Options include: "
                     + "'change_streams' to capture changes via MongoDB Change Streams, update events do not contain full documents; "
                     + "'change_streams_update_full' (the default) to capture changes via MongoDB Change Streams, update events contain full documents");
 
+    /**
+     * @deprecated Use {@link #CAPTURE_MODE_POST_IMAGE} instead.
+     */
+    @Deprecated
     public static final Field CAPTURE_MODE_FULL_UPDATE_TYPE = Field.create("capture.mode.full.update.type")
             .withDisplayName("Capture mode full update type")
             .withEnum(FullUpdateType.class, FullUpdateType.LOOKUP)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 2))
+            .withValidation(MongoDbConnectorConfig::validateRequiredPostImage)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
-            .withDescription("The method used to perform full update lookups. "
+            .withDescription("Deprecated. Use capture.mode.post.image instead. "
+                    + "The method used to perform full update lookups. "
                     + "Options include: "
                     + "'lookup' (the default) use separate lookup to get the updated document; "
-                    + "'post_image' use MongoDB post images (requires Mongo 6.0 or newer");
+                    + "'post_image' use MongoDB post images when available; "
+                    + "'post_image_required' require MongoDB post images and fail if unavailable. "
+                    + "Post images require MongoDB 6.0 or newer and must be enabled on the collection. "
+                    + "With regex filters and deployment or database capture scope, required images can be needed for events from excluded collections.");
+
+    public static final Field CAPTURE_MODE_POST_IMAGE = Field.create("capture.mode.post.image")
+            .withDisplayName("Capture mode post-image policy")
+            .withEnum(PostImageMode.class, PostImageMode.LOOKUP)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Controls how to retrieve the full document after an update. "
+                    + "'off' does not request the updated document; "
+                    + "'lookup' (the default) uses a separate lookup; "
+                    + "'post_image' requests MongoDB post-images when available; "
+                    + "'post_image_required' fails if a post-image is unavailable. "
+                    + "Post-images require MongoDB 6.0 or newer and must be enabled on the collection. "
+                    + "With regex filters and deployment or database capture scope, required images can be needed for events from excluded collections. "
+                    + "When explicitly set, this property takes precedence over capture.mode and capture.mode.full.update.type.");
+
+    public static final Field CAPTURE_MODE_PRE_IMAGE = Field.create("capture.mode.pre.image")
+            .withDisplayName("Capture mode pre-image policy")
+            .withEnum(PreImageMode.class, PreImageMode.OFF)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Controls how to retrieve the document before a change. "
+                    + "'off' (the default) does not request pre-images; "
+                    + "'when_available' requests MongoDB pre-images when available; "
+                    + "'required' fails if a pre-image is unavailable. "
+                    + "Pre-images require MongoDB 6.0 or newer and must be enabled on the collection. "
+                    + "With regex filters and deployment or database capture scope, required images can be needed for events from excluded collections. "
+                    + "When explicitly set, this property takes precedence over capture.mode.");
+
+    public static final Field JSON_SERIALIZATION_MODE = Field.create("json.serialization.mode")
+            .withDisplayName("JSON serialization mode")
+            .withEnum(JsonSerializationMode.class, JsonSerializationMode.LEGACY)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR))
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Controls the Extended JSON serialization mode used for MongoDB event payload fields. "
+                    + "Options include: "
+                    + "'legacy' (the default) uses MongoDB Extended JSON v1 strict mode for full document fields and MongoDB Extended JSON v2 relaxed mode for update fields. "
+                    + "'strict' uses MongoDB Extended JSON v1 strict mode. "
+                    + "'extended' uses MongoDB Extended JSON v2 canonical mode. "
+                    + "'relaxed' uses MongoDB Extended JSON v2 relaxed mode.");
 
     public static final Field CAPTURE_START_OP_TIME = Field.create("capture.start.op.time")
             .withDisplayName("Capture from operation time")
             .withType(Type.LONG)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(-1L)
-            .withDescription("If no existing offset is detected,  "
-                    + "Debezium will start streaming from given timestamp");
+            .withValidation(MongoDbConnectorConfig::validateStartOpTime)
+            .withDescription("If no existing offset is detected, Debezium will start streaming from the given packed BSON timestamp. "
+                    + "Cannot be used with capture.start.timestamp unless set to -1 (disabled).");
+
+    public static final Field CAPTURE_START_TIMESTAMP = Field.create("capture.start.timestamp")
+            .withDisplayName("Capture from timestamp")
+            .withType(Type.STRING)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
+            .withWidth(Width.LONG)
+            .withImportance(Importance.LOW)
+            .withValidation(MongoDbConnectorConfig::validateStartTimestamp)
+            .withDescription("If no existing offset is detected, Debezium will start streaming from this timestamp. "
+                    + "Accepts integer Unix seconds, ISO-8601 with a UTC offset and whole-second precision, "
+                    + "or a BSON timestamp in Extended JSON format. "
+                    + "Cannot be used with capture.start.op.time unless that property is set to -1 (disabled).");
 
     public static final Field CAPTURE_SCOPE = Field.create("capture.scope")
             .withDisplayName("Capture scope")
             .withEnum(CaptureScope.class, CaptureScope.DEPLOYMENT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("The scope of captured changes. "
@@ -915,7 +1145,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
             .withDisplayName("Capture target")
             .withType(Type.STRING)
             .withValidation(MongoDbConnectorConfig::validateCaptureTarget)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("The target to capture changes from. "
@@ -931,7 +1161,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SNAPSHOT_MODE = Field.create("snapshot.mode")
             .withDisplayName("Snapshot mode")
             .withEnum(SnapshotMode.class, SnapshotMode.INITIAL)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 0))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The criteria for running a snapshot upon startup of the connector. "
@@ -942,7 +1172,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SNAPSHOT_FILTER_QUERY_BY_COLLECTION = Field.create("snapshot.collection.filter.overrides")
             .withDisplayName("Snapshot collection filter overrides")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT, 1))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_SNAPSHOT))
             .withWidth(Width.LONG)
             .withImportance(Importance.MEDIUM)
             .withDescription("This property contains a comma-separated list of <dbName>.<collectionName>, for which "
@@ -956,10 +1186,17 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
             .withImportance(Importance.LOW)
             .withDescription("The maximum processing time in milliseconds to wait for the oplog cursor to process a single poll request");
 
+    /**
+     * Change stream pipeline stages that cannot be used in {@link #CURSOR_PIPELINE}, mapped to the reason reported to the user.
+     */
+    private static final Map<String, String> UNSUPPORTED_CURSOR_PIPELINE_STAGES = Map.of(
+            "$changeStream", "the connector opens the change stream itself; to start streaming from a specific time, use '"
+                    + CAPTURE_START_OP_TIME.name() + "' or '" + CAPTURE_START_TIMESTAMP.name() + "'");
+
     public static final Field CURSOR_PIPELINE = Field.create("cursor.pipeline")
             .withDisplayName("Pipeline stages applied to the change stream cursor")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 6))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withValidation(MongoDbConnectorConfig::validateChangeStreamPipeline)
@@ -971,7 +1208,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field CURSOR_PIPELINE_ORDER = Field.create("cursor.pipeline.order")
             .withDisplayName("Change stream cursor pipeline order")
             .withEnum(CursorPipelineOrder.class, CursorPipelineOrder.INTERNAL_FIRST)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 7))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("The order used to construct the effective MongoDB aggregation stream pipeline "
@@ -983,7 +1220,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field CURSOR_OVERSIZE_HANDLING_MODE = Field.create("cursor.oversize.handling.mode")
             .withDisplayName("Oversize document handling mode")
             .withEnum(OversizeHandlingMode.class, OversizeHandlingMode.FAIL)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 8))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The strategy used to handle change events for documents exceeding specified BSON size. "
@@ -995,7 +1232,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field CURSOR_OVERSIZE_SKIP_THRESHOLD = Field.create("cursor.oversize.skip.threshold")
             .withDisplayName("Oversize document skip threshold")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 9))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(0)
@@ -1016,36 +1253,27 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     public static final Field SOURCE_INFO_STRUCT_MAKER = CommonConnectorConfig.SOURCE_INFO_STRUCT_MAKER
             .withDefault(MongoDbSourceInfoStructMaker.class.getName());
 
+    public static final Field QUERY_FETCH_SIZE = CommonConnectorConfig.QUERY_FETCH_SIZE
+            .withDisplayName("Change stream cursor batch size")
+            .withDescription("The maximum number of change stream documents returned in each batch from MongoDB. "
+                    + "A value of '0' uses the server default batch size.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = CommonConnectorConfig.CONFIG_DEFINITION.edit()
             .name("MongoDB")
-            .type(
-                    TOPIC_PREFIX,
-                    CONNECTION_STRING,
-                    ALLOW_OFFSET_INVALIDATION,
-                    USER,
-                    PASSWORD,
-                    AUTH_SOURCE,
-                    CONNECT_TIMEOUT_MS,
-                    HEARTBEAT_FREQUENCY_MS,
-                    SOCKET_TIMEOUT_MS,
-                    SERVER_SELECTION_TIMEOUT_MS,
-                    MONGODB_POLL_INTERVAL_MS,
-                    SSL_ENABLED,
-                    SSL_ALLOW_INVALID_HOSTNAMES,
+            .excluding(CommonConnectorConfig.QUERY_FETCH_SIZE, CommonConnectorConfig.TOPIC_NAMING_STRATEGY)
+            .group(Field.Group.CONNECTION, CONNECTION_STRING, ALLOW_OFFSET_INVALIDATION, USER, PASSWORD, AUTH_SOURCE, CONNECT_TIMEOUT_MS,
+                    HEARTBEAT_FREQUENCY_MS, SOCKET_TIMEOUT_MS, SERVER_SELECTION_TIMEOUT_MS, MONGODB_POLL_INTERVAL_MS, SSL_ENABLED, SSL_ALLOW_INVALID_HOSTNAMES,
                     CURSOR_MAX_AWAIT_TIME_MS)
-            .events(
-                    DATABASE_INCLUDE_LIST,
-                    DATABASE_EXCLUDE_LIST,
-                    COLLECTION_INCLUDE_LIST,
-                    COLLECTION_EXCLUDE_LIST,
-                    FIELD_EXCLUDE_LIST,
-                    FIELD_RENAMES,
-                    SNAPSHOT_FILTER_QUERY_BY_COLLECTION,
-                    SOURCE_INFO_STRUCT_MAKER)
-            .connector(
-                    SNAPSHOT_MODE,
-                    CAPTURE_MODE,
-                    SCHEMA_NAME_ADJUSTMENT_MODE)
+            .group(Field.Group.CONNECTION_ADVANCED, AUTH_PROVIDER_CLASS)
+            .group(Field.Group.CONNECTION_ADVANCED_SSL, SSL_KEYSTORE, SSL_KEYSTORE_PASSWORD, SSL_KEYSTORE_TYPE, SSL_TRUSTSTORE, SSL_TRUSTSTORE_PASSWORD,
+                    SSL_TRUSTSTORE_TYPE)
+            .group(Field.Group.FILTERS, DATABASE_INCLUDE_LIST, DATABASE_EXCLUDE_LIST, COLLECTION_INCLUDE_LIST, COLLECTION_EXCLUDE_LIST, FIELD_EXCLUDE_LIST, FIELD_RENAMES,
+                    SNAPSHOT_FILTER_QUERY_BY_COLLECTION, FILTERS_MATCH_MODE)
+            .group(Field.Group.CONNECTOR, TOPIC_PREFIX, TOPIC_NAMING_STRATEGY, SNAPSHOT_MODE, CAPTURE_MODE, CAPTURE_MODE_POST_IMAGE, CAPTURE_MODE_PRE_IMAGE,
+                    CAPTURE_SCOPE, CAPTURE_TARGET, JSON_SERIALIZATION_MODE,
+                    SCHEMA_NAME_ADJUSTMENT_MODE, SOURCE_INFO_STRUCT_MAKER, CAPTURE_START_OP_TIME, CAPTURE_START_TIMESTAMP)
+            .group(Field.Group.CONNECTOR_ADVANCED, QUERY_FETCH_SIZE, CURSOR_PIPELINE, CURSOR_PIPELINE_ORDER, CURSOR_OVERSIZE_HANDLING_MODE,
+                    CURSOR_OVERSIZE_SKIP_THRESHOLD, CAPTURE_MODE_FULL_UPDATE_TYPE)
             .create();
 
     /**
@@ -1058,9 +1286,12 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     }
 
     private final SnapshotMode snapshotMode;
-    private final Long startOperationTime;
+    private final BsonTimestamp startOperationTime;
     private final CaptureMode captureMode;
+    private final JsonSerializationMode jsonSerializationMode;
     private final FullUpdateType captureModeFullUpdateType;
+    private final PreImageMode captureModePreImage;
+    private final PostImageMode captureModePostImage;
     private final CaptureScope captureScope;
     private final String captureTarget;
     private final boolean offsetInvalidationAllowed;
@@ -1070,7 +1301,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     private final String user;
     private final String password;
     private final String authSource;
-    private final MongoDbAuthProvider authProvider;
+    private MongoDbAuthProvider authProvider;
     private final boolean sslEnabled;
     private final boolean sslAllowInvalidHostnames;
     private final String sslKeyStore;
@@ -1092,7 +1323,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
         super(config, DEFAULT_SNAPSHOT_FETCH_SIZE);
 
         // Connection configuration
-        this.authProvider = config.getInstance(MongoDbConnectorConfig.AUTH_PROVIDER_CLASS, MongoDbAuthProvider.class);
         this.sslEnabled = config.getBoolean(MongoDbConnectorConfig.SSL_ENABLED);
         this.sslAllowInvalidHostnames = config.getBoolean(MongoDbConnectorConfig.SSL_ALLOW_INVALID_HOSTNAMES);
         this.sslKeyStore = config.getString(MongoDbConnectorConfig.SSL_KEYSTORE);
@@ -1115,12 +1345,34 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
         String snapshotModeValue = config.getString(MongoDbConnectorConfig.SNAPSHOT_MODE);
         this.snapshotMode = SnapshotMode.parse(snapshotModeValue, MongoDbConnectorConfig.SNAPSHOT_MODE.defaultValueAsString());
 
-        this.startOperationTime = config.getLong(CAPTURE_START_OP_TIME);
+        try {
+            this.startOperationTime = resolveStartOperationTime(config);
+        }
+        catch (IllegalArgumentException e) {
+            throw new ConfigException(CAPTURE_START_TIMESTAMP.name(), config.getString(CAPTURE_START_TIMESTAMP), e.getMessage());
+        }
 
         String captureModeValue = config.getString(MongoDbConnectorConfig.CAPTURE_MODE);
         this.captureMode = CaptureMode.parse(captureModeValue, MongoDbConnectorConfig.CAPTURE_MODE.defaultValueAsString());
         String fullUpdateTypeValue = config.getString(MongoDbConnectorConfig.CAPTURE_MODE_FULL_UPDATE_TYPE);
         this.captureModeFullUpdateType = FullUpdateType.parse(fullUpdateTypeValue, MongoDbConnectorConfig.CAPTURE_MODE_FULL_UPDATE_TYPE.defaultValueAsString());
+        this.captureModePreImage = config.hasKey(CAPTURE_MODE_PRE_IMAGE)
+                ? PreImageMode.parse(config.getString(CAPTURE_MODE_PRE_IMAGE))
+                : captureMode.isIncludePreImage() ? PreImageMode.WHEN_AVAILABLE : PreImageMode.OFF;
+        this.captureModePostImage = config.hasKey(CAPTURE_MODE_POST_IMAGE)
+                ? PostImageMode.parse(config.getString(CAPTURE_MODE_POST_IMAGE))
+                : captureMode.isFullUpdate() ? PostImageMode.parse(captureModeFullUpdateType.getValue()) : PostImageMode.OFF;
+        if (config.hasKey(CAPTURE_MODE)) {
+            LOGGER.warn("Configuration property '{}' is deprecated. Use '{}' and '{}' instead.",
+                    CAPTURE_MODE.name(), CAPTURE_MODE_PRE_IMAGE.name(), CAPTURE_MODE_POST_IMAGE.name());
+        }
+        if (config.hasKey(CAPTURE_MODE_FULL_UPDATE_TYPE)) {
+            LOGGER.warn("Configuration property '{}' is deprecated. Use '{}' instead.",
+                    CAPTURE_MODE_FULL_UPDATE_TYPE.name(), CAPTURE_MODE_POST_IMAGE.name());
+        }
+
+        String jsonSerializationModeValue = config.getString(MongoDbConnectorConfig.JSON_SERIALIZATION_MODE);
+        this.jsonSerializationMode = JsonSerializationMode.parse(jsonSerializationModeValue, MongoDbConnectorConfig.JSON_SERIALIZATION_MODE.defaultValueAsString());
 
         this.offsetInvalidationAllowed = config.getBoolean(ALLOW_OFFSET_INVALIDATION);
 
@@ -1145,14 +1397,26 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     private static int validateChangeStreamPipeline(Configuration config, Field field, ValidationOutput problems) {
         String value = config.getString(field);
 
+        final ChangeStreamPipeline pipeline;
         try {
-            new ChangeStreamPipeline(value);
+            pipeline = new ChangeStreamPipeline(value);
         }
         catch (Exception e) {
             problems.accept(field, value, "Change stream pipeline JSON is invalid: " + e.getMessage());
             return 1;
         }
-        return 0;
+
+        int count = 0;
+        for (final var stage : pipeline.getStages()) {
+            for (final var stageName : stage.toBsonDocument().keySet()) {
+                final var reason = UNSUPPORTED_CURSOR_PIPELINE_STAGES.get(stageName);
+                if (reason != null) {
+                    problems.accept(field, value, "Change stream pipeline stage '" + stageName + "' is not supported: " + reason);
+                    count++;
+                }
+            }
+        }
+        return count;
     }
 
     private static int validateOversizeSkipThreshold(Configuration config, Field field, ValidationOutput problems) {
@@ -1216,20 +1480,56 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     }
 
     private static int validateCollectionExcludeList(Configuration config, Field field, ValidationOutput problems) {
-        String includeList = config.getString(COLLECTION_INCLUDE_LIST);
-        String excludeList = config.getString(COLLECTION_EXCLUDE_LIST);
-        if (includeList != null && excludeList != null) {
-            problems.accept(COLLECTION_EXCLUDE_LIST, excludeList, COLLECTION_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG);
+        return ConnectorConfigValidationHelper.validateExcludeField(config, COLLECTION_INCLUDE_LIST, COLLECTION_EXCLUDE_LIST, problems);
+    }
+
+    private static int validateDatabaseExcludeList(Configuration config, Field field, ValidationOutput problems) {
+        return ConnectorConfigValidationHelper.validateExcludeField(config, DATABASE_INCLUDE_LIST, DATABASE_EXCLUDE_LIST, problems);
+    }
+
+    private static int validateStartOpTime(Configuration config, Field field, ValidationOutput problems) {
+        if (hasConflictingStartTimes(config)) {
+            problems.accept(field, config.getString(field), "Cannot be configured together with '" + CAPTURE_START_TIMESTAMP.name() + "'");
             return 1;
         }
         return 0;
     }
 
-    private static int validateDatabaseExcludeList(Configuration config, Field field, ValidationOutput problems) {
-        String includeList = config.getString(DATABASE_INCLUDE_LIST);
-        String excludeList = config.getString(DATABASE_EXCLUDE_LIST);
-        if (includeList != null && excludeList != null) {
-            problems.accept(DATABASE_EXCLUDE_LIST, excludeList, DATABASE_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG);
+    private static int validateStartTimestamp(Configuration config, Field field, ValidationOutput problems) {
+        try {
+            resolveStartOperationTime(config);
+            return 0;
+        }
+        catch (IllegalArgumentException e) {
+            problems.accept(field, config.getString(field), e.getMessage());
+            return 1;
+        }
+    }
+
+    private static boolean hasConflictingStartTimes(Configuration config) {
+        return !Strings.isNullOrBlank(config.getString(CAPTURE_START_TIMESTAMP))
+                && !CAPTURE_START_OP_TIME.defaultValue().equals(config.getLong(CAPTURE_START_OP_TIME));
+    }
+
+    private static BsonTimestamp resolveStartOperationTime(Configuration config) {
+        if (hasConflictingStartTimes(config)) {
+            throw new IllegalArgumentException("Cannot be configured together with '" + CAPTURE_START_OP_TIME.name() + "'");
+        }
+        final var value = config.getString(CAPTURE_START_TIMESTAMP);
+        if (!Strings.isNullOrBlank(value)) {
+            return BsonTimestampParser.parse(value);
+        }
+        final var operationTime = config.getLong(CAPTURE_START_OP_TIME);
+        return !CAPTURE_START_OP_TIME.defaultValue().equals(operationTime) ? new BsonTimestamp(operationTime) : null;
+    }
+
+    private static int validateRequiredPostImage(Configuration config, Field field, ValidationOutput problems) {
+        if (config.hasKey(CAPTURE_MODE_POST_IMAGE)) {
+            return 0;
+        }
+        final var mode = CaptureMode.parse(config.getString(CAPTURE_MODE), CAPTURE_MODE.defaultValueAsString());
+        if (FullUpdateType.parse(config.getString(field)) == FullUpdateType.POST_IMAGE_REQUIRED && mode != null && !mode.isFullUpdate()) {
+            problems.accept(field, config.getString(field), "Required post-images need a capture.mode that retrieves full documents");
             return 1;
         }
         return 0;
@@ -1237,18 +1537,36 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
 
     private static int validateCaptureTarget(Configuration config, Field field, ValidationOutput problems) {
         var value = config.getString(field);
-        var scope = config.getString(MongoDbConnectorConfig.CAPTURE_SCOPE);
+        var scope = CaptureScope.parse(config.getString(CAPTURE_SCOPE), CAPTURE_SCOPE.defaultValueAsString());
 
-        if (value != null && CaptureScope.DEPLOYMENT.value.equals(scope)) {
-            LOGGER.warn("Config property '{}' will be ignored due to {}={}", field.name(), CAPTURE_SCOPE.name(), scope);
+        if (scope == null) {
+            // An invalid capture.scope value is reported by the capture.scope field validation
+            return 0;
         }
 
-        if (value == null) {
-            problems.accept(field, null, field.name() + "property is missing");
-            return 1;
+        switch (scope) {
+            case DEPLOYMENT:
+                if (value != null) {
+                    LOGGER.warn("Config property '{}' will be ignored due to {}={}", field.name(), CAPTURE_SCOPE.name(), scope.getValue());
+                }
+                return 0;
+            case DATABASE:
+                if (value == null) {
+                    problems.accept(field, null, "The '" + field.name() + "' property must be set to a database name when '"
+                            + CAPTURE_SCOPE.name() + "' is '" + scope.getValue() + "'");
+                    return 1;
+                }
+                return 0;
+            case COLLECTION:
+            default:
+                final String[] parts = value == null ? null : value.split("\\.");
+                if (parts == null || parts.length != 2 || parts[0].isBlank() || parts[1].isBlank()) {
+                    problems.accept(field, value, "The '" + field.name() + "' property must be set to '<databaseName>.<collectionName>' when '"
+                            + CAPTURE_SCOPE.name() + "' is '" + scope.getValue() + "'");
+                    return 1;
+                }
+                return 0;
         }
-
-        return 0;
     }
 
     public SnapshotMode getSnapshotMode() {
@@ -1261,26 +1579,37 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
     }
 
     /**
-     * Provides statically configured capture mode. The configured value can be overrided upon
-     * connector start if offsets stored were created by a different capture mode.
-     *
-     * See {@link MongoDbTaskContext#getCaptureMode()}
-     *
-     * @return capture mode requested by configuration
+     * @return the legacy capture mode requested by configuration
+     * @deprecated Use {@link #getCaptureModePreImage()} and {@link #getCaptureModePostImage()} instead.
      */
+    @Deprecated
     public CaptureMode getCaptureMode() {
         return captureMode;
     }
 
     public Optional<BsonTimestamp> startAtOperationTime() {
-        if (CAPTURE_START_OP_TIME.defaultValue().equals(startOperationTime)) {
-            return Optional.empty();
-        }
-        return Optional.of(new BsonTimestamp(startOperationTime));
+        return Optional.ofNullable(startOperationTime);
     }
 
+    /**
+     * @return the legacy full update type requested by configuration
+     * @deprecated Use {@link #getCaptureModePostImage()} instead.
+     */
+    @Deprecated
     public FullUpdateType getCaptureModeFullUpdateType() {
         return captureModeFullUpdateType;
+    }
+
+    public PostImageMode getCaptureModePostImage() {
+        return captureModePostImage;
+    }
+
+    public PreImageMode getCaptureModePreImage() {
+        return captureModePreImage;
+    }
+
+    public JsonSerializationMode getJsonSerializationMode() {
+        return jsonSerializationMode;
     }
 
     public CaptureScope getCaptureScope() {
@@ -1315,7 +1644,10 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
         return cursorMaxAwaitTimeMs;
     }
 
-    public MongoDbAuthProvider getAuthProvider() {
+    public synchronized MongoDbAuthProvider getAuthProvider() {
+        if (authProvider == null) {
+            authProvider = getConfig().getInstance(AUTH_PROVIDER_CLASS, MongoDbAuthProvider.class);
+        }
         return authProvider;
     }
 
@@ -1456,8 +1788,8 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig implements Sha
         final String[] result = new String[3];
         int idx = 0;
         for (Object fieldValue : fields.values()) {
-            if (fieldValue instanceof Document) {
-                result[idx++] = ((Document) fieldValue).toJson();
+            if (fieldValue instanceof Document document) {
+                result[idx++] = document.toJson();
             }
             else {
                 result[idx++] = fieldValue.toString();

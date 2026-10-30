@@ -20,6 +20,7 @@ import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -28,6 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -47,16 +49,11 @@ import org.apache.kafka.connect.data.SchemaAndValue;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.json.JsonConverter;
-import org.apache.kafka.connect.json.JsonConverterConfig;
 import org.apache.kafka.connect.json.JsonDeserializer;
 import org.apache.kafka.connect.runtime.WorkerConfig;
 import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
 import org.apache.kafka.connect.source.SourceConnector;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.apache.kafka.connect.storage.Converter;
-import org.apache.kafka.connect.storage.FileOffsetBackingStore;
-import org.apache.kafka.connect.storage.OffsetStorageReaderImpl;
-import org.apache.kafka.connect.storage.OffsetStorageWriter;
 import org.awaitility.Awaitility;
 import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.AfterEach;
@@ -65,7 +62,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
-import io.debezium.config.Instantiator;
+import io.debezium.config.EmbeddedWorkerConfig;
+import io.debezium.converter.kafka.KafkaConnectConverterAdapter;
 import io.debezium.data.VerifyRecord;
 import io.debezium.embedded.util.MetricsHelper;
 import io.debezium.engine.DebeziumEngine;
@@ -73,6 +71,13 @@ import io.debezium.function.BooleanConsumer;
 import io.debezium.pipeline.txmetadata.TransactionStatus;
 import io.debezium.pipeline.txmetadata.TransactionStructMaker;
 import io.debezium.relational.history.HistoryRecord;
+import io.debezium.spi.storage.OffsetStorageReader;
+import io.debezium.spi.storage.OffsetStorageWriter;
+import io.debezium.spi.storage.OffsetStore;
+import io.debezium.storage.kafka.KafkaConnectOffsetStorageReaderAdapter;
+import io.debezium.storage.kafka.KafkaConnectOffsetStorageWriterAdapter;
+import io.debezium.storage.kafka.KafkaConnectStorageAdapter;
+import io.debezium.storage.kafka.offset.KafkaFileOffsetProvider;
 import io.debezium.util.LoggingContext;
 import io.debezium.util.Testing;
 
@@ -99,6 +104,8 @@ public abstract class AbstractConnectorTest implements Testing {
     protected long pollTimeoutInMs = TimeUnit.SECONDS.toMillis(10);
     protected final Logger logger = LoggerFactory.getLogger(getClass());
     protected final AtomicBoolean isEngineRunning = new AtomicBoolean(false);
+    private final AtomicBoolean stopRequestedByConsumer = new AtomicBoolean(false);
+    private final AtomicReference<Throwable> lastEngineFailure = new AtomicReference<>();
     private CountDownLatch latch;
     private JsonConverter keyJsonConverter = new JsonConverter();
     private JsonConverter valueJsonConverter = new JsonConverter();
@@ -132,6 +139,7 @@ public abstract class AbstractConnectorTest implements Testing {
         valueJsonDeserializer.configure(deserializerConfig.asMap(), false);
 
         resetBeforeEachTest();
+        lastEngineFailure.set(null);
         consumedLines = new ArrayBlockingQueue<>(getMaximumEnqueuedRecordCount());
         Testing.Files.delete(OFFSET_STORE_PATH);
         OFFSET_STORE_PATH.getParent().toFile().mkdirs();
@@ -157,7 +165,18 @@ public abstract class AbstractConnectorTest implements Testing {
             if (engine != null && isEngineRunning.get()) {
                 logger.info("Stopping the engine");
                 try {
-                    engine.close();
+                    // The stop-record exception already requests shutdown; closing an async engine again while stopping fails.
+                    if (!stopRequestedByConsumer.get()) {
+                        try {
+                            engine.close();
+                        }
+                        catch (IllegalStateException e) {
+                            // The consumer may request shutdown after the check above, concurrently with close().
+                            if (!stopRequestedByConsumer.get()) {
+                                throw e;
+                            }
+                        }
+                    }
                     // Oracle connector needs longer time to complete shutdown
                     Awaitility.await().atMost(60, TimeUnit.SECONDS).until(() -> !isEngineRunning.get());
                 }
@@ -234,6 +253,18 @@ public abstract class AbstractConnectorTest implements Testing {
      */
     protected int getMaximumEnqueuedRecordCount() {
         return 100;
+    }
+
+    /**
+     * Returns the error with which the engine most recently completed during the current test, if any.
+     * <p>
+     * The error is cleared before each test, so it can be inspected by test fixtures after a test
+     * failed to determine whether the connector stopped due to a specific error.
+     *
+     * @return the most recent engine failure during the current test, or empty if the engine has not failed
+     */
+    public Optional<Throwable> getLastEngineFailure() {
+        return Optional.ofNullable(lastEngineFailure.get());
     }
 
     /**
@@ -419,6 +450,7 @@ public abstract class AbstractConnectorTest implements Testing {
                 .with(EmbeddedEngineConfig.OFFSET_FLUSH_INTERVAL_MS, 0)
                 .build();
         latch = new CountDownLatch(1);
+        stopRequestedByConsumer.set(false);
         DebeziumEngine.CompletionCallback wrapperCallback = (success, msg, error) -> {
             try {
                 if (callback != null) {
@@ -426,8 +458,11 @@ public abstract class AbstractConnectorTest implements Testing {
                 }
             }
             finally {
+                if (!success && error != null) {
+                    lastEngineFailure.set(error);
+                }
                 if (!success) {
-                    // we only unblock if there was an error; in all other cases we're unblocking when a task has been started
+                    // we only unblock if there was an error; in all other cases we're unblocking when tasks polling has started
                     latch.countDown();
                 }
             }
@@ -437,9 +472,16 @@ public abstract class AbstractConnectorTest implements Testing {
         DebeziumEngine.ConnectorCallback wrapperConnectorCallback = new DebeziumEngine.ConnectorCallback() {
             @Override
             public void taskStarted() {
-                // if this is called, it means a task has been started successfully so we can continue
                 if (connectorCallback != null) {
                     connectorCallback.taskStarted();
+                }
+            }
+
+            @Override
+            public void pollingStarted() {
+                // all tasks have started and the engine can be stopped, so we can continue
+                if (connectorCallback != null) {
+                    connectorCallback.pollingStarted();
                 }
                 latch.countDown();
             }
@@ -492,6 +534,7 @@ public abstract class AbstractConnectorTest implements Testing {
     protected Consumer<SourceRecord> getConsumer(Predicate<SourceRecord> isStopRecord, Consumer<SourceRecord> recordArrivedListener, boolean ignoreRecordsAfterStop) {
         return (record) -> {
             if (isStopRecord != null && isStopRecord.test(record)) {
+                stopRequestedByConsumer.set(true);
                 logger.error("Stopping connector after record as requested");
                 throw new ConnectException("Stopping connector after record as requested");
             }
@@ -713,9 +756,9 @@ public abstract class AbstractConnectorTest implements Testing {
     }
 
     /**
-     * Try to consume and capture records untel a codition is satisfied.
+     * Try to consume and capture records until a condition is satisfied.
      *
-     * @param condition contition that must be satisifed to terminate reading
+     * @param condition condition that must be satisfied to terminate reading
      * @return the collector into which the records were captured; never null
      * @throws InterruptedException if the thread was interrupted while waiting for a record to be returned
      */
@@ -1223,24 +1266,22 @@ public abstract class AbstractConnectorTest implements Testing {
                 .build();
 
         final String engineName = config.getString(EmbeddedEngineConfig.ENGINE_NAME);
-        Map<String, String> internalConverterConfig = Collections.singletonMap(JsonConverterConfig.SCHEMAS_ENABLE_CONFIG, "false");
-        Converter keyConverter = Instantiator.getInstance(JsonConverter.class.getName());
-        keyConverter.configure(internalConverterConfig, true);
-        Converter valueConverter = Instantiator.getInstance(JsonConverter.class.getName());
-        valueConverter.configure(internalConverterConfig, false);
+        Map<String, String> internalConverterConfig = Collections.singletonMap("schemas.enable", "false");
+        KafkaConnectConverterAdapter keyConverter = new KafkaConnectConverterAdapter(
+                Configuration.from(internalConverterConfig).edit().with("class", "org.apache.kafka.connect.json.JsonConverter").build(), "class", true);
+        KafkaConnectConverterAdapter valueConverter = new KafkaConnectConverterAdapter(
+                Configuration.from(internalConverterConfig).edit().with("class", "org.apache.kafka.connect.json.JsonConverter").build(), "class", false);
 
-        // Create the worker config, adding extra fields that are required for validation of a worker config
-        // but that are not used within the embedded engine (since the source records are never serialized) ...
-        Map<String, String> embeddedConfig = config.asMap(EmbeddedEngineConfig.ALL_FIELDS);
-        embeddedConfig.put(WorkerConfig.KEY_CONVERTER_CLASS_CONFIG, JsonConverter.class.getName());
-        embeddedConfig.put(WorkerConfig.VALUE_CONVERTER_CLASS_CONFIG, JsonConverter.class.getName());
-        WorkerConfig workerConfig = new EmbeddedWorkerConfig(embeddedConfig);
+        // Enrich config with the default values need for Worker config.
+        // TODO Keep WorkerConfig for now, but it should be removed in the future and directly providing Debezium config should be enough.
+        WorkerConfig workerConfig = new EmbeddedWorkerConfig(config.asMap());
 
-        FileOffsetBackingStore offsetStore = KafkaConnectUtil.fileOffsetBackingStore();
-        offsetStore.configure(workerConfig);
+        OffsetStore offsetStore = new KafkaFileOffsetProvider().create();
+        offsetStore.configure(Configuration.from(workerConfig.originalsStrings()));
         offsetStore.start();
         try {
-            OffsetStorageReaderImpl offsetReader = new OffsetStorageReaderImpl(offsetStore, engineName, keyConverter, valueConverter);
+            final OffsetStorageReader offsetReader = new KafkaConnectOffsetStorageReaderAdapter((KafkaConnectStorageAdapter.OffsetBackingStore) offsetStore, engineName,
+                    keyConverter.getDelegate(), valueConverter.getDelegate());
             return offsetReader.offsets(partitions);
         }
         finally {
@@ -1255,29 +1296,28 @@ public abstract class AbstractConnectorTest implements Testing {
                 .build();
 
         final String engineName = config.getString(EmbeddedEngineConfig.ENGINE_NAME);
-        Map<String, String> internalConverterConfig = Collections.singletonMap(JsonConverterConfig.SCHEMAS_ENABLE_CONFIG, "false");
-        Converter keyConverter = Instantiator.getInstance(JsonConverter.class.getName());
-        keyConverter.configure(internalConverterConfig, true);
-        Converter valueConverter = Instantiator.getInstance(JsonConverter.class.getName());
-        valueConverter.configure(internalConverterConfig, false);
+        Map<String, String> internalConverterConfig = Collections.singletonMap("schemas.enable", "false");
+        KafkaConnectConverterAdapter keyConverter = new KafkaConnectConverterAdapter(
+                Configuration.from(internalConverterConfig).edit().with("class", "org.apache.kafka.connect.json.JsonConverter").build(), "class", true);
+        KafkaConnectConverterAdapter valueConverter = new KafkaConnectConverterAdapter(
+                Configuration.from(internalConverterConfig).edit().with("class", "org.apache.kafka.connect.json.JsonConverter").build(), "class", false);
 
-        // Create the worker config, adding extra fields that are required for validation of a worker config
-        // but that are not used within the embedded engine (since the source records are never serialized) ...
-        Map<String, String> embeddedConfig = config.asMap(EmbeddedEngineConfig.ALL_FIELDS);
-        embeddedConfig.put(WorkerConfig.KEY_CONVERTER_CLASS_CONFIG, JsonConverter.class.getName());
-        embeddedConfig.put(WorkerConfig.VALUE_CONVERTER_CLASS_CONFIG, JsonConverter.class.getName());
-        WorkerConfig workerConfig = new EmbeddedWorkerConfig(embeddedConfig);
+        // Enrich config with the default values need for Worker config.
+        // TODO Keep WorkerConfig for now, but it should be removed in the future and directly providing Debezium config should be enough.
+        WorkerConfig workerConfig = new EmbeddedWorkerConfig(config.asMap());
 
-        FileOffsetBackingStore offsetStore = KafkaConnectUtil.fileOffsetBackingStore();
-        offsetStore.configure(workerConfig);
+        OffsetStore offsetStore = new KafkaFileOffsetProvider().create();
+        offsetStore.configure(Configuration.from(workerConfig.originalsStrings()));
         offsetStore.start();
+
         var latch = new CountDownLatch(1);
         try {
-            OffsetStorageWriter offsetWriter = new OffsetStorageWriter(offsetStore, engineName, keyConverter, valueConverter);
+            final OffsetStorageWriter offsetWriter = new KafkaConnectOffsetStorageWriterAdapter((KafkaConnectStorageAdapter.OffsetBackingStore) offsetStore, engineName,
+                    keyConverter.getDelegate(), valueConverter.getDelegate());
             for (var partition : offsets.keySet()) {
                 offsetWriter.offset(partition, offsets.get(partition));
             }
-            offsetWriter.beginFlush();
+            offsetWriter.beginFlush(0, TimeUnit.NANOSECONDS);
             offsetWriter.doFlush((t, r) -> latch.countDown());
         }
         finally {

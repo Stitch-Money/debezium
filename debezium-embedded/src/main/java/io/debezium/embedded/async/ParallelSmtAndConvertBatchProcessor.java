@@ -7,6 +7,7 @@ package io.debezium.embedded.async;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.function.Function;
 
@@ -25,15 +26,19 @@ import io.debezium.engine.DebeziumEngine;
 public class ParallelSmtAndConvertBatchProcessor<R> extends AbstractRecordProcessor<R> {
     private static final Logger LOGGER = LoggerFactory.getLogger(ParallelSmtAndConvertBatchProcessor.class);
 
-    final DebeziumEngine.RecordCommitter committer;
-    final DebeziumEngine.ChangeConsumer<R> userHandler;
-    final Function<SourceRecord, R> convertor;
+    private final DebeziumEngine.RecordCommitter<R> committer;
+    private final DebeziumEngine.RecordCommitter<SourceRecord> sourceCommitter;
+    private final Function<SourceRecord, R> convertor;
+    private final BatchProcessor<R> processor;
 
-    ParallelSmtAndConvertBatchProcessor(final DebeziumEngine.RecordCommitter committer, final DebeziumEngine.ChangeConsumer<R> userHandler,
-                                        final Function<SourceRecord, R> convertor) {
+    ParallelSmtAndConvertBatchProcessor(DebeziumEngine.RecordCommitter<R> committer,
+                                        DebeziumEngine.RecordCommitter<SourceRecord> sourceCommitter,
+                                        Function<SourceRecord, R> convertor,
+                                        BatchProcessor<R> processor) {
         this.committer = committer;
-        this.userHandler = userHandler;
+        this.sourceCommitter = sourceCommitter;
         this.convertor = convertor;
+        this.processor = processor;
     }
 
     @Override
@@ -46,13 +51,32 @@ public class ParallelSmtAndConvertBatchProcessor<R> extends AbstractRecordProces
         LOGGER.trace("Getting source records.");
         final List<R> convertedRecords = new ArrayList<>(recordFutures.size());
         for (Future<R> f : recordFutures) {
-            R record = f.get(); // we need the whole batch, eventually wait forever
-            if (record != null) {
-                convertedRecords.add(record);
-            }
+            convertedRecords.add(f.get()); // we need the whole batch, eventually wait forever
         }
 
-        LOGGER.trace("Calling user handler.");
-        userHandler.handleBatch(convertedRecords, committer);
+        processBatch(processor, records, convertedRecords, committer, sourceCommitter);
+    }
+
+    public static <R> ParallelSmtAndConvertBatchProcessor<R> create(DebeziumEngine.RecordCommitter<R> committer,
+                                                                    DebeziumEngine.RecordCommitter<SourceRecord> sourceCommitter,
+                                                                    Function<SourceRecord, R> convertor,
+                                                                    DebeziumEngine.ChangeConsumer<R> userHandler,
+                                                                    Watcher watcher,
+                                                                    DebeziumEngine.Shutdown<R> shutdown,
+                                                                    Runnable runner, Map<String, String> configuration) {
+        if (shutdown == null) {
+            return new ParallelSmtAndConvertBatchProcessor<>(committer, sourceCommitter, convertor, new BatchProcessor.DirectProcessor<>(userHandler));
+        }
+
+        return new ParallelSmtAndConvertBatchProcessor<>(
+                committer,
+                sourceCommitter,
+                convertor,
+                new BatchProcessor.ObservableProcessor<>(watcher,
+                        new ShutdownChangeConsumer<>(
+                                DefaultShutdownHandler.create(shutdown.before(), runner, committer, configuration),
+                                DefaultShutdownHandler.create(shutdown.after(), runner, committer, configuration),
+                                userHandler, watcher)));
+
     }
 }

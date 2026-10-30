@@ -6,6 +6,7 @@
 package io.debezium.embedded;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.File;
@@ -25,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.file.FileStreamSourceConnector;
@@ -52,11 +54,14 @@ import io.debezium.engine.ChangeEvent;
 import io.debezium.engine.DebeziumEngine;
 import io.debezium.engine.Header;
 import io.debezium.engine.RecordChangeEvent;
+import io.debezium.engine.converter.HeaderConverter;
 import io.debezium.engine.format.ChangeEventFormat;
 import io.debezium.engine.format.Json;
 import io.debezium.engine.format.JsonByteArray;
+import io.debezium.engine.format.KeyValueHeaderChangeEventFormat;
 import io.debezium.engine.format.SimpleString;
 import io.debezium.engine.spi.OffsetCommitPolicy;
+import io.debezium.storage.kafka.offset.KafkaInterruptingOffsetStoreProvider;
 import io.debezium.util.LoggingContext;
 import io.debezium.util.Testing;
 import io.debezium.util.Throwables;
@@ -189,7 +194,7 @@ public class EmbeddedEngineTest extends AbstractAsyncEngineConnectorTest {
         props.put(EmbeddedEngineConfig.ENGINE_NAME.name(), "testing-connector");
         props.put(EmbeddedEngineConfig.CONNECTOR_CLASS.name(), DebeziumAsyncEngineTestUtils.InterruptedConnector.class.getName());
         props.put(EmbeddedEngineConfig.OFFSET_FLUSH_INTERVAL_MS.name(), 0);
-        props.put(EmbeddedEngineConfig.OFFSET_STORAGE.name(), InterruptingOffsetStore.class.getName());
+        props.put(EmbeddedEngineConfig.OFFSET_STORAGE.name(), KafkaInterruptingOffsetStoreProvider.NAME);
         props.put(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, OFFSET_STORE_PATH.toAbsolutePath().toString());
         props.put(DebeziumEngine.OFFSET_FLUSH_INTERVAL_MS_PROP, "0");
 
@@ -224,7 +229,7 @@ public class EmbeddedEngineTest extends AbstractAsyncEngineConnectorTest {
         final Properties props = new Properties();
         props.put(EmbeddedEngineConfig.ENGINE_NAME.name(), "testing-connector");
         props.put(EmbeddedEngineConfig.CONNECTOR_CLASS.name(), SimpleSourceConnector.class.getName());
-        props.put(EmbeddedEngineConfig.OFFSET_STORAGE.name(), InterruptingOffsetStore.class.getName());
+        props.put(EmbeddedEngineConfig.OFFSET_STORAGE.name(), KafkaInterruptingOffsetStoreProvider.NAME);
         props.put(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, OFFSET_STORE_PATH.toAbsolutePath().toString());
         props.put(SimpleSourceConnector.BATCH_COUNT, 1);
         props.put(DebeziumEngine.OFFSET_FLUSH_INTERVAL_MS_PROP, "0");
@@ -904,6 +909,92 @@ public class EmbeddedEngineTest extends AbstractAsyncEngineConnectorTest {
                 false);
     }
 
+    @Test
+    @FixFor("debezium/dbz#2520")
+    void shouldConvertHeadersToStringWhenSimpleStringFormat() {
+        final Properties props = new Properties();
+        props.setProperty("converter.schemas.enable", "false");
+
+        final ConverterBuilder<ChangeEvent<String, String>> converterBuilder = new ConverterBuilder<ChangeEvent<String, String>>()
+                .using(KeyValueHeaderChangeEventFormat.of(SimpleString.class, SimpleString.class, SimpleString.class))
+                .using(props);
+
+        final ConnectHeaders connectHeaders = new ConnectHeaders();
+        connectHeaders.addString("headerKey", "headerValue");
+
+        final SourceRecord record = new SourceRecord(
+                null, null, "topic", 0,
+                null, null,
+                null, null,
+                System.currentTimeMillis(), connectHeaders);
+
+        final HeaderConverter headerConverter = converterBuilder.headerConverter();
+        final Function<SourceRecord, ChangeEvent<String, String>> toFormat = converterBuilder.toFormat(headerConverter);
+
+        final ChangeEvent<String, String> event = assertDoesNotThrow(() -> toFormat.apply(record));
+        assertThat(event.headers()).hasSize(1);
+        // SimpleString format must produce String headers, not byte[]
+        final Header<?> header = event.headers().get(0);
+        assertThat(header.getKey()).isEqualTo("headerKey");
+        assertThat(header.getValue()).isInstanceOf(String.class);
+        assertThat(header.getValue()).isEqualTo("headerValue");
+    }
+
+    @Test
+    @FixFor("debezium/dbz#2520")
+    void shouldKeepHeadersAsByteArrayWhenJsonByteArrayFormat() {
+        final Properties props = new Properties();
+        props.setProperty("converter.schemas.enable", "false");
+
+        final ConverterBuilder<ChangeEvent<byte[], byte[]>> converterBuilder = new ConverterBuilder<ChangeEvent<byte[], byte[]>>()
+                .using(KeyValueHeaderChangeEventFormat.of(JsonByteArray.class, JsonByteArray.class, JsonByteArray.class))
+                .using(props);
+
+        final ConnectHeaders connectHeaders = new ConnectHeaders();
+        connectHeaders.addString("headerKey", "headerValue");
+
+        final SourceRecord record = new SourceRecord(
+                null, null, "topic", 0,
+                null, null,
+                null, null,
+                System.currentTimeMillis(), connectHeaders);
+
+        final HeaderConverter headerConverter = converterBuilder.headerConverter();
+        final Function<SourceRecord, ChangeEvent<byte[], byte[]>> toFormat = converterBuilder.toFormat(headerConverter);
+
+        final ChangeEvent<byte[], byte[]> event = assertDoesNotThrow(() -> toFormat.apply(record));
+        assertThat(event.headers()).hasSize(1);
+        // JsonByteArray format must produce byte[] headers
+        final Header<?> header = event.headers().get(0);
+        assertThat(header.getKey()).isEqualTo("headerKey");
+        assertThat(header.getValue()).isInstanceOf(byte[].class);
+    }
+
+    @Test
+    @FixFor("DBZ-8072")
+    void shouldSkipNullValueReturnedByHeaderConverter() {
+        final Properties props = new Properties();
+        props.setProperty("converter.schemas.enable", "false");
+
+        ConverterBuilder<ChangeEvent<byte[], byte[]>> converterBuilder = new ConverterBuilder<ChangeEvent<byte[], byte[]>>()
+                .using(KeyValueHeaderChangeEventFormat.of(JsonByteArray.class, JsonByteArray.class, JsonByteArray.class))
+                .using(props);
+
+        ConnectHeaders connectHeaders = new ConnectHeaders();
+        connectHeaders.addString("headerKey", "headerValue");
+
+        SourceRecord record = new SourceRecord(
+                null, null, "topic", 0,
+                null, null,
+                null, null,
+                System.currentTimeMillis(), connectHeaders);
+
+        Function<SourceRecord, ChangeEvent<byte[], byte[]>> toFormat = converterBuilder.toFormat(new NullReturningHeaderConverter());
+
+        ChangeEvent<byte[], byte[]> event = assertDoesNotThrow(() -> toFormat.apply(record));
+        assertThat(event.headers()).isEmpty();
+    }
+
     public static class AddHeaderTransform implements Transformation<SourceRecord> {
 
         @Override
@@ -924,6 +1015,22 @@ public class EmbeddedEngineTest extends AbstractAsyncEngineConnectorTest {
         @Override
         public ConfigDef config() {
             return new ConfigDef();
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    public static class NullReturningHeaderConverter implements HeaderConverter {
+
+        @Override
+        public byte[] fromHeader(String topic, String headerKey, Object schema, Object value) {
+            return null;
+        }
+
+        @Override
+        public void configure(Map<String, ?> configs) {
         }
 
         @Override

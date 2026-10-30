@@ -43,6 +43,18 @@ public class MySqlGtidSetTest {
     }
 
     @Test
+    void shouldCreateSetWithTaggedInterval() {
+        gtids = new MySqlGtidSet(UUID1 + ":debezium_test:1-191");
+        asertIntervalCount(UUID1, 1);
+        asertIntervalExists(UUID1, 1, 191);
+        asertFirstInterval(UUID1, 1, 191);
+        asertLastInterval(UUID1, 1, 191);
+        assertThat(gtids.toString()).isEqualTo(UUID1 + ":debezium_test:1-191");
+        assertThat(gtids.contains(UUID1 + ":debezium_test:42")).isTrue();
+        assertThat(gtids.contains(UUID1 + ":42")).isFalse();
+    }
+
+    @Test
     void shouldCollapseAdjacentIntervals() {
         gtids = new MySqlGtidSet(UUID1 + ":1-191:192-199");
         asertIntervalCount(UUID1, 1);
@@ -136,6 +148,18 @@ public class MySqlGtidSetTest {
     }
 
     @Test
+    void shouldRetainOnlyKnownTsids() {
+        MySqlGtidSet available = new MySqlGtidSet(UUID1 + ":known:1-5:unknown:1-10");
+        MySqlGtidSet known = new MySqlGtidSet(UUID1 + ":known:1-2");
+
+        MySqlGtidSet filtered = available.retainAllKnownTsids(known);
+
+        assertThat(filtered.toString()).isEqualTo(UUID1 + ":known:1-5");
+        assertThat(filtered.contains(UUID1 + ":known:3")).isTrue();
+        assertThat(filtered.contains(UUID1 + ":unknown:3")).isFalse();
+    }
+
+    @Test
     public void subtract() {
         String gtidStr1 = "036d85a9-64e5-11e6-9b48-42010af0000c:1-20,"
                 + "7145bf69-d1ca-11e5-a588-0242ac110004:1-3200:3400-3800:3900-3990,"
@@ -193,6 +217,42 @@ public class MySqlGtidSetTest {
         List<Interval> intervalsToRemove = Arrays.asList(new Interval(5, 8), new Interval(12, 18), new Interval(25, 55), new Interval(60, 65));
         List<Interval> diff = Arrays.asList(new Interval(1, 4), new Interval(9, 11), new Interval(19, 24));
         assertThat(interval.removeAll(intervalsToRemove)).isEqualTo(diff);
+    }
+
+    @Test
+    void toStringShouldPlaceUntaggedIntervalBeforeTaggedIntervalsForSameUuid() {
+        // Both entries share the same UUID, so toString() emits them as a single
+        // colon-delimited group: uuid:10-20:sometag:1-5
+        // Put the tagged interval first in the input string to exercise the sort.
+        final String tag = "sometag";
+        final String gtidStr = UUID1 + ":" + tag + ":1-5," + UUID1 + ":10-20";
+        gtids = new MySqlGtidSet(gtidStr);
+
+        final String result = gtids.toString();
+
+        // Untagged intervals have no tag prefix; tagged ones start with "<tag>:".
+        // After the sort, the untagged segment "10-20" must come before the tagged segment "sometag:1-5".
+        final int untaggedPos = result.indexOf("10-20");
+        final int taggedPos = result.indexOf(tag + ":1-5");
+        assertThat(untaggedPos).as("untagged intervals must precede tagged intervals in toString()").isGreaterThanOrEqualTo(0);
+        assertThat(taggedPos).as("tagged intervals must be present in toString()").isGreaterThanOrEqualTo(0);
+        assertThat(untaggedPos).as("untagged entry must appear before tagged entry").isLessThan(taggedPos);
+    }
+
+    @Test
+    void toStringShouldPreserveUntaggedFirstWhenAlreadyFirst() {
+        // Same expectation — input already has untagged first; sort must be a no-op.
+        final String tag = "sometag";
+        final String gtidStr = UUID1 + ":10-20," + UUID1 + ":" + tag + ":1-5";
+        gtids = new MySqlGtidSet(gtidStr);
+
+        final String result = gtids.toString();
+
+        final int untaggedPos = result.indexOf("10-20");
+        final int taggedPos = result.indexOf(tag + ":1-5");
+        assertThat(untaggedPos).as("untagged intervals must precede tagged intervals in toString()").isGreaterThanOrEqualTo(0);
+        assertThat(taggedPos).as("tagged intervals must be present in toString()").isGreaterThanOrEqualTo(0);
+        assertThat(untaggedPos).as("untagged entry must appear before tagged entry").isLessThan(taggedPos);
     }
 
     protected void asertIntervalCount(String uuid, int count) {

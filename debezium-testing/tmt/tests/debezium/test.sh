@@ -4,9 +4,11 @@ cd ../../../..
 
 echo $PWD
 
+MVN_CMD="${MAVEN_COMMAND:-mvn}"
+
 if [ "$TEST_PROFILE" = "mysql" ]
 then
-  mvn clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-mysql \
+  $MVN_CMD clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-mysql \
     -Dversion.mysql.server=${MYSQL_VERSION} \
     ${EXECUTION_ARG:-} \
     -Dmysql.port=4301 \
@@ -16,7 +18,7 @@ then
     -P${PROFILE}
 elif [ "$TEST_PROFILE" = "postgres" ]
 then
-  mvn clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-postgres \
+  $MVN_CMD clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-postgres \
   -Dpostgres.port=55432 \
   ${ORACLE_ARG:-}                            \
   ${EXECUTION_ARG:-}                            \
@@ -27,9 +29,9 @@ elif [ "$TEST_PROFILE" = "oracle" ]
 then
   source ${HOME}/install-oracle-driver.sh
   export LD_LIBRARY_PATH=$ORACLE_ARTIFACT_DIR
-  if [ "$ORACLE_VERSION" = "23.3.0.0" ]
+  if [ "$ORACLE_REGISTRY" != "quay.io/rh_integration/dbz-oracle" ]
   then
-    export ORACLE_HOME=/usr/lib/oracle/21/client64
+    export ORACLE_HOME=/usr/lib/oracle/23/client64
     export PATH=$ORACLE_HOME/bin:$PATH
     export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
     export ORACLE_CONNECTION="-Ddatabase.dbname=FREEPDB1 -Ddatabase.pdb.name=FREEPDB1"
@@ -39,7 +41,7 @@ then
   if [[ "$ORACLE_VERSION" = *noncdb ]]; then
     DATABASE_USER="dbzuser"
   fi
-  mvn clean verify -U -pl debezium-connector-oracle -am -fae \
+  $MVN_CMD clean verify -U -pl debezium-connector-oracle -am -fae \
     -Poracle-tests                              \
     ${ORACLE_PROFILE_ARGS:-}                    \
     ${ORACLE_ARG:-}                            \
@@ -63,11 +65,11 @@ then
   else
     export DATABASE_IMAGE="mcr.microsoft.com/mssql/server:2022-latest"
   fi
-  mvn clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-sqlserver \
+  $MVN_CMD clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-sqlserver \
   ${EXECUTION_ARG:-}                            \
   -Ddocker.db="${DATABASE_IMAGE}"
 else
-  mvn clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-mongodb \
+  $MVN_CMD clean verify ${CUSTOM_MAVEN_ARGS},debezium-connector-mongodb \
   ${EXECUTION_ARG:-}                            \
   -Dversion.mongo.server=${MONGODB_VERSION}
 fi

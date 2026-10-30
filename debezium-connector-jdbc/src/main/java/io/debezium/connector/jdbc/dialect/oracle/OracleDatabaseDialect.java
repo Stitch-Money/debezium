@@ -76,7 +76,16 @@ public class OracleDatabaseDialect extends GeneralDatabaseDialect {
         registerType(BytesType.INSTANCE);
         registerType(ZonedTimestampType.INSTANCE);
         registerType(ZonedTimeType.INSTANCE);
+        registerType(StructuredTimeType.INSTANCE);
+        registerType(StructuredZonedTimeType.INSTANCE);
+        registerType(StructuredDurationType.INSTANCE);
         registerType(GeometryType.INSTANCE);
+
+        // Oracle 21c and later provide a native JSON column type; route STRUCT values there instead
+        // of the inherited string/CLOB fallback registered by GeneralDatabaseDialect.
+        if (getDatabaseVersion().isSameOrAfter(21)) {
+            registerType(OracleStructToJsonType.INSTANCE);
+        }
     }
 
     @Override

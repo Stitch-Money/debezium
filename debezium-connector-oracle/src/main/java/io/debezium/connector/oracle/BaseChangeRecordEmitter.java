@@ -25,7 +25,6 @@ import io.debezium.pipeline.spi.Partition;
 import io.debezium.relational.Column;
 import io.debezium.relational.RelationalChangeRecordEmitter;
 import io.debezium.relational.Table;
-import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
 import io.debezium.util.Clock;
 import io.debezium.util.Strings;
@@ -80,7 +79,7 @@ public abstract class BaseChangeRecordEmitter<T> extends RelationalChangeRecordE
                 LOGGER.info("Table '{}' primary key changed from '{}' to '{}' via an UPDATE, re-selecting LOB columns {} out of bands.",
                         table.id(), oldKey, newKey, reselectColumns.stream().map(Column::name).collect(Collectors.toList()));
 
-                try (OracleConnection connection = new OracleConnection(connectorConfig)) {
+                try (OracleConnection connection = new OracleConnection(connectorConfig, true)) {
                     final String query = getReselectQuery(reselectColumns, table, connection);
                     if (!Strings.isNullOrBlank(connectorConfig.getPdbName())) {
                         connection.setSessionToPdb(connectorConfig.getPdbName());
@@ -143,11 +142,10 @@ public abstract class BaseChangeRecordEmitter<T> extends RelationalChangeRecordE
      * @return the query string for the reselect query
      */
     private String getReselectQuery(List<Column> reselectColumns, Table table, OracleConnection connection) {
-        final TableId id = new TableId(null, table.id().schema(), table.id().table());
         final StringBuilder query = new StringBuilder("SELECT ")
                 .append(reselectColumns.stream().map(c -> connection.quoteIdentifier(c.name())).collect(Collectors.joining(", ")))
                 .append(" FROM ")
-                .append(id.toDoubleQuotedString())
+                .append(connection.quotedTableIdString(table.id()))
                 .append(" WHERE ");
 
         for (int i = 0; i < table.primaryKeyColumnNames().size(); ++i) {

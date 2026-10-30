@@ -102,8 +102,7 @@ public abstract class AbstractLogMinerStreamingAdapter
         // that prevents switching from a PDB to the root CDB and if invoking the LogMiner APIs on
         // such a connection, the use of commit/rollback by LogMiner will drop/invalidate the save
         // point as well. A separate connection is necessary to preserve the save point.
-        try (OracleConnection conn = new OracleConnection(connectorConfig, connection.config())) {
-            conn.setAutoCommit(false);
+        try (OracleConnection conn = new OracleConnection(connectorConfig, connection.config(), false)) {
             if (!Strings.isNullOrEmpty(connectorConfig.getPdbName())) {
                 // The next stage cannot be run within the PDB, reset the connection to the CDB.
                 conn.resetSessionToCdb();
@@ -218,8 +217,8 @@ public abstract class AbstractLogMinerStreamingAdapter
 
     protected Scn getOldestScnAvailableInLogs(OracleConnectorConfig config, OracleConnection connection) throws SQLException {
         final Duration archiveLogRetention = config.getArchiveLogRetention();
-        final String archiveLogDestinationName = config.getArchiveDestinationNameResolver().getDestinationName(connection);
-        return connection.queryAndMap(SqlUtils.oldestFirstChangeQuery(archiveLogRetention, archiveLogDestinationName),
+        final List<String> archiveLogDestinationNames = config.getArchiveDestinationNameResolver().getDestinationNames(connection);
+        return connection.queryAndMap(SqlUtils.oldestFirstChangeQuery(archiveLogRetention, archiveLogDestinationNames),
                 rs -> {
                     if (rs.next()) {
                         final String value = rs.getString(1);
@@ -233,7 +232,7 @@ public abstract class AbstractLogMinerStreamingAdapter
 
     protected List<LogFile> getOrderedLogsFromScn(OracleConnectorConfig config, Scn sinceScn, OracleConnection connection) throws SQLException {
         final LogFileCollector collector = new LogFileCollector(config, connection);
-        return collector.getLogs(sinceScn)
+        return collector.getLogs(sinceScn).logFiles()
                 .stream()
                 .sorted(Comparator.comparing(LogFile::getSequence))
                 .collect(Collectors.toList());
@@ -243,7 +242,7 @@ public abstract class AbstractLogMinerStreamingAdapter
         final Scn oldestScn = getOldestScnAvailableInLogs(connectorConfig, connection);
         final List<LogFile> logFiles = getOrderedLogsFromScn(connectorConfig, oldestScn, connection);
         if (!logFiles.isEmpty()) {
-            try (var context = new LogMinerSessionContext(connection, false, LogMiningStrategy.ONLINE_CATALOG, connectorConfig.getLogMiningPathToDictionary())) {
+            try (var context = new LogMinerSessionContext(connection, LogMiningStrategy.ONLINE_CATALOG, connectorConfig.getLogMiningPathToDictionary())) {
                 context.addLogFiles(getMostRecentLogFilesForSearch(logFiles));
                 context.startSession(Scn.NULL, Scn.NULL, false);
 

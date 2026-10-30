@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceConnector;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -48,6 +49,7 @@ import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnaps
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
 import io.debezium.relational.history.SchemaHistory;
+import io.debezium.time.ZonedTimestamp;
 
 public abstract class BinlogIncrementalSnapshotIT<C extends SourceConnector>
         extends AbstractIncrementalSnapshotWithSchemaChangesSupportTest<C>
@@ -100,7 +102,8 @@ public abstract class BinlogIncrementalSnapshotIT<C extends SourceConnector>
                 .with(BinlogConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
                 .with(BinlogConnectorConfig.SIGNAL_DATA_COLLECTION, DATABASE.qualifiedTableName("debezium_signal"))
                 .with(CommonConnectorConfig.SIGNAL_POLL_INTERVAL_MS, 1)
-                .with(RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS, String.format("%s:%s", DATABASE.qualifiedTableName("a42"), "pk1,pk2,pk3,pk4"))
+                .with(RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS,
+                        String.format("%s:%s;%s:id", DATABASE.qualifiedTableName("a42"), "pk1,pk2,pk3,pk4", DATABASE.qualifiedTableName("debezium_signal")))
                 .with(BinlogConnectorConfig.INCREMENTAL_SNAPSHOT_CHUNK_SIZE, 10)
                 .with(BinlogConnectorConfig.INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES, true)
                 .with(CommonConnectorConfig.SCHEMA_NAME_ADJUSTMENT_MODE, SchemaNameAdjustmentMode.AVRO);
@@ -124,7 +127,8 @@ public abstract class BinlogIncrementalSnapshotIT<C extends SourceConnector>
                 .with(BinlogConnectorConfig.SIGNAL_DATA_COLLECTION, DATABASE.qualifiedTableName("debezium_signal"))
                 .with(CommonConnectorConfig.SIGNAL_POLL_INTERVAL_MS, 5)
                 .with(BinlogConnectorConfig.TABLE_INCLUDE_LIST, tableIncludeList)
-                .with(RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS, String.format("%s:%s", DATABASE.qualifiedTableName("a42"), "pk1,pk2,pk3,pk4"))
+                .with(RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS,
+                        String.format("%s:%s;%s:id", DATABASE.qualifiedTableName("a42"), "pk1,pk2,pk3,pk4", DATABASE.qualifiedTableName("debezium_signal")))
                 .with(BinlogConnectorConfig.INCREMENTAL_SNAPSHOT_CHUNK_SIZE, 10)
                 .with(BinlogConnectorConfig.INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES, true)
                 .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, storeOnlyCapturedDdl)
@@ -343,6 +347,41 @@ public abstract class BinlogIncrementalSnapshotIT<C extends SourceConnector>
     }
 
     @Test
+    @FixFor("debezium/dbz#1015")
+    public void tableWithTimeOutsideOfDayRange() throws Exception {
+        // The last row is read for the maximum key, so it holds a value whose text form is not 8 or 12 bytes long
+        final List<String> times = List.of("25:00:00", "838:59:59", "-00:00:01", "-838:59:59");
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.setAutoCommit(false);
+            for (int i = 0; i < times.size(); i++) {
+                connection.executeWithoutCommitting(String.format(
+                        "INSERT INTO a_dt (pk, dt, d, t) VALUES (%s, '2000-05-01', '2000-05-01', '%s')", i + 1, times.get(i)));
+            }
+            connection.commit();
+        }
+
+        final Configuration config = config().with(BinlogConnectorConfig.SNAPSHOT_FETCH_SIZE, 5).build();
+        start(connectorClass(), config, loggingCompletion());
+        waitForConnectorToStart();
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        sendAdHocSnapshotSignal(dataCollectionName("a_dt"));
+
+        final Map<Integer, Long> dbChanges = consumeMixedWithIncrementalSnapshot(
+                times.size(),
+                x -> true,
+                k -> k.getInt32(pkFieldName()),
+                record -> ((Struct) record.value()).getStruct("after").getInt64("t"),
+                DATABASE.topicForTable("a_dt"),
+                null);
+        assertThat(dbChanges).containsOnly(
+                entry(1, 90_000_000_000L),
+                entry(2, 3_020_399_000_000L),
+                entry(3, -1_000_000L),
+                entry(4, -3_020_399_000_000L));
+    }
+
+    @Test
     @FixFor("DBZ-5099")
     public void tableWithZeroDate() throws Exception {
         // Testing.Print.enable();
@@ -383,7 +422,9 @@ public abstract class BinlogIncrementalSnapshotIT<C extends SourceConnector>
         // Testing.Print.enable();
 
         populateTable();
-        final Configuration config = config().with(BinlogConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER).build();
+        final Configuration config = config()
+                .with(BinlogConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .build();
         start(connectorClass(), config, loggingCompletion());
 
         sendAdHocSnapshotSignal();
@@ -435,5 +476,90 @@ public abstract class BinlogIncrementalSnapshotIT<C extends SourceConnector>
         try (JdbcConnection connection = databaseConnection()) {
             populate4PkTable(connection, "a4");
         }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#1550")
+    public void schemaOfTableMissingFromHistoryIsReadWithDdlParser() throws Exception {
+        // Phase 1: capture only table "a"; the DDL of any other table is not recorded in the history
+        final String initialTableIncludeList = DATABASE.qualifiedTableName("a") + "," + DATABASE.qualifiedTableName("debezium_signal");
+        populateTable();
+        startConnector(x -> x
+                .without(BinlogConnectorConfig.TABLE_EXCLUDE_LIST.name())
+                .with(BinlogConnectorConfig.TABLE_INCLUDE_LIST, initialTableIncludeList)
+                .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, true)
+                .with(SchemaHistory.STORE_ONLY_CAPTURED_DATABASES_DDL, true));
+        waitForStreamingRunning(getConnectorName(), DATABASE.getServerName());
+
+        // Create a table that is NOT captured, then move the offset past its DDL by streaming an
+        // unrelated change, so that after a restart the table's schema is missing from the history
+        // and its CREATE TABLE statement is no longer reachable from the resume position
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.execute(
+                    "CREATE TABLE b1550 ("
+                            + "id BIGINT PRIMARY KEY,"
+                            + "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                            + "amount DECIMAL(10,2))",
+                    "INSERT INTO b1550 (id, amount) VALUES (1, 10.00)",
+                    "UPDATE a SET aa = 42 WHERE pk = 1");
+        }
+        assertThat(consumeRecordsForTopic(DATABASE.topicForTable("a"), 1)).hasSize(1);
+        stopConnector();
+
+        // Phase 2: expand the filter to include the new table and restart
+        final Configuration expandedConfig = config()
+                .without(BinlogConnectorConfig.TABLE_EXCLUDE_LIST.name())
+                .with(BinlogConnectorConfig.TABLE_INCLUDE_LIST, initialTableIncludeList + "," + DATABASE.qualifiedTableName("b1550"))
+                .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, true)
+                .with(SchemaHistory.STORE_ONLY_CAPTURED_DATABASES_DDL, true)
+                .build();
+        start(connectorClass(), expandedConfig);
+        waitForConnectorToStart();
+        waitForStreamingRunning(getConnectorName(), DATABASE.getServerName());
+
+        sendAdHocSnapshotSignal(DATABASE.qualifiedTableName("b1550"));
+
+        // The recovered schema must match the DDL-parsing paths. The previous JDBC metadata fallback
+        // reported TIMESTAMP with the display size as length, emitting an INT64
+        // io.debezium.time.NanoTimestamp field without the column default.
+        final SourceRecord read = consumeRecordsForTopic(DATABASE.topicForTable("b1550"), 1).get(0);
+        final Schema createdAtSchema = read.valueSchema().field("after").schema().field("created_at").schema();
+        assertThat(createdAtSchema.name()).isEqualTo(ZonedTimestamp.SCHEMA_NAME);
+        assertThat(createdAtSchema.defaultValue()).isNotNull();
+
+        // Streaming an update that does not touch the timestamp column must not fail the task with
+        // "Invalid value: null used for required field"
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.execute("UPDATE b1550 SET amount = 20.00 WHERE id = 1");
+        }
+        final SourceRecord update = consumeRecordsForTopic(DATABASE.topicForTable("b1550"), 1).get(0);
+        final Struct after = ((Struct) update.value()).getStruct("after");
+        assertThat(after.get("created_at")).isNotNull();
+
+        // The recovered table model must be persisted to schema history and survive another restart.
+        stopConnector();
+        start(connectorClass(), expandedConfig);
+        waitForConnectorToStart();
+        waitForStreamingRunning(getConnectorName(), DATABASE.getServerName());
+
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.execute("UPDATE b1550 SET amount = 30.00 WHERE id = 1");
+        }
+        final SourceRecord updateAfterRestart = consumeRecordsForTopic(DATABASE.topicForTable("b1550"), 1).get(0);
+        final Struct afterRestart = ((Struct) updateAfterRestart.value()).getStruct("after");
+        assertThat(afterRestart.get("created_at")).isNotNull();
+    }
+
+    private List<SourceRecord> consumeRecordsForTopic(String topicName, int expectedCount) {
+        final List<SourceRecord> records = new ArrayList<>();
+        Awaitility.await().atMost(60, TimeUnit.SECONDS).until(() -> {
+            consumeAvailableRecords(r -> {
+                if (r.topic().equals(topicName)) {
+                    records.add(r);
+                }
+            });
+            return records.size() >= expectedCount;
+        });
+        return records;
     }
 }

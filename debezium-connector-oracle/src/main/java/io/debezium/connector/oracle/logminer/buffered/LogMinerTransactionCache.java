@@ -103,15 +103,6 @@ public interface LogMinerTransactionCache<T extends Transaction> {
     void transactions(Consumer<Stream<T>> consumer);
 
     /**
-     * Get the transaction event by transaction reference and event key.
-     *
-     * @param transaction the transaction, should not be {@code null}
-     * @param eventKey the event key, should not be {@code null}
-     * @return the event if found, {@code null} if not found
-     */
-    LogMinerEvent getTransactionEvent(T transaction, int eventKey);
-
-    /**
      * Applies a consumer to all event keys in the cache.
      * No assumptions should be made about the order of the event keys.
      *
@@ -144,15 +135,6 @@ public interface LogMinerTransactionCache<T extends Transaction> {
      * @param transaction the transaction, should not be {@code null}
      */
     void removeTransactionEvents(T transaction);
-
-    /**
-     * Removes a specific transaction event by unique row identifier.
-     *
-     * @param transaction the transaction, should not be {@code null}
-     * @param rowId the event's unique row identifier
-     * @return {@code true} if the event was found and removed, {@code false} if it was not found
-     */
-    boolean removeTransactionEventWithRowId(T transaction, String rowId);
 
     /**
      * Checks whether a specific transaction's event with the event key is cached.
@@ -201,6 +183,24 @@ public interface LogMinerTransactionCache<T extends Transaction> {
      * @return {@code true} if the transaction is abandoned, {@code false} otherwise
      */
     boolean isAbandoned(String transactionId);
+
+    /**
+     * Records the given event as the most recently enqueued event for the specified transaction.
+     *
+     * @param transactionId the transaction identifier, should not be {@code null}
+     * @param event the event to track, should not be {@code null}
+     * @return the previously tracked event for the transaction, or {@code null} if there was none
+     */
+    LogMinerEvent putLastEnqueuedEvent(String transactionId, LogMinerEvent event);
+
+    /**
+     * Removes the tracked last enqueued event for the specified transaction. This should be done
+     * whenever the transaction is removed from the cache, e.g. on commit, rollback, or abandonment.
+     *
+     * @param transactionId the transaction identifier, should not be {@code null}
+     * @return the removed event, or {@code null} if none was tracked
+     */
+    LogMinerEvent removeLastEnqueuedEvent(String transactionId);
 
     /**
      * Clears the contents of the cache.

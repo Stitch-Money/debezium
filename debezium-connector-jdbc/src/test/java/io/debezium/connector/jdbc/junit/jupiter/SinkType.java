@@ -13,10 +13,14 @@ package io.debezium.connector.jdbc.junit.jupiter;
 public enum SinkType {
 
     MYSQL("mysql"),
+    SINGLESTORE("singlestore"),
+    STARROCKS("starrocks"),
     POSTGRES("postgres"),
+    COCKROACHDB("cockroachdb"),
     SQLSERVER("sqlserver"),
     ORACLE("oracle"),
-    DB2("db2");
+    DB2("db2"),
+    DB2I("db2i");
 
     private final String value;
 

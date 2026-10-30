@@ -8,7 +8,9 @@ package io.debezium.connector.binlog.jdbc;
 import static io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode.FAIL;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.ByteOrder;
 import java.nio.charset.Charset;
 import java.nio.charset.IllegalCharsetNameException;
@@ -47,6 +49,9 @@ import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMo
 import io.debezium.connector.binlog.BinlogGeometry;
 import io.debezium.connector.binlog.BinlogUnsignedIntegerConverter;
 import io.debezium.connector.binlog.charset.BinlogCharsetRegistry;
+import io.debezium.connector.binlog.event.BinlogDateTimeValue;
+import io.debezium.connector.binlog.event.BinlogDateValue;
+import io.debezium.data.EnumeratedValues;
 import io.debezium.data.Json;
 import io.debezium.data.SpecialValueDecimal;
 import io.debezium.data.vector.FloatVector;
@@ -56,6 +61,10 @@ import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.ValueConverter;
 import io.debezium.service.spi.ServiceRegistry;
+import io.debezium.time.StructuredDate;
+import io.debezium.time.StructuredDuration;
+import io.debezium.time.StructuredTimestamp;
+import io.debezium.time.StructuredZonedTimestamp;
 import io.debezium.time.Year;
 import io.debezium.util.Loggings;
 import io.debezium.util.Strings;
@@ -84,6 +93,14 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
     private static final Logger INVALID_VALUE_LOGGER = LoggerFactory.getLogger(BinlogValueConverters.class.getName() + ".invalid_value");
 
     /**
+     * Marker value indicating an unavailable column value, e.g. when the database
+     * runs with {@code binlog_row_image=NOBLOB} and a BLOB/TEXT column was not
+     * included in the row image.
+     */
+    public static final Serializable UNAVAILABLE_VALUE = new Serializable() {
+    };
+
+    /**
      * Used to parse values of TIME columns. Format: 000:00:00.000000.
      */
     private static final Pattern TIME_FIELD_PATTERN = Pattern.compile("(\\-?[0-9]*):([0-9]*)(:([0-9]*))?(\\.([0-9]*))?");
@@ -97,9 +114,12 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
      * Used to parse values of TIMESTAMP columns. Format: 000-00-00 00:00:00.000.
      */
     private static final Pattern TIMESTAMP_FIELD_PATTERN = Pattern.compile("([0-9]*)-([0-9]*)-([0-9]*) .*");
+    private static final Pattern TIMESTAMP_FIELD_COMPONENT_PATTERN = Pattern.compile("([0-9]*)-([0-9]*)-([0-9]*)[ T]([0-9]*):([0-9]*):([0-9]*)(\\.([0-9]*))?.*");
 
     private final EventConvertingFailureHandlingMode eventConvertingFailureHandlingMode;
     private final BinlogCharsetRegistry charsetRegistry;
+    private final byte[] unavailableValuePlaceholderBinary;
+    private final String unavailableValuePlaceholderString;
 
     /**
      * Create a new instance of the value converters that always uses UTC for the default time zone when
@@ -112,6 +132,7 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
      * @param adjuster a temporal adjuster to make a database specific time before conversion
      * @param eventConvertingFailureHandlingMode how to handle conversion failures
      * @param serviceRegistry the service registry instance, should not be {@code null}
+     * @param unavailableValuePlaceholder the placeholder bytes for unavailable column values; may be null
      */
     public BinlogValueConverters(DecimalMode decimalMode,
                                  TemporalPrecisionMode temporalPrecisionMode,
@@ -119,10 +140,28 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
                                  BinaryHandlingMode binaryHandlingMode,
                                  TemporalAdjuster adjuster,
                                  EventConvertingFailureHandlingMode eventConvertingFailureHandlingMode,
-                                 ServiceRegistry serviceRegistry) {
+                                 ServiceRegistry serviceRegistry,
+                                 byte[] unavailableValuePlaceholder) {
         super(decimalMode, temporalPrecisionMode, ZoneOffset.UTC, adjuster, bigIntUnsignedMode, binaryHandlingMode);
         this.eventConvertingFailureHandlingMode = eventConvertingFailureHandlingMode;
         this.charsetRegistry = serviceRegistry.getService(BinlogCharsetRegistry.class);
+        this.unavailableValuePlaceholderBinary = unavailableValuePlaceholder;
+        this.unavailableValuePlaceholderString = unavailableValuePlaceholder != null ? new String(unavailableValuePlaceholder) : null;
+    }
+
+    /**
+     * @deprecated Use the constructor that accepts an unavailable value placeholder.
+     */
+    @Deprecated
+    public BinlogValueConverters(DecimalMode decimalMode,
+                                 TemporalPrecisionMode temporalPrecisionMode,
+                                 BigIntUnsignedMode bigIntUnsignedMode,
+                                 BinaryHandlingMode binaryHandlingMode,
+                                 TemporalAdjuster adjuster,
+                                 EventConvertingFailureHandlingMode eventConvertingFailureHandlingMode,
+                                 ServiceRegistry serviceRegistry) {
+        this(decimalMode, temporalPrecisionMode, bigIntUnsignedMode, binaryHandlingMode, adjuster,
+                eventConvertingFailureHandlingMode, serviceRegistry, null);
     }
 
     @Override
@@ -147,6 +186,9 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
         if (matches(typeName, "YEAR")) {
             return Year.builder();
         }
+        if (matches(typeName, "TIME") && temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+            return StructuredDuration.builder();
+        }
         if (matches(typeName, "ENUM")) {
             String commaSeparatedOptions = extractEnumAndSetOptionsAsString(column);
             return io.debezium.data.Enum.builder(commaSeparatedOptions);
@@ -155,13 +197,27 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
             String commaSeparatedOptions = extractEnumAndSetOptionsAsString(column);
             return io.debezium.data.EnumSet.builder(commaSeparatedOptions);
         }
+        if (matches(typeName, "TINYINT UNSIGNED") || matches(typeName, "TINYINT UNSIGNED ZEROFILL")
+                || matches(typeName, "INT1 UNSIGNED") || matches(typeName, "INT1 UNSIGNED ZEROFILL")) {
+            // In order to capture unsigned TINYINT 8-bit data source, INT16 will be required to safely capture all valid values
+            // Source: https://kafka.apache.org/0102/javadoc/org/apache/kafka/connect/data/Schema.Type.html
+            return SchemaBuilder.int16();
+        }
         if (matches(typeName, "SMALLINT UNSIGNED") || matches(typeName, "SMALLINT UNSIGNED ZEROFILL")
                 || matches(typeName, "INT2 UNSIGNED") || matches(typeName, "INT2 UNSIGNED ZEROFILL")) {
             // In order to capture unsigned SMALLINT 16-bit data source, INT32 will be required to safely capture all valid values
             // Source: https://kafka.apache.org/0102/javadoc/org/apache/kafka/connect/data/Schema.Type.html
             return SchemaBuilder.int32();
         }
+        if (matches(typeName, "MEDIUMINT UNSIGNED") || matches(typeName, "MEDIUMINT UNSIGNED ZEROFILL")
+                || matches(typeName, "INT3 UNSIGNED") || matches(typeName, "INT3 UNSIGNED ZEROFILL")
+                || matches(typeName, "MIDDLEINT UNSIGNED") || matches(typeName, "MIDDLEINT UNSIGNED ZEROFILL")) {
+            // The unsigned MEDIUMINT 24-bit data source fits into INT32, same as its signed counterpart
+            // Source: https://kafka.apache.org/0102/javadoc/org/apache/kafka/connect/data/Schema.Type.html
+            return SchemaBuilder.int32();
+        }
         if (matches(typeName, "INT UNSIGNED") || matches(typeName, "INT UNSIGNED ZEROFILL")
+                || matches(typeName, "INTEGER UNSIGNED") || matches(typeName, "INTEGER UNSIGNED ZEROFILL")
                 || matches(typeName, "INT4 UNSIGNED") || matches(typeName, "INT4 UNSIGNED ZEROFILL")) {
             // In order to capture unsigned INT 32-bit data source, INT64 will be required to safely capture all valid values
             // Source: https://kafka.apache.org/0102/javadoc/org/apache/kafka/connect/data/Schema.Type.html
@@ -241,6 +297,7 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
             return (data) -> convertUnsignedMediumint(column, fieldDefn, data);
         }
         if (matches(typeName, "INT UNSIGNED") || matches(typeName, "INT UNSIGNED ZEROFILL")
+                || matches(typeName, "INTEGER UNSIGNED") || matches(typeName, "INTEGER UNSIGNED ZEROFILL")
                 || matches(typeName, "INT4 UNSIGNED") || matches(typeName, "INT4 UNSIGNED ZEROFILL")) {
             // Convert INT UNSIGNED internally from SIGNED to UNSIGNED based on the boundary settings
             return (data) -> convertUnsignedInt(column, fieldDefn, data);
@@ -279,6 +336,9 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
                 logger.warn("Using UTF-8 charset by default for column without charset: {}", column);
                 return (data) -> convertString(column, fieldDefn, StandardCharsets.UTF_8, data);
             case Types.TIME:
+                if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
+                    return data -> convertDurationToStructured(column, fieldDefn, data);
+                }
                 if (temporalPrecisionMode == TemporalPrecisionMode.ADAPTIVE_TIME_MICROSECONDS) {
                     return data -> convertDurationToMicroseconds(column, fieldDefn, data);
                 }
@@ -298,10 +358,19 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
     }
 
     @Override
+    protected Object convertTinyInt(Column column, Field fieldDefn, Object data) {
+        // Allows decimal default values for tinyint columns
+        if (data instanceof String) {
+            data = new BigDecimal((String) data).setScale(0, RoundingMode.HALF_UP);
+        }
+        return super.convertTinyInt(column, fieldDefn, data);
+    }
+
+    @Override
     protected Object convertSmallInt(Column column, Field fieldDefn, Object data) {
         // Allows decimal default values for smallint columns
         if (data instanceof String) {
-            data = Math.round(Double.parseDouble((String) data));
+            data = new BigDecimal((String) data).setScale(0, RoundingMode.HALF_UP);
         }
         return super.convertSmallInt(column, fieldDefn, data);
     }
@@ -310,7 +379,7 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
     protected Object convertInteger(Column column, Field fieldDefn, Object data) {
         // Allows decimal default values for integer columns
         if (data instanceof String) {
-            data = Math.round(Double.parseDouble((String) data));
+            data = new BigDecimal((String) data).setScale(0, RoundingMode.HALF_UP);
         }
         return super.convertInteger(column, fieldDefn, data);
     }
@@ -319,7 +388,7 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
     protected Object convertBigInt(Column column, Field fieldDefn, Object data) {
         // Allows decimal default values for bigint columns
         if (data instanceof String) {
-            data = Math.round(Double.parseDouble((String) data));
+            data = new BigDecimal((String) data).setScale(0, RoundingMode.HALF_UP);
         }
         return super.convertBigInt(column, fieldDefn, data);
     }
@@ -345,6 +414,9 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
 
     @Override
     protected Object convertBinary(Column column, Field fieldDefn, Object data, BinaryHandlingMode mode) {
+        if (data == UNAVAILABLE_VALUE) {
+            data = unavailableValuePlaceholderBinary;
+        }
         // During snapshots, the JDBC ResultSet returns Blob instances
         if (data instanceof Blob) {
             try {
@@ -387,6 +459,9 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
      * @throws IllegalArgumentException if the value could not be converted but the column does not allow nulls
      */
     protected Object convertString(Column column, Field fieldDefn, Charset columnCharset, Object data) {
+        if (data == UNAVAILABLE_VALUE) {
+            return unavailableValuePlaceholderString;
+        }
         return convertValue(column, fieldDefn, data, "", (r) -> {
             if (data instanceof byte[]) {
                 // Decode the binary representation using the given character encoding ...
@@ -598,7 +673,7 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
     }
 
     protected String extractEnumAndSetOptionsAsString(Column column) {
-        return Strings.join(",", extractEnumAndSetOptions(column));
+        return EnumeratedValues.toCommaSeparatedString(extractEnumAndSetOptions(column));
     }
 
     protected String convertSetValue(Column column, long indexes, List<String> options) {
@@ -833,6 +908,77 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
         });
     }
 
+    protected Object convertDurationToStructured(Column column, Field fieldDefn, Object data) {
+        final int precision = getTimePrecision(column);
+        return convertValue(column, fieldDefn, data, StructuredDuration.from(fieldDefn.schema(), 0, 0, 0, 0, 0, 0, 0, precision), (r) -> {
+            try {
+                if (data instanceof Duration) {
+                    final Duration duration = (Duration) data;
+                    final int sign = duration.isNegative() ? -1 : 1;
+                    final Duration abs = duration.abs();
+                    r.deliver(StructuredDuration.from(
+                            fieldDefn.schema(),
+                            0,
+                            0,
+                            0,
+                            Math.toIntExact(abs.toHours() * sign),
+                            abs.toMinutesPart() * sign,
+                            abs.toSecondsPart() * sign,
+                            abs.toNanosPart() * sign,
+                            precision));
+                }
+            }
+            catch (IllegalArgumentException | ArithmeticException e) {
+                LOGGER.warn("Unexpected duration value for field {} with schema {}: class={}, value={}", fieldDefn.name(),
+                        fieldDefn.schema(), data.getClass(), data, e);
+            }
+        });
+    }
+
+    @Override
+    protected Object convertDateToStructured(Column column, Field fieldDefn, Object data) {
+        if (data instanceof BinlogDateValue value) {
+            return StructuredDate.from(fieldDefn.schema(), value.getYear(), value.getMonth(), value.getDay());
+        }
+        return super.convertDateToStructured(column, fieldDefn, data);
+    }
+
+    @Override
+    protected Object convertTimestampToStructured(Column column, Field fieldDefn, Object data) {
+        if (data instanceof BinlogDateTimeValue value) {
+            return StructuredTimestamp.from(
+                    fieldDefn.schema(),
+                    value.getYear(),
+                    value.getMonth(),
+                    value.getDay(),
+                    value.getHour(),
+                    value.getMinute(),
+                    value.getSecond(),
+                    value.getNanos(),
+                    getTimePrecision(column));
+        }
+        return super.convertTimestampToStructured(column, fieldDefn, data);
+    }
+
+    @Override
+    protected Object convertTimestampWithZoneToStructured(Column column, Field fieldDefn, Object data) {
+        if (data instanceof BinlogDateTimeValue value) {
+            return StructuredZonedTimestamp.from(
+                    fieldDefn.schema(),
+                    value.getYear(),
+                    value.getMonth(),
+                    value.getDay(),
+                    value.getHour(),
+                    value.getMinute(),
+                    value.getSecond(),
+                    value.getNanos(),
+                    ZoneOffset.UTC.getTotalSeconds(),
+                    ZoneOffset.UTC.getId(),
+                    getTimePrecision(column));
+        }
+        return super.convertTimestampWithZoneToStructured(column, fieldDefn, data);
+    }
+
     protected Object convertTimestampToLocalDateTime(Column column, Field fieldDefn, Object data) {
         if (data == null && !fieldDefn.schema().isOptional()) {
             return null;
@@ -959,6 +1105,40 @@ public abstract class BinlogValueConverters extends JdbcValueConverters {
             return null;
         }
         return LocalDate.of(year, month, day);
+    }
+
+    public static BinlogDateValue stringToBinlogDateValue(String dateString) {
+        final Matcher matcher = DATE_FIELD_PATTERN.matcher(dateString);
+        if (!matcher.matches()) {
+            throw new RuntimeException("Unexpected format for DATE column: " + dateString);
+        }
+
+        return new BinlogDateValue(
+                Integer.parseInt(matcher.group(1)),
+                Integer.parseInt(matcher.group(2)),
+                Integer.parseInt(matcher.group(3)));
+    }
+
+    public static BinlogDateTimeValue stringToBinlogDateTimeValue(String timestampString) {
+        final Matcher matcher = TIMESTAMP_FIELD_COMPONENT_PATTERN.matcher(timestampString);
+        if (!matcher.matches()) {
+            throw new RuntimeException("Unexpected format for TIMESTAMP column: " + timestampString);
+        }
+
+        int nanos = 0;
+        final String fractionalSeconds = matcher.group(8);
+        if (!Objects.isNull(fractionalSeconds)) {
+            nanos = Integer.parseInt(Strings.justifyLeft(fractionalSeconds, 9, '0'));
+        }
+
+        return new BinlogDateTimeValue(
+                Integer.parseInt(matcher.group(1)),
+                Integer.parseInt(matcher.group(2)),
+                Integer.parseInt(matcher.group(3)),
+                Integer.parseInt(matcher.group(4)),
+                Integer.parseInt(matcher.group(5)),
+                Integer.parseInt(matcher.group(6)),
+                nanos);
     }
 
     /**
